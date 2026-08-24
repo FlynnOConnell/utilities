@@ -11,6 +11,7 @@ masknmf imports are function-local: the package is optional, heavy to import,
 and its stage math runs in the spawned worker subprocess.
 """
 
+import os
 import time
 from pathlib import Path
 
@@ -376,11 +377,16 @@ def _stage_demixing(pmd, cfg, runtime, plane_dir: Path, device: str, fs, logger)
 
 
 def _write_registered_bin(moco, plane_dir: Path, logger) -> tuple[np.ndarray, np.ndarray]:
-    """Stream the registered movie to data.bin; returns (meanImg, max_proj)."""
+    """Stream the registered movie to data.bin; returns (meanImg, max_proj).
+
+    Written to a temp name and renamed on completion: np.memmap
+    preallocates the full file up front, so a crash mid-write would
+    otherwise leave a full-size partial data.bin that later runs (and
+    Suite2pArray) trust as complete.
+    """
     nframes, ly, lx = (int(s) for s in moco.shape)
-    out = np.memmap(
-        plane_dir / "data.bin", dtype=np.int16, mode="w+", shape=(nframes, ly, lx)
-    )
+    tmp = plane_dir / "data.bin.partial"
+    out = np.memmap(tmp, dtype=np.int16, mode="w+", shape=(nframes, ly, lx))
     acc = np.zeros((ly, lx), dtype=np.float64)
     mx = np.full((ly, lx), -np.inf, dtype=np.float64)
     step = 200
@@ -393,6 +399,7 @@ def _write_registered_bin(moco, plane_dir: Path, logger) -> tuple[np.ndarray, np
         out[t0: t0 + chunk.shape[0]] = np.clip(chunk, -32768, 32767).astype(np.int16)
     out.flush()
     del out
+    os.replace(tmp, plane_dir / "data.bin")
     logger.info(f"masknmf: wrote {plane_dir / 'data.bin'}")
     return (acc / max(nframes, 1)).astype(np.float32), mx.astype(np.float32)
 
