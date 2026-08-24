@@ -56,6 +56,7 @@ the 5D array underneath for writers and the viewer.
 | ↳ Standard/ImageJ | `TiffArray` | `(T, C, Z, Y, X)` | All TIFFs including ImageJ hyperstacks |
 | **`.bin`** | `BinArray` | as-passed, e.g. `(T, Y, X)` | Suite2p binary (requires shape) |
 | **`.h5`** | `H5Array` | `(T, C, Z, Y, X)` | HDF5 datasets |
+| **`.mesc`** | `MescArray` | `(T, C, Z, Y, X)` | Femtonics MESc, one measurement unit |
 | **`.zarr`** | `ZarrArray` | `(T, C, Z, Y, X)` | Zarr v3 / OME-Zarr |
 | **`.npy`** | `NumpyArray` | `(T, C, Z, Y, X)` | Memory-mapped numpy |
 | **`np.ndarray`** | `NumpyArray` | `(T, C, Z, Y, X)` | In-memory wrapper |
@@ -72,6 +73,7 @@ imread(path)
 ├── np.ndarray ───────────────────────────► NumpyArray (in-memory)
 ├── .npy ─────────────────────────────────► NumpyArray (mmap)
 ├── .h5 / .hdf5 ──────────────────────────► H5Array
+├── .mesc ─────────────────────────────────► MescArray (one MUnit)
 ├── .zarr ────────────────────────────────► ZarrArray
 ├── .bin (with ops.npy nearby) ───────────► Suite2pArray
 ├── .bin (no ops.npy) ────────────────────► BinArray (shape required)
@@ -250,6 +252,96 @@ print(arr.shape)       # (T, C, Z, Y, X)
 # specify dataset explicitly
 arr = mbo.imread("/path/to/data.h5", dataset="imaging_data")
 ```
+
+(mescarray)=
+### MescArray
+
+Femtonics MESc acquisitions. A `.mesc` file is an HDF5 container holding one
+or more sessions (`MSession_N`), each holding one or more **measurement units**
+(`MUnit_M`). A MUnit is one scan — one thing the operator ran at the scope: a
+z-stack, a ribbon time series, a snapshot. They are unrelated recordings with
+different shapes, so `MescArray` opens exactly one.
+
+```python
+import mbo_utilities as mbo
+from mbo_utilities.arrays import list_mesc_units
+
+# what's in the file? (headers only, no pixel data)
+for u in list_mesc_units("scan.mesc"):
+    print(u["index"], u["munit"], u["modality_name"], u["shape"])
+
+arr = mbo.imread("scan.mesc", unit=2)          # by index
+arr = mbo.imread("scan.mesc", unit="MUnit_2")  # or by key
+```
+
+From the CLI, `mbo info scan.mesc` prints the unit table, `mbo scan.mesc --unit 2`
+opens one directly, and `mbo scan.mesc` with more than one unit pops a picker.
+
+#### Layout
+
+`MethodType` decides what axis 0 of `Channel_N` means and how the scanned
+sub-regions are packed into the raw page. `MescArray` unpacks all of them into
+canonical `(T, C, Z, Y, X)`:
+
+| `MethodType` | raw `Channel_N` | reported shape |
+|---|---|---|
+| 1 timeseries | `(T, Y, X)` | `(T, C, 1, Y, X)` |
+| 2 zstack | `(Z, Y, X)` | `(1, C, Z, Y, X)` |
+| 6 linescan | `(1, T*n_lines, X)` | `(T, C, R, n_lines, width)` |
+| 7 multiline | `(1, T*n_lines, X)` | `(T, C, R, n_lines, width)` |
+| 8 chessboard | `(T, Y, R*X)` | `(T, C, R, Y, X)` |
+| 9 / 10 ribbon | `(T, Y, X)` | `(T, C, R, Y, X)` |
+
+The AOD ROI index `R` sits on the `Z` axis. Those ROIs are arbitrarily placed
+patches in 3D — not evenly spaced, not necessarily monotonic in z — so this is
+a slot, not a depth series: `dz` stays `None` and the real geometry lives in
+metadata. Check `metadata["mesc_z_axis_meaning"]` (`"roi_index"`, `"depth"` or
+`"none"`) rather than inferring it from the modality.
+
+#### Multi-ROI
+
+Units with several ROIs use the same ROI interface as ScanImage mROI data:
+
+```python
+arr = mbo.imread("scan.mesc", unit=2)
+arr.roi = None   # default: every ROI on the Z axis, one array
+arr.roi = 2      # just ROI 2 -> Z collapses to 1
+arr.roi = 0      # split: per-ROI viewer subplots, one roiNN/ dir per ROI on write
+```
+
+Ribbon and linescan ROIs differ in size and are zero-padded to the largest.
+`metadata["mesc_roi_extents"]` records where each ROI's valid region lands, so
+padding is distinguishable from genuinely dark pixels.
+
+#### MESc-specific metadata
+
+| Key | Meaning |
+|---|---|
+| `mesc_unit` / `mesc_units_in_file` | which MUnit this array reads, and how many the file holds |
+| `mesc_modality` / `mesc_modality_name` | raw `MethodType` and its name |
+| `mesc_layout` | how the page was unpacked (`zstack`/`tiled`/`boxes`/`packed`/`frames`) |
+| `mesc_z_axis_meaning` | `"roi_index"`, `"depth"`, or `"none"` |
+| `mesc_centroids` / `mesc_rotations` | per-ROI 3D centroid and orientation |
+| `mesc_roi_extents` | per-ROI valid region inside the padded frame |
+| `mesc_sync_frame` / `mesc_start_frame` | detected sync frame, and the crop actually applied |
+| `mesc_flip_y` | whether Y was flipped on read |
+
+#### Alignment and correction
+
+Nothing is cropped or corrected by default — the array shows what is on disk.
+
+```python
+# crop to the sync curve's edge (reported in metadata either way)
+arr = mbo.imread("scan.mesc", unit=2, sync_key="DiI2", sync_edge="falling")
+
+# or drop a fixed number of leading timepoints
+arr = mbo.imread("scan.mesc", unit=2, start_frame=12)
+```
+
+Bidirectional scan-phase correction is wired up but disabled; toggle it with
+`arr.fix_phase = True` or from the viewer's scan-phase controls. Stored counts
+are returned as-is — the channel conversion factors are exposed in
+`metadata["mesc_attrs"]` rather than applied.
 
 (zarrarray)=
 ### ZarrArray
