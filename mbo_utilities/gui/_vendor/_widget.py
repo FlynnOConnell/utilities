@@ -530,8 +530,10 @@ class ImageWidget:
 
         self._figure: Figure = Figure(**figure_kwargs_default)
 
-        # HistogramLUTTool was removed on the ndwidget branch
-        self._histogram_widget = False
+        # HistogramLUTTool was removed on the ndwidget branch; its
+        # replacement ImguiColorbar is attached per subplot below
+        self._histogram_widget = histogram_widget
+        self._colorbars = []
         for data_ix, (d, subplot) in enumerate(zip(self.data, self.figure)):
 
             frame = self._process_indices(d, slice_indices=self._current_index)
@@ -567,12 +569,12 @@ class ImageWidget:
             subplot.add_graphic(ig)
 
             if self._histogram_widget:
-                hlut = HistogramLUTTool(data=d, images=ig, name="histogram_lut")
+                from fastplotlib.ui import ImguiColorbar
 
-                subplot.docks["right"].add_graphic(hlut)
-                subplot.docks["right"].size = 80
-                subplot.docks["right"].auto_scale(maintain_aspect=False)
-                subplot.docks["right"].controller.enabled = False
+                counts, edges = np.histogram(np.asarray(frame).ravel(), bins=100)
+                colorbar = ImguiColorbar(images=ig, histogram=(counts, edges))
+                subplot.add_imgui_window(colorbar, location="right", size=100)
+                self._colorbars.append(colorbar)
 
         # hard code the expected height so that the first render looks right in tests, docs etc.
         # +24 px: the ImguiWindow base draws a custom title row the
@@ -953,9 +955,9 @@ class ImageWidget:
                 # make new graphic first
                 new_graphic = ImageGraphic(data=frame, name="image_widget_managed")
 
-                if self._histogram_widget:
-                    # set hlut tool to use new graphic
-                    subplot.docks["right"]["histogram_lut"].images = new_graphic
+                if self._histogram_widget and i < len(self._colorbars):
+                    # rebind the colorbar to the new graphic
+                    self._colorbars[i].images = new_graphic
 
                 # delete old graphic after setting hlut tool to new graphic
                 # this ensures gc
@@ -976,10 +978,16 @@ class ImageWidget:
                     self._dims_max_bounds[scroll_dim] = max_lengths[scroll_dim]
 
             # set histogram widget
-            if self._histogram_widget:
-                subplot.docks["right"]["histogram_lut"].set_data(
-                    new_array, reset_vmin_vmax=reset_vmin_vmax
+            if self._histogram_widget and i < len(self._colorbars):
+                hist_frame = self._process_indices(
+                    new_array, slice_indices=self._current_index
                 )
+                hist_frame = self._process_frame_apply(hist_frame, i)
+                self._colorbars[i].histogram = np.histogram(
+                    np.asarray(hist_frame).ravel(), bins=100
+                )
+                if reset_vmin_vmax:
+                    subplot["image_widget_managed"].reset_vmin_vmax()
 
         # force graphics to update
         self.current_index = self.current_index
@@ -1047,3 +1055,34 @@ ImageWidget.graphics = property(_mbo_graphics)
 ImageWidget.n_sliders = property(_mbo_n_sliders)
 ImageWidget._sliders_ui = property(_mbo_sliders_ui)
 ImageWidget.indices = property(_mbo_indices_get, _mbo_indices_set)
+
+
+# upstream ImguiColorbar._draw_histogram calls
+# add_polyline(points, col, thickness, flags); imgui-bundle 1.92.5 binds
+# add_polyline(points, col, flags, thickness) — same body, fixed call
+def _fixed_draw_histogram(self, draw_list, x_left, x_right, bar_y, bar_h):
+    from imgui_bundle import imgui
+
+    counts, edges = self._histogram
+    cmin = counts.min()
+    cmax = counts.max()
+    span = cmax - cmin
+    if span <= 0:
+        return
+
+    color = imgui.color_convert_float4_to_u32((0.7, 0.7, 0.7, 1.0))
+    hist_w = x_right - x_left
+    if hist_w <= 0:
+        return
+    norm = (counts - cmin) / span
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    points = [
+        imgui.ImVec2(x_right - frac * hist_w, self._value_to_y(c, bar_y, bar_h))
+        for frac, c in zip(norm, centers)
+    ]
+    draw_list.add_polyline(points, color, 0, 1.5)
+
+
+from fastplotlib.ui import ImguiColorbar as _PatchedColorbar
+
+_PatchedColorbar._draw_histogram = _fixed_draw_histogram
