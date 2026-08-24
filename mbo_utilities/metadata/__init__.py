@@ -1,0 +1,125 @@
+"""
+mbo_utilities.metadata - metadata handling for calcium imaging data.
+
+this package provides:
+- standardized parameter definitions and aliases
+- scanimage-specific metadata parsing
+- stack type detection (lbm, piezo, pollen, single plane)
+- voxel size extraction and normalization
+- file I/O for extracting metadata from TIFF files
+"""
+from .base import (
+    MetadataParameter,
+    VoxelSize,
+    METADATA_PARAMS,
+    ALIAS_MAP,
+    get_canonical_name,
+    IMAGING_METADATA_KEYS,
+    EXPORT_DENYLIST,
+    strip_for_export,
+)
+from mbo_utilities.arrays.features._roi import RoiMode
+
+from .params import (
+    get_param,
+    get_voxel_size,
+    normalize_resolution,
+    normalize_metadata,
+)
+
+from .scanimage import (
+    StackType,
+    detect_stack_type,
+    is_lbm_stack,
+    is_piezo_stack,
+    get_saved_channel_ports,
+    get_color_channel_ports,
+    get_beamlets_per_port,
+    get_num_color_channels,
+    get_num_zplanes,
+    get_frames_per_slice,
+    get_log_average_factor,
+    get_z_step_size,
+    get_num_volumes,
+    get_num_slices,
+    get_frames_per_volume,
+    get_roi_info,
+    get_frame_rate,
+    extract_roi_slices,
+)
+
+# file I/O functions
+from .io import (
+    is_raw_scanimage,
+    get_metadata,
+    get_metadata_single,
+    get_metadata_batch,
+    query_tiff_pages,
+    clean_scanimage_metadata,
+    default_ops,
+    _build_ome_metadata,
+)
+
+# output metadata for subsetted data
+from .output import OutputMetadata
+
+# filename metadata parsing
+from ._filename_parser import (
+    FilenameMetadata,
+    parse_filename_metadata,
+    get_filename_suggestions,
+)
+
+__all__ = [
+    "ALIAS_MAP",
+    # imaging metadata (core params for display/editing)
+    "IMAGING_METADATA_KEYS",
+    # writer denylist + helper (suite2p-only fields stripped from non-suite2p output)
+    "EXPORT_DENYLIST",
+    "strip_for_export",
+    "METADATA_PARAMS",
+    # base types
+    "MetadataParameter",
+    "RoiMode",
+    # scanimage detection
+    "StackType",
+    "VoxelSize",
+    "_build_ome_metadata",
+    "clean_scanimage_metadata",
+    "default_ops",
+    "detect_stack_type",
+    "extract_roi_slices",
+    "get_canonical_name",
+    "get_frame_rate",
+    "get_frames_per_slice",
+    "get_saved_channel_ports",
+    "get_color_channel_ports",
+    "get_beamlets_per_port",
+    "get_log_average_factor",
+    "get_metadata",
+    "get_metadata_batch",
+    "get_metadata_single",
+    "get_num_color_channels",
+    "get_num_slices",
+    "get_num_volumes",
+    "get_num_zplanes",
+    "get_frames_per_volume",
+    # parameter access
+    "get_param",
+    "get_roi_info",
+    "get_voxel_size",
+    "get_z_step_size",
+    # file I/O
+    "is_lbm_stack",
+    "is_piezo_stack",
+    "is_raw_scanimage",
+    "normalize_metadata",
+    "normalize_resolution",
+    "query_tiff_pages",
+    # output metadata
+    "OutputMetadata",
+    # filename parsing
+    "FilenameMetadata",
+    "parse_filename_metadata",
+    "get_filename_suggestions",
+]

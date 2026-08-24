@@ -1,0 +1,173 @@
+"""
+window functions widget.
+
+controls for projection type and window size (temporal operations).
+always shows for any data with temporal dimension.
+"""
+
+from typing import Any
+
+from imgui_bundle import imgui, hello_imgui
+
+from mbo_utilities.gui.widgets._base import Widget
+from mbo_utilities.gui._imgui_helpers import set_tooltip
+from mbo_utilities.gui._colormaps import DEFAULT_COLORMAPS, DEFAULT_COLORMAP
+
+
+class WindowFunctionsWidget(Widget):
+    """ui widget for window functions (projection, window size)."""
+
+    name = "Window Functions"
+    priority = 10  # show first
+
+    @classmethod
+    def is_supported(cls, parent: Any) -> bool:
+        """Supported when data has a time dimension with more than 1 frame."""
+        arr = parent.image_widget.data[0] if getattr(parent, "image_widget", None) else None
+        if arr is None:
+            return False
+        dims = getattr(arr, "dims", None)
+        shape = getattr(arr, "shape", None)
+        if dims and shape:
+            dims_lower = tuple(d.lower() for d in dims)
+            if "t" in dims_lower:
+                return shape[dims_lower.index("t")] > 1
+            return False
+        # fallback: any shape with >1 in the outer dim and rank >= 3
+        return bool(shape) and len(shape) >= 3 and shape[0] > 1
+
+    def draw(self) -> None:
+        """Draw window functions controls."""
+        parent = self.parent
+
+        imgui.spacing()
+        imgui.text_colored(imgui.ImVec4(0.8, 0.8, 0.2, 1.0), "Window Functions")
+        imgui.spacing()
+        imgui.spacing()
+
+        # projection type combo (temporal operations only)
+        options = ["mean", "max", "std"]
+
+        current_display_idx = options.index(parent.proj) if parent.proj in options else 0
+
+        imgui.set_next_item_width(hello_imgui.em_size(6))
+        proj_changed, selected_display_idx = imgui.combo(
+            "Projection", current_display_idx, options
+        )
+        set_tooltip(
+            "Choose projection method over the sliding window:\n\n"
+            ' "mean" (average)\n'
+            ' "max" (peak)\n'
+            ' "std" (variance)'
+        )
+
+        if proj_changed and options[selected_display_idx] != parent.proj:
+            parent.proj = options[selected_display_idx]
+
+        # window size
+        imgui.set_next_item_width(hello_imgui.em_size(6))
+        winsize_changed, new_winsize = imgui.input_int(
+            "Window Size", parent.window_size, step=1, step_fast=2
+        )
+        set_tooltip(
+            "Size of the temporal window (in frames) used for projection."
+            " E.g. a value of 3 averages over 3 consecutive frames."
+        )
+        if winsize_changed and new_winsize > 0 and new_winsize != parent.window_size:
+            parent.window_size = new_winsize
+
+
+class SpatialFunctionsWidget(Widget):
+    """ui widget for spatial functions (gaussian blur, mean subtraction, colormap)."""
+
+    name = "Spatial Functions"
+    priority = 11  # show after window functions
+
+    def __init__(self, parent: Any):
+        super().__init__(parent)
+        self._cmaps: list[str] = list(DEFAULT_COLORMAPS)
+        self._cmap_idx: int = self._cmaps.index(DEFAULT_COLORMAP)
+        self._cmap_synced: bool = False
+
+    def _sync_cmap_from_fpl(self) -> None:
+        if self._cmap_synced:
+            return
+        iw = getattr(self.parent, "image_widget", None)
+        if iw is None:
+            return
+        try:
+            cmap_name = str(list(iw.graphics)[0].cmap or "")
+        except Exception:
+            return
+        if not cmap_name:
+            return
+        if cmap_name not in self._cmaps:
+            self._cmaps = [cmap_name] + list(DEFAULT_COLORMAPS)
+        self._cmap_idx = self._cmaps.index(cmap_name)
+        self._cmap_synced = True
+
+    @classmethod
+    def is_supported(cls, parent: Any) -> bool:
+        """Supported when data has rank > 2 (something to stack across).
+
+        A pure 2D image has no temporal or z axis — mean subtraction is
+        ill-defined and gaussian blur is trivially available on the
+        already-displayed frame without this control.
+        """
+        arr = parent.image_widget.data[0] if getattr(parent, "image_widget", None) else None
+        if arr is None:
+            return False
+        shape = getattr(arr, "shape", None)
+        return bool(shape) and len(shape) > 2
+
+    def draw(self) -> None:
+        """Draw spatial functions controls."""
+        parent = self.parent
+
+        imgui.spacing()
+        imgui.separator()
+        imgui.spacing()
+        imgui.text_colored(imgui.ImVec4(0.8, 0.8, 0.2, 1.0), "Spatial Functions")
+        imgui.spacing()
+        imgui.spacing()
+
+        # gaussian sigma
+        imgui.set_next_item_width(hello_imgui.em_size(6))
+        gaussian_changed, new_sigma = imgui.input_float(
+            "Gaussian Sigma", parent.gaussian_sigma, step=0.1, step_fast=1.0, format="%.1f"
+        )
+        set_tooltip(
+            "Apply a Gaussian blur to the preview image. Sigma is in pixels; larger values yield stronger smoothing."
+        )
+        if gaussian_changed:
+            parent.gaussian_sigma = max(0.0, new_sigma)
+
+        # mean subtraction checkbox
+        zstats_ready = all(parent._zstats_done)
+        if not zstats_ready:
+            imgui.begin_disabled()
+
+        mean_sub_changed, mean_sub_value = imgui.checkbox(
+            "Mean Subtraction", parent.mean_subtraction
+        )
+        if not zstats_ready:
+            set_tooltip("Mean subtraction requires z-stats to be computed first (in progress...)")
+            imgui.end_disabled()
+        else:
+            set_tooltip(
+                "Subtract the mean image from each frame. Useful for visualizing activity changes."
+            )
+
+        if mean_sub_changed and zstats_ready:
+            parent.mean_subtraction = mean_sub_value
+
+        # colormap selector
+        self._sync_cmap_from_fpl()
+        imgui.set_next_item_width(hello_imgui.em_size(8))
+        cmap_changed, new_cmap_idx = imgui.combo("Colormap", self._cmap_idx, self._cmaps)
+        if cmap_changed:
+            self._cmap_idx = new_cmap_idx
+            try:
+                parent.image_widget.cmap = self._cmaps[self._cmap_idx]
+            except Exception:
+                pass

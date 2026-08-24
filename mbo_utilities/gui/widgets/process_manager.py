@@ -1,0 +1,551 @@
+"""
+process manager for background operations.
+
+tracks subprocesses that can survive gui closure. stores process info
+to disk so orphaned processes can be detected on next gui launch.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any
+
+from mbo_utilities import log
+from mbo_utilities.preferences import get_mbo_dirs
+
+logger = log.get("gui.process_manager")
+
+
+
+# how long to keep completed processes visible (seconds)
+COMPLETED_RETENTION_SECONDS = 300  # 5 minutes
+
+
+@dataclass
+class ProcessInfo:
+    pid: int
+    description: str
+    start_time: float
+    task_type: str
+    output_path: str | None = None
+    args: dict | None = None
+    # runtime fields (not persisted in main list, but read from sidecar)
+    status: str = "running"
+    progress: float = 0.0
+    status_message: str = ""
+    error_details: dict | str | None = None
+    completed_time: float | None = None  # when process finished
+
+    def elapsed_seconds(self) -> float:
+        """Seconds since process started, frozen once it reaches a terminal state."""
+        end = self.completed_time if self.completed_time is not None else time.time()
+        return end - self.start_time
+
+    def elapsed_str(self) -> str:
+        """human-readable elapsed time."""
+        elapsed = self.elapsed_seconds()
+        if elapsed < 60:
+            return f"{int(elapsed)} seconds ago"
+        if elapsed < 3600:
+            return f"{int(elapsed / 60)} minutes ago"
+        return f"{elapsed / 3600:.1f} hours ago"
+
+    def update_from_sidecar(self, verbose=False):
+        """Read progress_{uuid}.json (preferred) or progress_{pid}.json."""
+        # Assume log dir is standard
+        log_dir = get_mbo_dirs()["logs"]
+
+        uuid = self.args.get("_uuid") if self.args else None
+
+        sidecar = None
+        # Try UUID first
+        if uuid:
+            candidate = log_dir / f"progress_{uuid}.json"
+            if candidate.exists():
+                sidecar = candidate
+
+        # Fallback to PID if UUID sidecar missing
+        if not sidecar:
+            # Check PID sidecar
+            candidate = log_dir / f"progress_{self.pid}.json"
+            if candidate.exists():
+                sidecar = candidate
+            elif uuid:
+                 # If neither exists and we have UUID, candidate for error reporting is UUID file
+                 # (or we report missing for both)
+                 pass
+
+        if verbose:
+            logger.debug(f"Checking sidecar for PID {self.pid} (UUID={uuid})")
+            if uuid:
+                logger.debug(f"  UUID path: {log_dir / f'progress_{uuid}.json'} (Exists: {(log_dir / f'progress_{uuid}.json').exists()})")
+            logger.debug(f"  PID path:  {log_dir / f'progress_{self.pid}.json'} (Exists: {(log_dir / f'progress_{self.pid}.json').exists()})")
+
+        if sidecar and sidecar.exists():
+            try:
+                with open(sidecar) as f:
+                    data = json.load(f)
+
+                    # Validate: either UUID matches or PID matches
+                    valid = False
+                    if (uuid and data.get("uuid") == uuid) or data.get("pid") == self.pid:
+                        valid = True
+
+                    if valid:
+                        self.status = data.get("status", self.status)
+                        self.progress = data.get("progress", self.progress)
+                        self.status_message = data.get("message", self.status_message)
+                        self.error_details = data.get("details", self.error_details)
+                        # freeze elapsed timer the moment we observe a terminal state
+                        if self.status in ("completed", "error") and self.completed_time is None:
+                            self.completed_time = data.get("timestamp", time.time())
+                    else:
+                        logger.debug(f"Identity mismatch in sidecar {sidecar}. Found pid={data.get('pid')}, uuid={data.get('uuid')}")
+            except Exception as e:
+                # Silently ignore read errors - atomic writes should prevent most issues
+                logger.debug(f"Failed to read sidecar for pid {self.pid}: {e}")
+        elif verbose:
+            logger.debug(f"No sidecar found for PID {self.pid}.")
+
+    def is_alive(self) -> bool:
+        """Check if process is still running."""
+        try:
+            # cross-platform check using os.kill with signal 0
+            # on windows, this uses ctypes internally
+            if sys.platform == "win32":
+                import ctypes
+                # Use WinDLL with use_last_error=True to correctly capture error codes
+                k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, self.pid)
+                if handle:
+                    k32.CloseHandle(handle)
+                    return True
+                err = ctypes.get_last_error()
+                if err == 5:
+                    # ERROR_ACCESS_DENIED: Process exists but we can't query it. Assume alive.
+                    return True
+                # ERROR_INVALID_PARAMETER (87) usually means PID found no process (Dead).
+                if err != 87:
+                    # Log unusual errors
+                    logger.debug(f"PID {self.pid} is_alive check failed. OpenProcess err={err}")
+                return False
+            os.kill(self.pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+    def kill(self) -> bool:
+        """Kill the process and its descendants (task-spawned pool / plane
+        workers, multiprocessing Manager).
+
+        Terminate gracefully first, then force-kill survivors. Children are
+        signalled before the parent so they are not reparented mid-kill.
+        Falls back to taskkill /T / SIGKILL if psutil is unavailable.
+        """
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+
+        if psutil is not None:
+            try:
+                parent = psutil.Process(self.pid)
+            except psutil.NoSuchProcess:
+                return True  # already gone
+            try:
+                procs = parent.children(recursive=True)
+            except psutil.NoSuchProcess:
+                procs = []
+            procs.append(parent)
+            for p in procs:
+                try:
+                    p.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            _, alive = psutil.wait_procs(procs, timeout=5)
+            for p in alive:
+                try:
+                    p.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            return True
+
+        try:
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.pid)], check=True, capture_output=True)
+            else:
+                os.kill(self.pid, 9)  # SIGKILL
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to kill process {self.pid}: {e}")
+            return False
+
+    def tail_log(self, n: int = 50) -> list[str]:
+        """Read the last n lines from the log file."""
+        if not self.output_path:
+            return []
+        p = Path(self.output_path)
+        if not p.is_file():
+            return []
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                return f.readlines()[-n:]
+        except Exception:
+            return []
+
+
+class ProcessManager:
+    """
+    manages background subprocesses that can survive gui closure.
+
+    spawns processes using subprocess.Popen with no connection to parent.
+    tracks process info in a json file so processes can be monitored
+    even after gui restart.
+    """
+
+    PROCESS_FILE = get_mbo_dirs()["cache"] / "running_processes.json"
+
+    def __init__(self):
+        self._processes: dict[int, ProcessInfo] = {}
+        self._load()
+        prune_logs()
+
+    def _load(self) -> None:
+        """Load process info from disk."""
+        if not self.PROCESS_FILE.exists():
+            return
+
+        try:
+            with open(self.PROCESS_FILE) as f:
+                data = json.load(f)
+
+            now = time.time()
+            max_age_seconds = 24 * 3600  # 24 hours max age for any process
+
+            for entry in data.get("processes", []):
+                info = ProcessInfo(**entry)
+                # skip processes older than 24 hours
+                age = now - info.start_time
+                if age > max_age_seconds:
+                    logger.debug(f"Discarding old process {info.pid} (age: {age/3600:.1f}h)")
+                    continue
+                self._processes[info.pid] = info
+
+            # save to disk if we filtered any out
+            if len(self._processes) < len(data.get("processes", [])):
+                self._save()
+
+        except Exception as e:
+            logger.warning(f"Failed to load process file: {e}")
+
+    def _save(self) -> None:
+        """Save process info to disk."""
+        self.PROCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        data = {
+            "processes": [asdict(p) for p in self._processes.values()]
+        }
+
+        try:
+            with open(self.PROCESS_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save process file: {e}")
+
+    def spawn(
+        self,
+        task_type: str,
+        args: dict[str, Any],
+        description: str,
+        output_path: str | None = None,
+    ) -> int | None:
+        """
+        Spawn a subprocess for a background task.
+
+        Parameters
+        ----------
+        task_type : str
+            type of task: "save_zarr", "suite2p", etc.
+        args : dict
+            arguments to pass to the worker.
+        description : str
+            human-readable description for display.
+        output_path : str, optional
+            output path for display purposes.
+
+        Returns
+        -------
+        int or None
+            pid of spawned process, or None if spawn failed.
+        """
+        try:
+            # Use pythonw.exe on Windows to prevent console window from appearing
+            # Output still goes to log file via stdout/stderr redirection
+            python_exe = sys.executable
+            if sys.platform == "win32" and python_exe.endswith("python.exe"):
+                pythonw = python_exe[:-10] + "pythonw.exe"
+                if Path(pythonw).exists():
+                    python_exe = pythonw
+
+            # Generate UUID for the task
+            from uuid import uuid4
+            from datetime import datetime
+
+            task_uuid = str(uuid4())
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # Central logging directory
+            log_dir = get_mbo_dirs()["logs"]
+
+            # Single log file per task: {timestamp}_{task_type}_{short_uuid}.log
+            log_file = log_dir / f"{timestamp}_{task_type}_{task_uuid[:8]}.log"
+
+            # Pass UUID and log file to arguments
+            args["_uuid"] = task_uuid
+            args["_log_file"] = str(log_file) # worker will pick this up
+
+            # write args to a temp file instead of passing on the command
+            # line. large frame selections (e.g. 11453 frames) produce
+            # a JSON blob that exceeds windows' 32768-char command-line
+            # limit (WinError 206). the file is named by the task UUID
+            # so concurrent workers never collide, and the worker deletes
+            # it after loading.
+            args_dir = log_dir  # reuse ~/.mbo/logs (already exists)
+            args_file = args_dir / f"args_{task_uuid}.json"
+            with open(args_file, "w", encoding="utf-8") as af:
+                json.dump(args, af)
+
+            # construct command — pass the file path, not the JSON blob
+            cmd = [
+                python_exe,
+                "-m", "mbo_utilities.gui._worker",
+                task_type,
+                str(args_file),
+            ]
+
+            # spawn detached process
+            # redirect output to log file
+            # open log file for redirection
+            f_out = open(log_file, "a")  # Append mode
+
+            # Force UTF-8 stdio in the worker. lsp prints status lines
+            # containing unicode (e.g. `→` U+2192 in run_plane_bin), which
+            # crash with UnicodeEncodeError on Windows because the default
+            # console encoding is cp1252 — and cp1252 is also what Python
+            # picks for redirected stdio there. PYTHONIOENCODING + PYTHONUTF8
+            # together force utf-8 for stdout/stderr writes regardless of
+            # the host code page.
+            child_env = os.environ.copy()
+            child_env.setdefault("PYTHONIOENCODING", "utf-8")
+            child_env.setdefault("PYTHONUTF8", "1")
+
+            if sys.platform == "win32":
+                # CREATE_NO_WINDOW hides the console; CREATE_NEW_PROCESS_GROUP
+                # detaches it from the GUI's Ctrl-C group so it outlives the
+                # GUI. DETACHED_PROCESS is deliberately NOT combined with
+                # CREATE_NO_WINDOW — they are conflicting console-disposition
+                # flags and together Windows pops a blank console window.
+                creationflags = (
+                    subprocess.CREATE_NO_WINDOW
+                    | subprocess.CREATE_NEW_PROCESS_GROUP
+                )
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+                proc = subprocess.Popen(
+                    cmd,
+                    creationflags=creationflags,
+                    startupinfo=startupinfo,
+                    stdin=subprocess.DEVNULL,
+                    stdout=f_out,
+                    stderr=f_out,
+                    env=child_env,
+                )
+            else:
+                # on unix, use start_new_session to detach
+                proc = subprocess.Popen(
+                    cmd,
+                    start_new_session=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=f_out,
+                    stderr=f_out,
+                    env=child_env,
+                )
+
+            # Close file handle in parent process, subprocess still owns duped copy
+            f_out.close()
+
+            # track the process
+            info = ProcessInfo(
+                pid=proc.pid,
+                description=description,
+                start_time=time.time(),
+                task_type=task_type,
+                output_path=str(log_file), # Store log path here
+                args=args,
+            )
+            self._processes[proc.pid] = info
+            self._save()
+
+            logger.info(f"Spawned background process {proc.pid}: {description}")
+            logger.debug(f"Process log: {log_file}")
+            return proc.pid
+
+        except Exception as e:
+            logger.exception(f"Failed to spawn process: {e}")
+            return None
+
+    def get_all(self) -> list[ProcessInfo]:
+        """Get all tracked processes."""
+        return list(self._processes.values())
+
+    def get_running(self) -> list[ProcessInfo]:
+        """Get processes to display (running, completed, or errored)."""
+        active = []
+        for p in self._processes.values():
+            # always update from sidecar first to get latest status
+            p.update_from_sidecar()
+            active.append(p)
+        return active
+
+    def cleanup_finished(self) -> int:
+        """
+        Remove entries for processes that have finished successfully and
+        exceeded the retention period. failed processes are kept until
+        dismissed or cleared.
+
+        returns number of entries removed.
+        """
+        now = time.time()
+        to_remove = []
+        changed = False
+
+        for pid, p in list(self._processes.items()):
+            # check sidecar one last time to capture final state
+            p.update_from_sidecar()
+
+            if not p.is_alive():
+                # verify status from sidecar one last time
+                p.update_from_sidecar()
+
+                if p.status == "error":
+                    # keep errors visible until dismissed
+                    continue
+
+                if p.status != "completed":
+                    # process died without reporting completion or error
+                    p.status = "error"
+                    p.status_message = "Process crashed unexpectedly"
+                    p.error_details = {"traceback": "Process exited without reporting results. Check worker logs."}
+                    changed = True
+                    continue
+
+                # mark completion time if not already set
+                if p.completed_time is None:
+                    p.completed_time = now
+                    changed = True
+
+                # check if retention period has passed
+                if now - p.completed_time > COMPLETED_RETENTION_SECONDS:
+                    to_remove.append(pid)
+
+        for pid in to_remove:
+            del self._processes[pid]
+
+        if to_remove or changed:
+            self._save()
+            if to_remove:
+                logger.debug(f"Cleaned up {len(to_remove)} finished processes")
+
+        return len(to_remove)
+
+    def kill(self, pid: int) -> bool:
+        """Kill a tracked process by pid."""
+        if pid not in self._processes:
+            return False
+
+        info = self._processes[pid]
+        if info.kill():
+            del self._processes[pid]
+            self._save()
+            return True
+        return False
+
+    def kill_all(self) -> int:
+        """Kill all tracked processes. returns count killed."""
+        killed = 0
+        for pid in list(self._processes.keys()):
+            if self.kill(pid):
+                killed += 1
+        return killed
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def prune_logs() -> None:
+    """Trim ~/.mbo/logs so task logs don't accumulate unbounded.
+
+    Deletes transient sidecars (progress_*/args_*/*.tmp) past a 24h grace, and
+    keeps the newest ``MBO_LOG_KEEP_RECENT`` (25) task logs while dropping the
+    rest once older than ``MBO_LOG_RETENTION_DAYS`` (14). Best-effort: a running
+    task's recent files fall inside the grace/keep window and are spared.
+    """
+    try:
+        log_dir = get_mbo_dirs()["logs"]
+        now = time.time()
+        retention = _env_int("MBO_LOG_RETENTION_DAYS", 14) * 86400
+        keep_recent = _env_int("MBO_LOG_KEEP_RECENT", 25)
+        grace = 24 * 3600
+
+        removed = 0
+        for pat in ("progress_*.json", "args_*.json", "*.tmp"):
+            for p in log_dir.glob(pat):
+                try:
+                    if now - p.stat().st_mtime > grace:
+                        p.unlink(missing_ok=True)
+                        removed += 1
+                except OSError:
+                    pass
+
+        logs = sorted(
+            (p for p in log_dir.glob("*.log*") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        cutoff = now - retention
+        for p in logs[keep_recent:]:
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                pass
+
+        if removed:
+            logger.debug(f"prune_logs: removed {removed} stale files from {log_dir}")
+    except Exception as e:
+        logger.debug(f"prune_logs failed: {e}")
+
+
+# global process manager instance
+_manager: ProcessManager | None = None
+
+
+def get_process_manager() -> ProcessManager:
+    """Get the global process manager instance."""
+    global _manager
+    if _manager is None:
+        _manager = ProcessManager()
+    return _manager

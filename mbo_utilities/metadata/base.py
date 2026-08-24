@@ -1,0 +1,559 @@
+"""
+base types and data structures for metadata handling.
+
+this module contains the core types used across the metadata system:
+- MetadataParameter: standardized parameter definition
+- VoxelSize: named tuple for voxel dimensions
+- METADATA_PARAMS: central registry of known parameters
+- alias lookup utilities
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import NamedTuple, Any
+
+
+@dataclass
+class MetadataParameter:
+    """
+    Standardized metadata parameter.
+
+    Provides a central registry for parameter names, their aliases across
+    different formats (ScanImage, Suite2p, OME, TIFF tags), and type information.
+
+    Attributes
+    ----------
+    canonical : str
+        The standard key name (e.g., "dx", "fs", "num_zplanes").
+    aliases : tuple[str, ...]
+        All known aliases for this parameter.
+    dtype : type
+        Expected Python type (float, int, str).
+    unit : str, optional
+        Physical unit if applicable (e.g., "micrometer", "Hz").
+    default : Any
+        Default value if parameter is not found in metadata.
+    description : str
+        Human-readable description of the parameter.
+    label : str, optional
+        Display label for GUI (e.g., "Frame Rate" for "fs").
+    transforms : dict, optional
+        Transform aliases: keys that hold a *converted* form of this value
+        (e.g. ImageJ ``finterval`` = 1/``fs``). Each value is a
+        ``(to_canonical, from_canonical)`` pair of callables — `get_param`
+        applies ``to_canonical`` on read, writers apply ``from_canonical``
+        to emit the alias. Distinct from `aliases`, which hold the value
+        verbatim.
+    """
+
+    canonical: str
+    aliases: tuple[str, ...] = field(default_factory=tuple)
+    dtype: type = float
+    unit: str | None = None
+    default: Any = None
+    description: str = ""
+    label: str = ""
+    transforms: dict[str, tuple] = field(default_factory=dict)
+
+
+class VoxelSize(NamedTuple):
+    """
+    Voxel size in micrometers (dx, dy, dz).
+
+    This class represents the physical size of a voxel in 3D space.
+    All values are in micrometers.
+
+    Attributes
+    ----------
+    dx : float
+        Pixel size in X dimension (µm / px).
+    dy : float
+        Pixel size in Y dimension (µm / px).
+    dz : float | None, optional
+        Pixel/voxel size in Z dimension (µm / px).
+        For LBM configurations, this must be supplied by the user.
+
+    Examples
+    --------
+    >>> vs = VoxelSize(0.5, 0.5, 5.0)
+    >>> vs.dx
+    0.5
+    >>> vs.dz
+    5.0
+    >>> tuple(vs)
+    (0.5, 0.5, 5.0)
+    """
+
+    dx: float
+    dy: float
+    dz: float | None
+
+    @property
+    def pixel_resolution(self) -> tuple[float, float]:
+        """Return (dx, dy) tuple for backward compatibility."""
+        return (self.dx, self.dy)
+
+    @property
+    def voxel_size(self) -> tuple[float, float, float | None]:
+        """Return (dx, dy, dz) tuple."""
+        return (self.dx, self.dy, self.dz)
+
+    def to_dict(self, include_aliases: bool = True) -> dict:
+        """
+        Convert to dictionary with optional aliases.
+
+        Parameters
+        ----------
+        include_aliases : bool
+            If True, includes all standard aliases (OME, ImageJ, legacy).
+
+        Returns
+        -------
+        dict
+            Dictionary with resolution values and aliases.
+        """
+        result = {
+            "dx": self.dx,
+            "dy": self.dy,
+            "dz": self.dz,
+            "pixel_resolution": self.pixel_resolution,
+            "voxel_size": self.voxel_size,
+        }
+
+        if include_aliases:
+            # OME format
+            result["PhysicalSizeX"] = self.dx
+            result["PhysicalSizeY"] = self.dy
+            result["PhysicalSizeZ"] = self.dz
+            result["PhysicalSizeXUnit"] = "micrometer"
+            result["PhysicalSizeYUnit"] = "micrometer"
+            result["PhysicalSizeZUnit"] = "micrometer"
+
+            # additional aliases
+            result["z_step"] = self.dz  # backward compat
+
+        return result
+
+
+def _reciprocal(value: Any) -> float:
+    """Convert between a rate and its interval (fs <-> finterval, px/µm <-> µm/px)."""
+    v = float(value)
+    if v == 0:
+        raise ZeroDivisionError("cannot invert a zero-valued metadata field")
+    return 1.0 / v
+
+
+# metadata params registry
+# dimensions: TZYX (4D), TYX (3D), or YX (2D)
+METADATA_PARAMS: dict[str, MetadataParameter] = {
+    # spatial resolution (micrometers per pixel)
+    "dx": MetadataParameter(
+        canonical="dx",
+        aliases=(
+            "Dx",
+            "PhysicalSizeX",
+            "pixelResolutionX",
+            "pixel_size_x",
+            "pixel_resolution_um",
+        ),
+        dtype=float,
+        unit="µm",
+        default=1.0,
+        description="Pixel size in X dimension (µm/pixel)",
+        label="Pixel Size X",
+        # TIFF/ImageJ XResolution is pixels-per-µm, the inverse of dx
+        transforms={"XResolution": (_reciprocal, _reciprocal)},
+    ),
+    "dy": MetadataParameter(
+        canonical="dy",
+        aliases=(
+            "Dy",
+            "PhysicalSizeY",
+            "pixelResolutionY",
+            "pixel_size_y",
+        ),
+        dtype=float,
+        unit="µm",
+        default=1.0,
+        description="Pixel size in Y dimension (µm/pixel)",
+        label="Pixel Size Y",
+        transforms={"YResolution": (_reciprocal, _reciprocal)},
+    ),
+    "dz": MetadataParameter(
+        canonical="dz",
+        aliases=(
+            "Dz",
+            "PhysicalSizeZ",
+            "z_step",
+            "z_step_um",
+            "spacing",
+            "pixelResolutionZ",
+            "ZResolution",
+            "axial_step",
+            "axial_step_um",
+        ),
+        dtype=float,
+        unit="µm",
+        default=None,
+        description="Voxel size in Z dimension (µm/z-step). Must be user-supplied for LBM.",
+        label="Z Step",
+    ),
+    # temporal
+    "fs": MetadataParameter(
+        canonical="fs",
+        aliases=(
+            "frame_rate",
+            "framerate",
+            "fr",
+            "sampling_frequency",
+            "frameRate",
+            "scanFrameRate",
+            "fps",
+        ),
+        dtype=float,
+        unit="Hz",
+        default=None,
+        description="Frame rate / sampling frequency (Hz)",
+        label="Frame Rate",
+        # ImageJ/Fiji store the per-frame interval (seconds); fs = 1/finterval
+        transforms={"finterval": (_reciprocal, _reciprocal)},
+    ),
+    # volumes per second (for volumetric imaging like IsoView)
+    "vps": MetadataParameter(
+        canonical="vps",
+        aliases=("volumes_per_second",),
+        dtype=float,
+        unit="Hz",
+        default=None,
+        description="Volumetric acquisition rate (volumes per second)",
+        label="Volume Rate",
+    ),
+    # ImageJ frame interval (seconds between frames, inverse of fs)
+    "finterval": MetadataParameter(
+        canonical="finterval",
+        aliases=(
+            "frame_interval",
+            "FrameInterval",
+            "dt",
+            "time_interval",
+        ),
+        dtype=float,
+        unit="s",
+        default=None,
+        description="Frame interval in seconds (1/fs). Used by ImageJ/Fiji.",
+        label="Frame Interval",
+        transforms={"fs": (_reciprocal, _reciprocal)},
+    ),
+    # image dimensions (pixels)
+    "Lx": MetadataParameter(
+        canonical="Lx",
+        aliases=(
+            "lx",
+            "LX",
+            "width",
+            "nx",
+            "size_x",
+            "image_width",
+            "fov_x",
+            "num_px_x",
+            "page_width",
+            "ImageWidth",
+        ),
+        dtype=int,
+        unit="px",
+        default=None,
+        description="Image width in pixels",
+    ),
+    "Ly": MetadataParameter(
+        canonical="Ly",
+        aliases=(
+            "ly",
+            "LY",
+            "height",
+            "ny",
+            "size_y",
+            "image_height",
+            "fov_y",
+            "num_px_y",
+            "page_height",
+            "ImageLength",
+        ),
+        dtype=int,
+        unit="px",
+        default=None,
+        description="Image height in pixels",
+    ),
+    # frame/plane/channel counts
+    # note: in suite2p ops.npy, "nframes" means timepoints (post-registration), not per-slice frames
+    "num_timepoints": MetadataParameter(
+        canonical="num_timepoints",
+        aliases=(
+            "nframes",        # suite2p ops.npy compatibility
+            "num_frames",     # legacy alias
+            "n_frames",
+            "frames",
+            "T",
+            "nt",
+            "timepoints",
+            "n_timepoints",
+        ),
+        dtype=int,
+        default=None,
+        description="Number of timepoints (T dimension) in the dataset",
+        label="Timepoints",
+    ),
+    "num_zplanes": MetadataParameter(
+        canonical="num_zplanes",
+        aliases=(
+            "num_planes",
+            "nplanes",
+            "n_planes",
+            "planes",
+            "Z",
+            "nz",
+            "num_z",
+            "numPlanes",
+            "zplanes",
+            "slices",
+        ),
+        dtype=int,
+        default=1,
+        description="Number of z-planes",
+        label="Num Z-Planes",
+    ),
+    "nchannels": MetadataParameter(
+        canonical="nchannels",
+        aliases=(
+            "num_channels",
+            "n_channels",
+            "channels",
+            "C",
+            "nc",
+            "numChannels",
+        ),
+        dtype=int,
+        default=1,
+        description="Number of channels (typically 1 for calcium imaging)",
+    ),
+    # data type
+    "dtype": MetadataParameter(
+        canonical="dtype",
+        aliases=("data_type", "pixel_type", "datatype"),
+        dtype=str,
+        default="int16",
+        description="Data type of pixel values",
+    ),
+    # total number of elements
+    "size": MetadataParameter(
+        canonical="size",
+        aliases=("num_elements", "total_elements"),
+        dtype=int,
+        default=None,
+        description="Total number of elements in the array (product of dimensions)",
+    ),
+    # array shape tuple
+    "shape": MetadataParameter(
+        canonical="shape",
+        aliases=("array_shape", "data_shape"),
+        dtype=tuple,
+        default=None,
+        description="Array shape as tuple (T, Z, Y, X) or (T, Y, X) or (Y, X)",
+    ),
+    # stack detection (ScanImage-derived)
+    "stack_type": MetadataParameter(
+        canonical="stack_type",
+        aliases=("stackType",),
+        dtype=str,
+        default="single_plane",
+        description="Stack type: lbm, piezo, or single_plane",
+    ),
+    "lbm_stack": MetadataParameter(
+        canonical="lbm_stack",
+        aliases=("is_lbm", "lbmStack"),
+        dtype=bool,
+        default=False,
+        description="True if Light Beads Microscopy stack",
+    ),
+    "piezo_stack": MetadataParameter(
+        canonical="piezo_stack",
+        aliases=("is_piezo", "piezoStack"),
+        dtype=bool,
+        default=False,
+        description="True if piezo-driven z-stack",
+    ),
+    "num_color_channels": MetadataParameter(
+        canonical="num_color_channels",
+        aliases=("color_channels", "ncolors", "num_colors"),
+        dtype=int,
+        default=1,
+        description="Number of color channels (1 or 2)",
+    ),
+    # ROI/FOV parameters
+    "num_mrois": MetadataParameter(
+        canonical="num_mrois",
+        aliases=("num_rois", "scanimage_multirois", "numROIs", "nrois", "n_rois"),
+        dtype=int,
+        default=1,
+        description="Number of mROIs (ScanImage multi-ROI scan regions)",
+    ),
+    "roi": MetadataParameter(
+        canonical="roi",
+        aliases=("roi_size", "roi_px"),
+        dtype=tuple,
+        unit="px",
+        default=None,
+        description="ROI dimensions as (width, height) in pixels",
+    ),
+    "fov": MetadataParameter(
+        canonical="fov",
+        aliases=("fov_px",),
+        dtype=tuple,
+        unit="px",
+        default=None,
+        description="Field of view as (x, y) in pixels (tiled)",
+    ),
+    "fov_um": MetadataParameter(
+        canonical="fov_um",
+        aliases=(),
+        dtype=tuple,
+        unit="µm",
+        default=None,
+        description="Field of view as (x, y) in µm (tiled)",
+    ),
+}
+
+
+def _build_alias_map() -> dict[str, str]:
+    """Build reverse lookup: alias (lowercase) -> canonical name."""
+    alias_map = {}
+    for param in METADATA_PARAMS.values():
+        alias_map[param.canonical.lower()] = param.canonical
+        for alias in param.aliases:
+            alias_map[alias.lower()] = param.canonical
+    return alias_map
+
+
+ALIAS_MAP: dict[str, str] = _build_alias_map()
+
+
+def get_canonical_name(name: str) -> str | None:
+    """
+    Get the canonical parameter name for an alias.
+
+    Parameters
+    ----------
+    name : str
+        Parameter name or alias.
+
+    Returns
+    -------
+    str or None
+        Canonical name, or None if not a registered parameter.
+    """
+    return ALIAS_MAP.get(name.lower())
+
+
+# core imaging metadata keys - always shown in metadata viewers/editors
+# these are the essential parameters for calcium imaging data
+IMAGING_METADATA_KEYS: tuple[str, ...] = (
+    "fs",
+    "dx",
+    "dy",
+    "dz",
+    "Lx",
+    "Ly",
+    "num_zplanes",
+    "num_color_channels",
+    "num_mrois",
+    "num_timepoints",
+    "dtype",
+)
+
+
+# fields stripped from tiff/h5/zarr metadata before stamping. these
+# belong only in suite2p layouts (ops.npy alongside data.bin) — embedding
+# them in non-suite2p outputs bloats files (regPC alone can be 500+ MB
+# after JSON expansion) and clutters readers like Fiji that load the
+# entire metadata blob into memory.
+
+_SUITE2P_REGISTRATION_INTERNALS = (
+    "regPC", "tPC", "regDX",
+    "yblock", "xblock", "NRsm",
+)
+
+_SUITE2P_SUMMARY_IMAGES = (
+    "meanImg", "meanImgE", "meanImg_chan2",
+    "Vmap", "Vcorr", "Vsplit", "Vmax",
+    "max_proj",
+    "refImg", "refImg1", "refAndMasks",
+)
+
+_PER_FRAME_VECTORS = (
+    "xoff", "yoff", "corrXY",
+    "xoff1", "yoff1", "corrXY1",
+    "badframes",
+)
+
+# plane_shifts / plane_shifts_params are intentionally NOT denylisted:
+# register_z writes them so viewers can align planes at render time
+# (see arrays/_registration.py), so they must survive export.
+_MBO_ADDITIONS = (
+    "processing_history", "_metadata_provenance",
+    "roi_mode",
+)
+
+_SUITE2P_GEOMETRY = (
+    "Ly", "Lx", "nframes", "nplanes", "nchannels",
+    "num_rois", "aspect", "tau",
+    "functional_chan", "align_by_chan",
+)
+
+_SUITE2P_PIPELINE_SETTINGS = (
+    "do_registration", "keep_movie_raw", "two_step_registration",
+    "nimg_init", "multiplane_parallel",
+    "nbinned", "batch_size",
+    "diameter", "cell_diameter", "spatial_scale", "spatscale_pix",
+    "roidetect", "spikedetect", "neuropil_extract",
+    "denoise", "anatomical_only",
+    "sparse_mode", "connected",
+    "threshold_scaling", "max_overlap", "max_iterations",
+    "high_pass", "smooth_sigma", "smooth_sigma_time",
+    "nonrigid", "block_size", "snr_thresh", "maxregshift",
+    "use_builtin_classifier", "classifier_path",
+    "preclassify", "chan2_thres",
+    "lam_percentile", "allow_overlap",
+    "inner_neuropil_radius", "min_neuropil_pixels",
+    "neucoeff",
+    "soma_crop", "win_baseline", "sig_baseline", "prctile_baseline",
+    "data_path", "save_path", "save_path0", "save_folder",
+    "fast_disk", "ops_path", "input_format",
+    "save_NWB", "save_mat",
+    "first_tiffs", "frames_include",
+    "h5py", "h5py_key",
+    "delete_bin", "combined", "report_time",
+    "do_bidiphase", "bidiphase",
+    "1Preg", "spatial_hp", "pre_smooth", "spatial_taper",
+)
+
+EXPORT_DENYLIST: frozenset[str] = frozenset(
+    _SUITE2P_REGISTRATION_INTERNALS
+    + _SUITE2P_SUMMARY_IMAGES
+    + _PER_FRAME_VECTORS
+    + _MBO_ADDITIONS
+    + _SUITE2P_GEOMETRY
+    + _SUITE2P_PIPELINE_SETTINGS
+)
+
+
+def strip_for_export(md: dict) -> dict:
+    """drop fields that should not be embedded in tiff/h5/zarr metadata.
+
+    suite2p ops fields (registration internals, summary images, per-frame
+    vectors, pipeline settings) and mbo-internal additions are kept only
+    in suite2p layouts (ops.npy alongside data.bin). everything else —
+    OME, ImageJ aliases, voxel size, frame rate, user description, etc. —
+    passes through untouched.
+    """
+    return {k: v for k, v in md.items() if k not in EXPORT_DENYLIST}
+
+

@@ -1,0 +1,310 @@
+"""
+Menu bar and process status indicator.
+
+This module contains the main menu bar and process status indicator.
+"""
+
+from __future__ import annotations
+
+import webbrowser
+from pathlib import Path
+from typing import Any
+
+from imgui_bundle import imgui, imgui_ctx, portable_file_dialogs as pfd
+
+from mbo_utilities.preferences import get_last_dir
+from mbo_utilities.gui._imgui_helpers import PopupAutoSize
+from mbo_utilities.gui.widgets.process_manager import get_process_manager
+
+
+def draw_menu_bar(parent: Any):
+    """Draw the menu bar within the current window/child scope."""
+    with imgui_ctx.begin_child(
+        "menu",
+        window_flags=imgui.WindowFlags_.menu_bar,
+        child_flags=imgui.ChildFlags_.auto_resize_y
+        | imgui.ChildFlags_.always_auto_resize,
+    ):
+        if imgui.begin_menu_bar():
+            if imgui.begin_menu("File", True):
+                # Open File - iw-array API
+                if imgui.menu_item("Open File", "o", p_selected=False, enabled=True)[0]:
+                    # Handle fpath being a list or a string
+                    fpath = parent.fpath[0] if isinstance(parent.fpath, list) else parent.fpath
+                    if fpath and Path(fpath).exists():
+                        start_dir = str(Path(fpath).parent)
+                    else:
+                        # Use open_file context-specific preference
+                        start_dir = str(get_last_dir("open_file") or Path.home())
+                    parent._file_dialog = pfd.open_file(
+                        "Select Data File(s)",
+                        start_dir,
+                        ["Image Files", "*.tif *.tiff *.zarr *.npy *.bin", "All Files", "*"],
+                        pfd.opt.multiselect
+                    )
+                # Open Folder - iw-array API
+                if imgui.menu_item("Open Folder", "Shift+O", p_selected=False, enabled=True)[0]:
+                    # Handle fpath being a list or a string
+                    fpath = parent.fpath[0] if isinstance(parent.fpath, list) else parent.fpath
+                    if fpath and Path(fpath).exists():
+                        start_dir = str(Path(fpath).parent)
+                    else:
+                        # Use open_folder context-specific preference
+                        start_dir = str(get_last_dir("open_folder") or Path.home())
+                    parent._folder_dialog = pfd.select_folder("Select Data Folder", start_dir)
+                imgui.separator()
+                if imgui.menu_item("Set Metadata", "Shift+M", p_selected=False, enabled=True)[0]:
+                    parent._show_metadata_popup = True
+                imgui.separator()
+                # Check if current data supports imwrite
+                can_save = parent.is_mbo_scan
+                if parent.image_widget and parent.image_widget.data:
+                    arr = parent.image_widget.data[0]
+                    can_save = hasattr(arr, "_imwrite")
+                if imgui.menu_item(
+                    "Save as", "s", p_selected=False, enabled=can_save
+                )[0]:
+                    parent._saveas_popup_open = True
+                if not can_save and imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
+                    imgui.begin_tooltip()
+                    arr_type = type(parent.image_widget.data[0]).__name__ if parent.image_widget and parent.image_widget.data else "Unknown"
+                    imgui.text(f"{arr_type} does not support saving.")
+                    imgui.end_tooltip()
+                imgui.separator()
+                if imgui.menu_item("Options", "", p_selected=False, enabled=True)[0]:
+                    parent._show_options_popup = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Render GPU adapter, debug logging, and other settings")
+                imgui.end_menu()
+            if imgui.begin_menu("Docs", True):
+                if imgui.menu_item(
+                    "Help", "F1", p_selected=False, enabled=True
+                )[0]:
+                    parent._show_help_popup = True
+                if imgui.menu_item(
+                    "Keybinds", "/", p_selected=False, enabled=True
+                )[0]:
+                    parent._show_keybinds_popup = True
+                imgui.separator()
+                if imgui.menu_item(
+                    "Online Docs", "", p_selected=False, enabled=True
+                )[0]:
+                    webbrowser.open(
+                        "https://millerbrainobservatory.github.io/mbo_utilities/"
+                    )
+                imgui.end_menu()
+        imgui.end_menu_bar()
+
+        # Draw process status indicator (consolidated)
+        parent._clear_stale_progress()
+        draw_process_status_indicator(parent)
+
+def draw_process_status_indicator(parent: Any):
+    """Draw compact process status indicator in top-left with color coding."""
+    # Import icons
+    try:
+        from imgui_bundle import icons_fontawesome as fa
+        ICON_IDLE = fa.ICON_FA_CIRCLE
+        ICON_RUNNING = fa.ICON_FA_SPINNER
+        ICON_ERROR = fa.ICON_FA_EXCLAMATION_TRIANGLE
+        ICON_CHECK = fa.ICON_FA_CHECK_CIRCLE
+    except (ImportError, AttributeError):
+        # Fallback to unicode
+        ICON_IDLE = "\uf111"  # circle
+        ICON_RUNNING = "\uf110"  # spinner
+        ICON_ERROR = "\uf071"  # exclamation-triangle
+        ICON_CHECK = "\uf058"  # check-circle
+
+    pm = get_process_manager()
+    pm.cleanup_finished()
+    all_procs = pm.get_running()
+
+    # Get in-app progress items
+    from mbo_utilities.gui.widgets.progress_bar import _get_active_progress_items
+    progress_items = _get_active_progress_items(parent)
+
+    # categorize processes
+    running_procs = [p for p in all_procs if p.is_alive()]
+    completed_procs = [p for p in all_procs if not p.is_alive() and p.status == "completed"]
+    error_procs = [p for p in all_procs if not p.is_alive() and p.status == "error"]
+
+    n_running = len(running_procs) + sum(1 for item in progress_items if not item.get("done"))
+    n_completed = len(completed_procs)
+    n_errors = len(error_procs)
+
+    # Determine status color and icon. `status_width_text` (when set) sizes the
+    # button to a fixed worst-case width so a per-frame-changing label (the live
+    # %) doesn't make the click target jitter and drop clicks.
+    status_width_text = None
+    if n_errors > 0:
+        # errors take priority
+        status_color = imgui.ImVec4(0.8, 0.2, 0.2, 1.0)  # Dark Red
+        status_text = f"{ICON_ERROR} Error ({n_errors})"
+    elif n_running > 0:
+        # actively running tasks
+        status_color = imgui.ImVec4(0.85, 0.45, 0.0, 1.0)  # Dark Orange
+
+        # Add percentage if we have progress items
+        if progress_items:
+            avg_progress = sum(item["progress"] for item in progress_items) / len(progress_items)
+            status_text = f"{ICON_RUNNING} Running ({n_running}) {int(avg_progress * 100)}%"
+            # widest the % can get -> fixes the button width as it animates
+            status_width_text = f"{ICON_RUNNING} Running ({n_running}) 100%"
+        else:
+            status_text = f"{ICON_RUNNING} Running ({n_running})"
+    elif n_completed > 0:
+        # completed tasks waiting to be acknowledged
+        status_color = imgui.ImVec4(0.15, 0.55, 0.15, 1.0)  # Dark Green
+        task_word = "task" if n_completed == 1 else "tasks"
+        status_text = f"{ICON_CHECK} Completed {n_completed} {task_word}"
+    else:
+        # idle
+        status_color = imgui.ImVec4(0.15, 0.55, 0.15, 1.0)  # Dark Green
+        status_text = f"{ICON_IDLE} Idle"
+
+    # Draw rounded buttons
+    imgui.push_style_var(imgui.StyleVar_.frame_rounding, 5.0)
+
+    # 1. Status Button
+    # Use distinct background color based on status
+    imgui.push_style_color(imgui.Col_.button, status_color)
+    imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(1, 1, 1, 1))  # Always white text
+
+    # Slightly lighter hover color
+    hover_col = imgui.ImVec4(
+        min(status_color.x + 0.1, 1.0),
+        min(status_color.y + 0.1, 1.0),
+        min(status_color.z + 0.1, 1.0),
+        status_color.w
+    )
+    imgui.push_style_color(imgui.Col_.button_hovered, hover_col)
+    imgui.push_style_color(imgui.Col_.button_active, status_color)
+
+    # fixed width while the label animates so the click target stays put
+    if status_width_text is not None:
+        pad = imgui.get_style().frame_padding.x
+        btn_w = imgui.calc_text_size(status_width_text).x + pad * 2.0
+        clicked = imgui.button(status_text + "##process_status", imgui.ImVec2(btn_w, 0.0))
+    else:
+        clicked = imgui.button(status_text + "##process_status")
+    if clicked:
+        parent._show_process_console = True
+
+    imgui.pop_style_color(4)  # button, text, hovered, active
+
+    if imgui.is_item_hovered():
+        imgui.set_mouse_cursor(imgui.MouseCursor_.hand)
+        imgui.set_tooltip("Click to view process console")
+
+    # 2. Metadata Button
+    imgui.same_line()
+    # Dark grey background
+    imgui.push_style_color(imgui.Col_.button, imgui.ImVec4(0.2, 0.2, 0.2, 1.0))
+    imgui.push_style_color(imgui.Col_.button_hovered, imgui.ImVec4(0.3, 0.3, 0.3, 1.0))
+    imgui.push_style_color(imgui.Col_.button_active, imgui.ImVec4(0.15, 0.15, 0.15, 1.0))
+    imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.9, 0.9, 0.9, 1.0))
+
+    if imgui.button("Metadata Viewer (m)"):
+        parent.show_metadata_viewer = not parent.show_metadata_viewer
+
+    imgui.pop_style_color(4)
+    imgui.pop_style_var()  # frame_rounding
+
+
+def draw_keybinds_popup(parent: Any):
+    """Draw the keybinds cheatsheet popup.
+
+    `_show_keybinds_popup` is the desired state: True = should be open,
+    False = should be closed. The 'k' shortcut flips it.
+    """
+    if not hasattr(parent, "_show_keybinds_popup"):
+        parent._show_keybinds_popup = False
+    if not hasattr(parent, "_keybinds_popup_actually_open"):
+        parent._keybinds_popup_actually_open = False
+    if not hasattr(parent, "_keybinds_sizer"):
+        parent._keybinds_sizer = PopupAutoSize("Keybinds", auto_resize=False)
+
+    # sync imgui's popup state with desired state
+    if parent._show_keybinds_popup and not parent._keybinds_popup_actually_open:
+        parent._keybinds_sizer.before_open()
+        imgui.open_popup("Keybinds")
+        parent._keybinds_popup_actually_open = True
+
+    imgui.set_next_window_size(imgui.ImVec2(320, 380), imgui.Cond_.first_use_ever)
+    popup_open = imgui.begin_popup_modal("Keybinds", flags=imgui.WindowFlags_.no_saved_settings)[0]
+    if popup_open:
+        # if user flipped the flag off (e.g. pressed k again), close the popup
+        if not parent._show_keybinds_popup:
+            imgui.close_current_popup()
+            parent._keybinds_popup_actually_open = False
+        imgui.text_colored(imgui.ImVec4(0.8, 0.8, 0.2, 1.0), "Keyboard Shortcuts")
+        imgui.separator()
+        imgui.dummy(imgui.ImVec2(0, 5))
+
+        # keybinds data: (key, description)
+        keybinds = [
+            ("Navigation", None),
+            ("\u2190 / \u2192", "Previous / Next frame (T)"),
+            ("\u2191 / \u2193", "Previous / Next z-plane (Z)"),
+            ("Shift + \u2190/\u2192", "Jump 10 frames (T)"),
+            ("Shift + \u2191/\u2193", "Jump 10 z-planes (Z)"),
+            ("", ""),
+            ("File", None),
+            ("o", "Open file"),
+            ("Shift + O", "Open folder"),
+            ("Shift + M", "Set metadata"),
+            ("s", "Save as"),
+            ("", ""),
+            ("View", None),
+            ("m", "Toggle metadata viewer"),
+            ("Shift + L", "Focus metadata search (when viewer open)"),
+            ("p / Enter", "Toggle side panel"),
+            ("Space", "Play / pause"),
+            ("v", "Reset vmin/vmax"),
+            ("Shift + V", "Toggle auto-contrast on Z"),
+            ("c", "Toggle fix scan-phase"),
+            ("Shift + C", "Toggle sub-pixel scan-phase"),
+            ("", ""),
+            ("Help", None),
+            ("h / F1", "Open help"),
+            ("k", "Open/close this popup"),
+        ]
+
+        table_flags = imgui.TableFlags_.sizing_fixed_fit | imgui.TableFlags_.no_borders_in_body
+        if imgui.begin_table("keybinds_table", 2, table_flags):
+            imgui.table_setup_column("key", imgui.TableColumnFlags_.width_fixed, 80)
+            imgui.table_setup_column("desc", imgui.TableColumnFlags_.width_stretch)
+
+            for key, desc in keybinds:
+                if desc is None:
+                    # section header
+                    imgui.table_next_row()
+                    imgui.table_next_column()
+                    imgui.dummy(imgui.ImVec2(0, 3))
+                    imgui.text_colored(imgui.ImVec4(0.6, 0.8, 1.0, 1.0), key)
+                    imgui.table_next_column()
+                elif key == "":
+                    # spacer
+                    imgui.table_next_row()
+                    imgui.table_next_column()
+                    imgui.table_next_column()
+                else:
+                    imgui.table_next_row()
+                    imgui.table_next_column()
+                    imgui.text_colored(imgui.ImVec4(0.9, 0.9, 0.5, 1.0), key)
+                    imgui.table_next_column()
+                    imgui.text(desc)
+
+            imgui.end_table()
+
+        imgui.dummy(imgui.ImVec2(0, 10))
+        if imgui.button("Close", imgui.ImVec2(80, 0)):
+            imgui.close_current_popup()
+            parent._show_keybinds_popup = False
+            parent._keybinds_popup_actually_open = False
+
+        imgui.end_popup()
+    else:
+        # imgui reports popup is not being drawn (e.g. user pressed escape)
+        parent._keybinds_popup_actually_open = False
+        parent._show_keybinds_popup = False
