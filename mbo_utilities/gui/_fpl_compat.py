@@ -15,7 +15,7 @@ import inspect
 import fastplotlib as fpl
 
 # upstream slider dims, left -> right (ALLOWED_SLIDER_DIMS in fpl)
-_SLIDER_DIM_ORDER = ("t", "z")
+_SLIDER_DIM_ORDER = ("t", "z", "c")
 
 
 def image_widget_cls():

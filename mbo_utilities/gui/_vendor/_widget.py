@@ -1,4 +1,5 @@
 from copy import deepcopy
+from itertools import product
 from typing import Callable
 from warnings import warn
 
@@ -20,16 +21,65 @@ IMAGE_DIM_COUNTS = {"gray": 2, "rgb": 3}
 # Map boolean (indicating whether we use RGB or grayscale) to the string. Used to index RGB_DIM_MAP
 RGB_BOOL_MAP = {False: "gray", True: "rgb"}
 
-# Dimensions that can be scrolled from a given data array
+# Dimensions that can be scrolled from a given data array. Upstream stops at
+# two ("tz"); mbo adds a third so a canonical TCZYX array with timepoints,
+# colour channels AND z-planes/ROIs all non-singleton gets three sliders
+# instead of being refused by _get_n_scrollable_dims. The letters are
+# positional labels for axes 0/1/2 — the names the user sees come from the
+# widget's `_slider_dim_names`.
 SCROLLABLE_DIMS_ORDER = {
     0: "",
     1: "t",
     2: "tz",
+    3: "tzc",
 }
 
-ALLOWED_SLIDER_DIMS = {0: "t", 1: "z"}
+ALLOWED_SLIDER_DIMS = {0: "t", 1: "z", 2: "c"}
 
+# window/rolling functions stay on the first two axes; there is no meaningful
+# rolling window over a channel or ROI axis.
 ALLOWED_WINDOW_DIMS = {"t", "z"}
+
+# hard-coded playback-bar heights, by slider count (+24 px for the title row
+# the ImguiWindow base draws)
+SLIDER_UI_SIZES = {0: 81, 1: 130, 2: 179, 3: 228}
+
+
+# How many positions to visit on each scrollable axis when rescaling contrast
+# "w.r.t. the full data", outermost axis first. Reading every frame is not an
+# option — a MESc unit runs to 45k frames on disk — so the range comes from an
+# even sample. The counts multiply out to ~64 frames whatever the rank, and
+# every read is a single 2D frame, so cost tracks frame size, not movie length.
+VMINMAX_SAMPLE_COUNTS = {1: (64,), 2: (24, 3), 3: (12, 3, 2)}
+
+
+def _sample_array(data) -> np.ndarray:
+    """Values from a bounded, evenly spread sample of `data`.
+
+    2D data is returned whole. Anything deeper is sampled across *every*
+    scrollable axis, not just the first — sampling time alone would report one
+    channel's or one ROI's range as the whole array's.
+
+    Each element of the sample is addressed with a fully scalar key so the
+    read is one 2D frame; a partial key would pull a whole volume per sample
+    (an isoview timepoint is every camera x every z-plane).
+    """
+    shape = tuple(getattr(data, "shape", ()) or ())
+    if len(shape) <= 2:
+        return np.asarray(data)
+    scroll = shape[:-2]
+    if any(n == 0 for n in scroll):
+        return np.empty(0)
+    counts = VMINMAX_SAMPLE_COUNTS.get(len(scroll), (8,) * len(scroll))
+    grids = [
+        np.unique(np.linspace(0, n - 1, min(int(n), c)).astype(int))
+        for n, c in zip(scroll, counts)
+    ]
+    blocks = [
+        np.asarray(data[tuple(int(i) for i in combo)]).ravel()
+        for combo in product(*grids)
+    ]
+    return np.concatenate(blocks) if blocks else np.empty(0)
 
 
 def _is_arraylike(obj) -> bool:
@@ -576,15 +626,12 @@ class ImageWidget:
                 subplot.add_imgui_window(colorbar, location="right", size=100)
                 self._colorbars.append(colorbar)
 
-        # hard code the expected height so that the first render looks right in tests, docs etc.
-        # +24 px: the ImguiWindow base draws a custom title row the
-        # original heights did not account for
-        if len(self.slider_dims) == 0:
-            ui_size = 81
-        if len(self.slider_dims) == 1:
-            ui_size = 130
-        elif len(self.slider_dims) == 2:
-            ui_size = 179
+        # hard code the expected height so that the first render looks right in
+        # tests, docs etc. A lookup, not an if-chain: the chain left `ui_size`
+        # unbound for any count it didn't enumerate.
+        ui_size = SLIDER_UI_SIZES.get(
+            len(self.slider_dims), max(SLIDER_UI_SIZES.values())
+        )
 
         self._image_widget_sliders = ImageWidgetSliders(
             figure=self.figure,
@@ -849,33 +896,49 @@ class ImageWidget:
         """Clear all registered event handlers"""
         self._current_index_changed_handlers.clear()
 
+    def _set_contrast(self, i, subplot, block):
+        """Rescale subplot `i` to the value range of `block` and redraw its bar.
+
+        `block` is whatever sample the caller decided represents the data: the
+        current frame, or a subsample of the whole array. The colorbar's
+        `histogram` setter also re-derives the value axis the bar spans, so
+        the handles land inside it.
+        """
+        block = np.asarray(block)
+        finite = block[np.isfinite(block)] if block.dtype.kind == "f" else block
+        if finite.size == 0:
+            return
+        vmin, vmax = float(finite.min()), float(finite.max())
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+
+        if self._histogram_widget and i < len(self._colorbars):
+            colorbar = self._colorbars[i]
+            colorbar.histogram = np.histogram(finite.ravel(), bins=100)
+            # order matters: widen through vmax first so a new vmin above the
+            # old vmax is never momentarily inverted
+            colorbar.vmax = vmax
+            colorbar.vmin = vmin
+        else:
+            graphic = subplot["image_widget_managed"]
+            graphic.vmin, graphic.vmax = vmin, vmax
+
     def reset_vmin_vmax(self):
         """
         Reset the vmin and vmax w.r.t. the full data
         """
-        for data, subplot in zip(self.data, self.figure):
-            if "histogram_lut" not in subplot.docks["right"]:
-                continue
-            hlut = subplot.docks["right"]["histogram_lut"]
-            hlut.set_data(data, reset_vmin_vmax=True)
+        for i, (data, subplot) in enumerate(zip(self.data, self.figure)):
+            self._set_contrast(i, subplot, _sample_array(data))
 
     def reset_vmin_vmax_frame(self):
         """
-        Resets the vmin vmax and HistogramLUT widgets w.r.t. the current data shown in the
+        Resets the vmin vmax and colorbar w.r.t. the current data shown in the
         ImageGraphic instead of the data in the full data array. For example, if a post-processing
         function is used, the range of values in the ImageGraphic can be very different from the
         range of values in the full data array.
-
-        TODO: We could think of applying the frame_apply funcs to a subsample of the entire array to get a better estimate of vmin vmax?
         """
-
-        for subplot in self.figure:
-            if "histogram_lut" not in subplot.docks["right"]:
-                continue
-
-            hlut = subplot.docks["right"]["histogram_lut"]
-            # set the data using the current image graphic data
-            hlut.set_data(subplot["image_widget_managed"].data.value)
+        for i, subplot in enumerate(self.figure):
+            self._set_contrast(i, subplot, subplot["image_widget_managed"].data.value)
 
     def set_data(
         self,
@@ -1105,9 +1168,6 @@ def _mbo_data_get(self):
     return _MboDataList(self, self._data)
 
 
-_SLIDER_UI_SIZES = {0: 81, 1: 130, 2: 179}
-
-
 def _mbo_replace_data(self, i, new_array):
     """Swap one managed array and re-derive all dimension state."""
     self._data[i] = new_array
@@ -1152,9 +1212,9 @@ def _mbo_replace_data(self, i, new_array):
     new_graphic.reset_vmin_vmax()
 
     # resize the playback bar to the new slider count
-    size = _SLIDER_UI_SIZES.get(len(self._slider_dims))
-    if size is not None:
-        self._image_widget_sliders.size = size
+    self._image_widget_sliders.size = SLIDER_UI_SIZES.get(
+        len(self._slider_dims), max(SLIDER_UI_SIZES.values())
+    )
 
     self.current_index = dict(self._current_index)
 

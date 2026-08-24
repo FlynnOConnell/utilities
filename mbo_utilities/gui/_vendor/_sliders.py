@@ -1,4 +1,5 @@
 import os
+from collections import defaultdict
 from time import perf_counter
 
 from imgui_bundle import imgui, icons_fontawesome_6 as fa
@@ -11,16 +12,18 @@ class ImageWidgetSliders(EdgeWindow):
         super().__init__(figure=figure, size=size, location=location, title=title)
         self._image_widget = image_widget
 
-        # whether or not a dimension is in play mode
-        self._playing: dict[str, bool] = {"t": False, "z": False}
+        # per-dimension playback state. defaultdicts, not fixed {"t", "z"}
+        # keys: the widget supports a third scrollable dim ("c"), and a data
+        # swap can add one, which a literal dict would KeyError on.
+        self._playing: dict[str, bool] = defaultdict(bool)
 
         # approximate framerate for playing
-        self._fps: dict[str, int] = {"t": 20, "z": 20}
+        self._fps: dict[str, int] = defaultdict(lambda: 20)
         # framerate converted to frame time
-        self._frame_time: dict[str, float] = {"t": 1 / 20, "z": 1 / 20}
+        self._frame_time: dict[str, float] = defaultdict(lambda: 1 / 20)
 
         # last timepoint that a frame was displayed from a given dimension
-        self._last_frame_time: dict[str, float] = {"t": 0, "z": 0}
+        self._last_frame_time: dict[str, float] = defaultdict(float)
 
         self._loop = False
 
@@ -45,6 +48,19 @@ class ImageWidgetSliders(EdgeWindow):
 
         # set current_index
         self._image_widget.current_index = {dim: min(index, max_index)}
+
+    def _dim_label(self, dim: str) -> str:
+        """Display name for a scrollable axis.
+
+        Falls back to the internal letter when the widget carries no
+        `_slider_dim_names` (plain fastplotlib usage).
+        """
+        names = getattr(self._image_widget, "_slider_dim_names", None) or ()
+        dims = self._image_widget.slider_dims
+        try:
+            return names[dims.index(dim)]
+        except (ValueError, IndexError):
+            return dim
 
     def update(self):
         """called on every render cycle to update the GUI elements"""
@@ -140,7 +156,9 @@ class ImageWidgetSliders(EdgeWindow):
             val = self._image_widget.current_index[dim]
             vmax = self._image_widget._dims_max_bounds[dim] - 1
 
-            imgui.text(f"{dim}: ")
+            # "t"/"z"/"c" are internal positional labels; show the name the
+            # array actually reports for that axis ("Timepoint", "ROI", ...)
+            imgui.text(f"{self._dim_label(dim)}: ")
             imgui.same_line()
             # so that slider occupies full width
             imgui.set_next_item_width(self.width * 0.85)
@@ -154,7 +172,7 @@ class ImageWidgetSliders(EdgeWindow):
 
             # slider for this dimension
             changed, index = imgui.slider_int(
-                f"{dim}", v=val, v_min=0, v_max=vmax, flags=flags
+                f"##{dim}", v=val, v_min=0, v_max=vmax, flags=flags
             )
 
             new_index[dim] = index

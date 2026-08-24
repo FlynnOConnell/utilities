@@ -534,27 +534,6 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
     else:
         figure_kwargs = {"size": (fig_w, fig_h)}
 
-    # ImageWidget scrolls at most two axes. An array with three non-singleton
-    # non-spatial axes (a MESc unit with time + colour channels + ROIs, or a
-    # multi-channel volumetric ScanImage stack) would be rejected outright, so
-    # fan the ROI axis out into subplots instead of asking for a third slider
-    # — the same arrangement `--roi 0` produces. Only the display changes; the
-    # array imread() returned still spans every ROI.
-    _s5 = getattr(data_array, "shape", ())
-    if len(_s5) == 5 and sum(1 for n in _s5[:3] if n > 1) > 2:
-        if (
-            hasattr(data_array, "roi_mode")
-            and getattr(data_array, "num_rois", 1) > 1
-            and getattr(data_array, "roi", None) is None
-        ):
-            data_array.roi = 0
-            from mbo_utilities.log import get as _get_log
-
-            _get_log("gui.boot").info(
-                f"shape {tuple(_s5)} needs 3 sliders but the viewer allows 2; "
-                f"showing {data_array.num_rois} ROIs as separate subplots."
-            )
-
     # Determine slider dimension names from array's dims property if available
     from mbo_utilities.arrays.features import get_slider_dims
 
@@ -808,9 +787,10 @@ def _prompt_for_mesc_unit(path, units):
     dialog.setWindowTitle(f"Select a measurement unit — {Path(path).name}")
     dialog.resize(860, 420)
     layout = QVBoxLayout(dialog)
+    plural = "unit" if len(units) == 1 else "units"
     layout.addWidget(
         QLabel(
-            f"{Path(path).name} contains {len(units)} measurement units "
+            f"{Path(path).name} contains {len(units)} measurement {plural} "
             f"(one per scan). Choose which to open:"
         )
     )
@@ -866,9 +846,13 @@ def _prompt_for_mesc_unit(path, units):
 def _resolve_mesc_unit(data_in, unit):
     """Reader kwargs selecting which MUnit of a ``.mesc`` to open.
 
-    Returns ``({}, True)`` for anything that isn't a multi-unit ``.mesc``.
-    The second element is False only when the user cancelled the picker, in
-    which case the caller should abort instead of opening something arbitrary.
+    Every ``.mesc`` prompts — a file holds one MUnit per scan the operator
+    ran, so which one to open is always the user's call, never a default worth
+    guessing at. An explicit ``unit`` is the deliberate bypass.
+
+    Returns ``({}, True)`` for anything that isn't a ``.mesc``. The second
+    element is False only when the user cancelled the picker, in which case
+    the caller should abort instead of opening something arbitrary.
     """
     from mbo_utilities.log import get as _get
 
@@ -889,8 +873,8 @@ def _resolve_mesc_unit(data_in, unit):
     except Exception as e:
         logger.warning(f"could not list units in {path.name}: {e}")
         return {}, True
-    if len(units) <= 1:
-        return {}, True
+    if not units:
+        return {}, True  # let imread raise the real "nothing readable" error
 
     chosen = _prompt_for_mesc_unit(path, units)
     if chosen is _PICKER_UNAVAILABLE:

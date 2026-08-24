@@ -429,8 +429,13 @@ class PreviewDataWidget(EdgeWindow):
                     self.nz = self.shape[vol_idx + 1]
                 else:
                     self.nz = self.shape[vol_idx]
-        elif len(self.shape) >= 4 and (dims_lower is None or "channel" not in dims_lower):
-            # only use shape[1] as z if not a channel dimension
+        elif len(self.shape) >= 4 and (
+            dims_lower is None
+            or not any(d in dims_lower for d in ("channel", "channels", "c"))
+        ):
+            # only use shape[1] as z if not a channel dimension. bare "c" counts:
+            # a squeezed TCZYX array with no Z reports ("T","C","Y","X"), and
+            # reading shape[1] there returns the channel count as nz.
             self.nz = self.shape[1]
         else:
             self.nz = 1
