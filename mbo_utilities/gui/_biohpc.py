@@ -583,7 +583,7 @@ class _BioHpcPanel:
             return
 
         _wrapped(
-            f"Signed in as {_DEMO_USER}  ·  simulated — no data leaves this machine",
+            f"Signed in as {_DEMO_USER}",
             _COL_DIM,
         )
         imgui.spacing()
