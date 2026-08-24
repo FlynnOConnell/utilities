@@ -8,7 +8,7 @@ version = "3.3.4"
 description = "Various utilities for the Miller Brain Observatory"
 readme = "README.md"
 license = "BSD-3-Clause"
-requires-python = ">=3.12.7,<3.15"
+requires-python = ">=3.12.7,<3.14"  # masknmf caps at <3.14
 keywords = ["Microscopy", "ScanImage", "multiROI", "Tiff"]
 # Slim base: viewer (fastplotlib/imgui/wgpu) + IO + scan-phase only. Heavy
 # stacks (suite2p/torch, napari, jupyter, qt) are opt-in extras below so
@@ -27,7 +27,9 @@ dependencies = [
 	"imageio[ffmpeg]",
 	"ffmpeg-python",
 	"matplotlib>=3.10.1",
-	"opencv-python-headless",
+	# masknmf pins opencv-contrib-python-headless; both dists own `cv2`,
+	# so the contrib variant (a superset) is the single cv2 provider here
+	"opencv-contrib-python-headless",
 	"h5py",
 	"tqdm",
 	"icecream>=2.1.4",
@@ -39,10 +41,16 @@ dependencies = [
 	"pygfx>=0.15.2",
 	"llvmlite>=0.43.0",
 	"numba>=0.60.0",
-	"mbo-fastplotlib>=0.7.3",
-	"rendercanvas>=2.4.2,<2.5",
-	"imgui-bundle==1.92.5",
-	"wgpu>=0.28.1,<0.29",
+	# exact branches this demo is developed against: fastplotlib's ndwidget
+	# branch (NDWidget, required at import time by masknmf) and masknmf's
+	# xarray-compatability branch. mbo-fastplotlib must NOT be installed
+	# alongside — both dists own the `fastplotlib` import package.
+	"fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@ndwidget",
+	# [multisession] is required: the branch imports roicat at module load
+	"masknmf[multisession] @ git+https://github.com/apasarkar/masknmf-toolbox.git@xarray-compatability",
+	"rendercanvas>=2.4.2",
+	"imgui-bundle>=1.92.5,<2",
+	"wgpu>=0.28.1",
 	"submitit>=1.5.0",
 	"imagecodecs>=2026.6.6",
 ]

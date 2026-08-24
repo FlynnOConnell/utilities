@@ -772,7 +772,8 @@ class TiffReaderMixin:
         histogram_widget = kwargs.get("histogram_widget", True)
         figure_kwargs = kwargs.get("figure_kwargs", {"size": (800, 1000)})
         window_funcs = kwargs.get("window_funcs")
-        return fpl.ImageWidget(
+        from mbo_utilities.gui._fpl_compat import create_image_widget
+        return create_image_widget(
             data=self,
             cmap="gnuplot2",
             histogram_widget=histogram_widget,

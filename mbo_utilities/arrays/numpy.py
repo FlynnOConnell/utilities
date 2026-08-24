@@ -410,7 +410,8 @@ class NumpyArray(ReductionMixin, Shape5DMixin):
         window_funcs = kwargs.pop("window_funcs", (np.mean, None, None))
         window_sizes = kwargs.pop("window_sizes", (1, None, None))
 
-        return fpl.ImageWidget(
+        from mbo_utilities.gui._fpl_compat import create_image_widget
+        return create_image_widget(
             data=self.data,
             slider_dim_names=slider_dim_names,
             window_funcs=window_funcs,

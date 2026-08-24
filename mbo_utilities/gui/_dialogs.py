@@ -361,7 +361,7 @@ def load_new_data(parent: Any, path: str):
         if hasattr(parent, "_rebuild_spatial_func"):
             parent._rebuild_spatial_func()
         if hasattr(parent, "image_widget") and parent.image_widget is not None:
-            for proc in parent.image_widget._image_processors:
+            for proc in getattr(parent.image_widget, "_image_processors", []):
                 proc.window_funcs = None
                 proc.window_sizes = None
                 proc.window_order = None

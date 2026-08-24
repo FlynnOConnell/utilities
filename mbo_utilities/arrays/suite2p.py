@@ -946,7 +946,8 @@ class Suite2pArray(ReductionMixin, Shape5DMixin):
 
         import fastplotlib as fpl
 
-        return fpl.ImageWidget(
+        from mbo_utilities.gui._fpl_compat import create_image_widget
+        return create_image_widget(
             data=arrays,
             names=names,
             histogram_widget=histogram_widget,

@@ -669,12 +669,20 @@ class PreviewDataWidget(EdgeWindow):
 
     @property
     def processors(self) -> list:
-        """Access to underlying NDImageProcessor instances."""
-        return self.image_widget._image_processors
+        """Access to underlying NDImageProcessor instances.
+
+        Empty on stock fastplotlib (no processors API); every consumer
+        early-returns on an empty list, degrading projection/window
+        controls instead of crashing.
+        """
+        return getattr(self.image_widget, "_image_processors", [])
 
     def _get_data_arrays(self) -> list:
         """Get underlying data arrays from image processors."""
-        return [proc.data for proc in self.processors]
+        procs = self.processors
+        if procs:
+            return [proc.data for proc in procs]
+        return list(getattr(self.image_widget, "data", None) or [])
 
     @property
     def current_offset(self) -> list[float]:
