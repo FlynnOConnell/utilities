@@ -9,6 +9,7 @@ it runs independently of the gui and can survive gui closure.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
@@ -362,6 +363,54 @@ def _contain_in_job():
         return None
 
 
+class _CRCollapseWriter(io.TextIOBase):
+    """Collapse carriage-return progress redraws to one log line per bar.
+
+    tqdm (masknmf, imwrite) and pytorch-lightning ignore TQDM_DISABLE and
+    emit every refresh; with stdio redirected to the log file each ``\\r``
+    redraw lands as its own line, flooding the log. Only the text after
+    the last ``\\r`` of each completed line survives, so a bar logs once,
+    at its final state.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._buf = ""
+
+    def write(self, text: str) -> int:
+        self._buf += text
+        out = []
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if "\r" in line:
+                # keep the final redraw whether the writer leads or
+                # trails with \r
+                segs = [s for s in line.split("\r") if s.strip()]
+                line = segs[-1] if segs else ""
+            if line.strip():
+                out.append(line)
+        if out:
+            self._stream.write("\n".join(out) + "\n")
+            self._stream.flush()
+        # cap a bar that redraws forever without ever emitting a newline
+        if len(self._buf) > 65536 and "\r" in self._buf:
+            self._buf = self._buf.rsplit("\r", 1)[-1]
+        return len(text)
+
+    def flush(self):
+        self._stream.flush()
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self._stream, "encoding", "utf-8")
+
+
 def main():
     """Main entry point for worker subprocess."""
     # force line buffering so print() output appears in logs immediately,
@@ -373,6 +422,13 @@ def main():
 
     # disable tqdm dynamic display for file output (no terminal = no \r updates)
     os.environ["TQDM_DISABLE"] = "1"
+
+    # not every library honors TQDM_DISABLE (masknmf's tqdm bars,
+    # lightning's progress bar): squash their redraws at the stream level
+    if sys.stdout is not None:
+        sys.stdout = _CRCollapseWriter(sys.stdout)
+    if sys.stderr is not None:
+        sys.stderr = _CRCollapseWriter(sys.stderr)
 
     # early print so we can see the process started even if logging fails
     print(f"Worker starting (pid={os.getpid()})", file=sys.stderr, flush=True)

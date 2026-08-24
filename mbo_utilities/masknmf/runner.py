@@ -385,7 +385,9 @@ def _write_registered_bin(moco, plane_dir: Path, logger) -> tuple[np.ndarray, np
     mx = np.full((ly, lx), -np.inf, dtype=np.float64)
     step = 200
     for t0 in range(0, nframes, step):
-        chunk = _to_np(moco[t0: t0 + step]).astype(np.float32)
+        # masknmf arrays raise on slice stops past n_frames instead of
+        # clamping like numpy
+        chunk = _to_np(moco[t0: min(t0 + step, nframes)]).astype(np.float32)
         acc += chunk.sum(axis=0)
         np.maximum(mx, chunk.max(axis=0), out=mx)
         out[t0: t0 + chunk.shape[0]] = np.clip(chunk, -32768, 32767).astype(np.int16)
