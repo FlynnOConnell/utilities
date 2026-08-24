@@ -49,7 +49,9 @@ dependencies = [
 	# [multisession] is required: the branch imports roicat at module load
 	"masknmf[multisession] @ git+https://github.com/apasarkar/masknmf-toolbox.git@xarray-compatability",
 	"rendercanvas>=2.4.2",
-	"imgui-bundle>=1.92.5,<2",
+	# 1.92.900 dropped ImDrawData.cmd_lists_count, which wgpu's imgui
+	# backend still reads — pin the last known-good build
+	"imgui-bundle==1.92.5",
 	"wgpu>=0.28.1",
 	"submitit>=1.5.0",
 	"imagecodecs>=2026.6.6",

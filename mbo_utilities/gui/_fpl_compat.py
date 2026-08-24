@@ -20,12 +20,23 @@ _SLIDER_DIM_ORDER = ("t", "z")
 
 
 def image_widget_cls():
-    """ImageWidget class across variants — the ndwidget branch drops the
-    top-level export but keeps fastplotlib.widgets.image_widget.ImageWidget."""
+    """ImageWidget class across variants.
+
+    mbo-fastplotlib and release fastplotlib export it at top level; the
+    ndwidget branch keeps the module but broke it (removed tools), so the
+    vendored copy patched onto that branch's APIs is the last resort.
+    """
     cls = getattr(fpl, "ImageWidget", None)
-    if cls is None:
-        from fastplotlib.widgets.image_widget import ImageWidget as cls
-    return cls
+    if cls is not None:
+        return cls
+    try:
+        from fastplotlib.widgets.image_widget import ImageWidget
+
+        return ImageWidget
+    except ImportError:
+        from mbo_utilities.gui._vendor._widget import ImageWidget
+
+        return ImageWidget
 
 
 def supports_named_sliders() -> bool:
@@ -102,5 +113,7 @@ def create_image_widget(**kwargs):
 
     iw = cls(**kwargs)
     iw._slider_dim_names = tuple(names) if names else None
-    iw.indices = _NamedIndices(iw)
+    # the vendored class defines `indices` as a property already
+    if not isinstance(getattr(type(iw), "indices", None), property):
+        iw.indices = _NamedIndices(iw)
     return iw

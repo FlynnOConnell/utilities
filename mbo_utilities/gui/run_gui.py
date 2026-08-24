@@ -646,7 +646,11 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
             fpath=data_array.source_path,
             size=300,
         )
-        iw.figure.add_gui(gui)
+        # the EdgeWindow shim registers itself with the figure during
+        # __init__; add_gui exists only on mbo-fastplotlib
+        add_gui = getattr(iw.figure, "add_gui", None)
+        if add_gui is not None:
+            add_gui(gui)
 
     return iw
 
@@ -1216,21 +1220,6 @@ def run_gui(
         mbo path/to/data.tif --metadata-only
         mbo --select-only
     """
-    # the masknmf fastplotlib stack (ndwidget branch) has no ImageWidget /
-    # EdgeWindow — the Studio viewer cannot run on it
-    try:
-        from fastplotlib.ui import EdgeWindow  # noqa: F401
-        from mbo_utilities.gui._fpl_compat import image_widget_cls
-
-        image_widget_cls()
-    except Exception:
-        print(
-            "Miller Brain Studio unavailable on this fastplotlib stack.\n"
-            "Process: python -c \"from mbo_utilities.masknmf import run_volume; ...\"\n"
-            "View demixing results: masknmf.SingleSessionDemixingVis"
-        )
-        return None
-
     # resolve compute-GPU policy -> CUDA_VISIBLE_DEVICES before any torch/cupy
     # import or worker spawn; detached workers inherit this environment. Env
     # MBO_GPU overrides the persisted GUI preference.
