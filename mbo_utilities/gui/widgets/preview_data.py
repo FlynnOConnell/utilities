@@ -883,6 +883,7 @@ class PreviewDataWidget(EdgeWindow):
         self._window_size = value
         self.logger.debug(f"Window size set to {value}.")
         if not self.processors:
+            self._apply_legacy_window_funcs()
             return
         n_slider_dims = self.processors[0].n_slider_dims
         if n_slider_dims == 0:
@@ -900,6 +901,7 @@ class PreviewDataWidget(EdgeWindow):
     def _set_processor_attr(self, attr: str, value):
         """Set processor attribute without expensive histogram recomputation."""
         if not self.processors:
+            self._set_legacy_iw_attr(attr, value)
             return
 
         # save histogram state and disable recomputation during update
@@ -940,6 +942,47 @@ class PreviewDataWidget(EdgeWindow):
         # post-restore refresh so changes take effect immediately.
         if attr in ("window_funcs", "window_sizes", "spatial_func"):
             self._refresh_image_widget()
+
+    def _set_legacy_iw_attr(self, attr: str, value):
+        """No processors API (stock ImageWidget): translate to its native
+        ``window_funcs`` / ``frame_apply``."""
+        iw = self.image_widget
+        if not hasattr(iw, "window_funcs"):
+            return
+        try:
+            if attr in ("window_funcs", "window_sizes"):
+                self._apply_legacy_window_funcs()
+            elif attr == "spatial_func":
+                if isinstance(value, (list, tuple)):
+                    funcs = list(value)
+                else:
+                    funcs = [value] * self.num_graphics
+                iw.frame_apply = {
+                    i: f for i, f in enumerate(funcs) if f is not None
+                }
+        except Exception as e:
+            self.logger.exception(f"Error setting {attr}: {e}")
+
+    def _apply_legacy_window_funcs(self):
+        """Map projection mode + window size onto the stock ImageWidget's
+        ``window_funcs`` ({"t": (func, size)}). Its half-window math yields
+        an empty window for even/size<3 values, so sizes are odd-ified and
+        size<=1 clears the projection (raw frame)."""
+        iw = self.image_widget
+        if not hasattr(iw, "window_funcs"):
+            return
+        if "t" not in (getattr(iw, "slider_dims", None) or ()):
+            return
+        try:
+            size = int(self._window_size)
+            if size <= 1:
+                iw.window_funcs = None
+                return
+            proj_funcs = {"mean": np.mean, "max": np.max, "std": np.std}
+            func = proj_funcs.get(self._proj, np.mean)
+            iw.window_funcs = {"t": (func, max(3, size | 1))}
+        except Exception as e:
+            self.logger.exception(f"Error applying window funcs: {e}")
 
     def _refresh_widgets(self):
         """Refresh widgets based on current data capabilities."""
@@ -1073,6 +1116,7 @@ class PreviewDataWidget(EdgeWindow):
     def _update_window_funcs(self):
         """Update window_funcs on image widget based on current projection mode."""
         if not self.processors:
+            self._apply_legacy_window_funcs()
             return
 
         def mean_wrapper(data, axis, keepdims):
