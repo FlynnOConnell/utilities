@@ -11,6 +11,7 @@ expectations read straight out of h5py.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import h5py
 import numpy as np
@@ -433,3 +434,188 @@ def test_imwrite_roi_zero_fans_out_one_directory_per_roi(mesc_path, tmp_path):
     assert sorted(p.name for p in out.iterdir()) == [
         "roi01", "roi02", "roi03", "roi04",
     ]
+
+
+# ============================================================
+# launch picker
+# ============================================================
+
+@pytest.fixture(scope="module")
+def single_unit_mesc(tmp_path_factory):
+    """A .mesc holding exactly one MUnit."""
+    path = tmp_path_factory.mktemp("mesc_one") / "one.mesc"
+    with h5py.File(path, "w") as f:
+        u = f.create_group("MSession_0").create_group("MUnit_0")
+        u.attrs.update({"MethodType": 1, "VecChannelsSize": 1, "TStepInMs": 50.0})
+        u.create_dataset(
+            "Channel_0", data=np.zeros((4, 8, 8), dtype=np.uint16)
+        )
+    return path
+
+
+class TestUnitPicker:
+    """`.mesc` always asks which unit to open — it is never a safe default."""
+
+    @staticmethod
+    def _patch(monkeypatch, result):
+        from mbo_utilities.gui import run_gui as rg
+
+        calls = []
+
+        def _fake(path, units):
+            calls.append((Path(path).name, len(units)))
+            return result
+
+        monkeypatch.setattr(rg, "_prompt_for_mesc_unit", _fake)
+        return calls
+
+    def test_prompts_even_when_the_file_holds_one_unit(
+        self, single_unit_mesc, monkeypatch
+    ):
+        from mbo_utilities.gui.run_gui import _resolve_mesc_unit
+
+        calls = self._patch(monkeypatch, "MSession_0/MUnit_0")
+        kwargs, proceed = _resolve_mesc_unit(single_unit_mesc, None)
+        assert calls == [("one.mesc", 1)]
+        assert (kwargs, proceed) == ({"unit": "MSession_0/MUnit_0"}, True)
+
+    def test_explicit_unit_bypasses_the_picker(self, mesc_path, monkeypatch):
+        from mbo_utilities.gui.run_gui import _resolve_mesc_unit
+
+        calls = self._patch(monkeypatch, "MSession_0/MUnit_0")
+        assert _resolve_mesc_unit(mesc_path, 3) == ({"unit": 3}, True)
+        assert calls == []
+
+    def test_cancelling_aborts_instead_of_opening_something(
+        self, mesc_path, monkeypatch
+    ):
+        from mbo_utilities.gui.run_gui import _resolve_mesc_unit
+
+        self._patch(monkeypatch, None)
+        assert _resolve_mesc_unit(mesc_path, None) == ({}, False)
+
+    def test_no_qt_falls_through_to_the_first_unit(self, mesc_path, monkeypatch):
+        from mbo_utilities.gui import run_gui as rg
+
+        self._patch(monkeypatch, rg._PICKER_UNAVAILABLE)
+        assert rg._resolve_mesc_unit(mesc_path, None) == ({}, True)
+
+    def test_non_mesc_inputs_are_left_alone(self, tmp_path, monkeypatch):
+        from mbo_utilities.gui.run_gui import _resolve_mesc_unit
+
+        calls = self._patch(monkeypatch, "MSession_0/MUnit_0")
+        other = tmp_path / "scan.tif"
+        other.touch()
+        assert _resolve_mesc_unit(other, None) == ({}, True)
+        assert _resolve_mesc_unit(tmp_path, None) == ({}, True)
+        assert calls == []
+
+
+# ============================================================
+# viewer fit + unit widget
+# ============================================================
+
+class TestViewerFit:
+    """Every non-spatial axis is a slider — no ROI pinning, no subplot fan-out."""
+
+    def test_three_scrollable_axes_stay_one_array(self, mesc_path):
+        arr = MescArray(mesc_path, unit=1)  # T=6, C=2, R=4
+        assert arr.roi is None
+        assert arr.shape == (6, 2, 4, 32, 24)
+        assert arr.slider_dim_labels == ("Timepoint", "Channel", "ROI")
+
+    @pytest.mark.parametrize("unit", [0, 2, 3, 4, 5])
+    def test_every_unit_reports_one_label_per_scrollable_axis(self, mesc_path, unit):
+        from mbo_utilities.gui.widgets.mesc_units import display_wrap
+
+        arr = MescArray(mesc_path, unit=unit)
+        assert arr.roi is None
+        view = display_wrap(arr)
+        assert len(view.shape) - 2 == len(arr.slider_dim_labels), arr.unit_key
+
+    def test_roi_axis_is_labelled_roi_not_z(self, mesc_path):
+        # a ribbon unit's Z axis holds ROIs; a real z-stack's holds depth
+        assert MescArray(mesc_path, unit=2).slider_dim_labels == (
+            "Timepoint", "ROI",
+        )
+        assert MescArray(mesc_path, unit=0).slider_dim_labels == (
+            "Channel", "Z-plane",
+        )
+
+    def test_mesc_array_is_found_through_the_display_wrappers(self, mesc_path):
+        from mbo_utilities.gui.widgets.mesc_units import display_wrap, mesc_array_of
+
+        arr = MescArray(mesc_path, unit=1)
+        assert mesc_array_of(display_wrap(arr)) is arr
+        # a squeeze layer is only inserted when a singleton axis exists
+        arr.roi = 1
+        assert mesc_array_of(display_wrap(arr)) is arr
+        assert mesc_array_of(np.zeros((3, 3))) is None
+
+
+class TestUnitWidgetSupport:
+    def test_supported_only_for_mesc_backed_viewers(self, mesc_path):
+        from mbo_utilities.gui.widgets.mesc_units import (
+            MescUnitsWidget,
+            display_wrap,
+        )
+
+        class FakeIW:
+            def __init__(self, data):
+                self.data = data
+
+        class FakeParent:
+            def __init__(self, data):
+                self.image_widget = FakeIW(data)
+
+        arr = MescArray(mesc_path, unit=4)
+        assert MescUnitsWidget.is_supported(FakeParent([display_wrap(arr)]))
+        assert not MescUnitsWidget.is_supported(FakeParent([np.zeros((4, 4, 4))]))
+        assert not MescUnitsWidget.is_supported(FakeParent([]))
+        assert not MescUnitsWidget.is_supported(FakeParent(None))
+
+
+def test_unit_switching_stands_down_on_split_roi_views(mesc_path):
+    """`--roi 0` fans ROIs across subplots; swapping would strand all but one."""
+    from mbo_utilities.gui.widgets.mesc_units import MescUnitsWidget, display_wrap
+
+    arr = MescArray(mesc_path, unit=1, roi=0)
+    views = [display_wrap(arr) for _ in range(arr.num_rois)]
+
+    drawn = []
+
+    class FakeIW:
+        data = views
+
+        class figure:  # noqa: N801 - stands in for the fastplotlib figure
+            pass
+
+    class FakeParent:
+        image_widget = FakeIW()
+        logger = None
+
+    widget = MescUnitsWidget(FakeParent())
+    assert widget.is_supported(FakeParent())
+
+    # draw() must bail before touching any combo state for a multi-subplot view
+    import mbo_utilities.gui.widgets.mesc_units as mod
+
+    class _Recorder:
+        def __getattr__(self, name):
+            def _call(*args, **kwargs):
+                drawn.append(name)
+                if name == "combo":
+                    raise AssertionError("combo drawn for a split-ROI view")
+                if name == "get_content_region_avail":
+                    return type("V", (), {"x": 100.0})()
+                return None
+
+            return _call
+
+    original = mod.imgui
+    mod.imgui = _Recorder()
+    try:
+        widget.draw()
+    finally:
+        mod.imgui = original
+    assert "text_disabled" in drawn
