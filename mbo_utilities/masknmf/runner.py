@@ -11,8 +11,11 @@ masknmf imports are function-local: the package is optional, heavy to import,
 and its stage math runs in the spawned worker subprocess.
 """
 
+import hashlib
+import json
 import os
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -28,13 +31,50 @@ from mbo_utilities.masknmf.params import (
 from mbo_utilities.masknmf import outputs as _outputs
 
 
-def _export_atomic(obj, path: Path) -> None:
+def _hash(obj) -> str:
+    return hashlib.sha1(
+        json.dumps(obj, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
+def _stage_hash(cfg, tri_field: str) -> str:
+    d = asdict(cfg)
+    d.pop(tri_field, None)
+    return _hash(d)
+
+
+def _raw_fingerprint(plane_dir: Path) -> str:
+    raw = plane_dir / "data_raw.bin"
+    try:
+        with open(raw, "rb") as f:
+            head = f.read(65536)
+        return _hash([raw.stat().st_size, hashlib.sha1(head).hexdigest()])
+    except OSError:
+        return ""
+
+
+def _read_provenance(path: Path) -> dict | None:
+    try:
+        import h5py
+
+        with h5py.File(path, "r") as f:
+            return json.loads(f.attrs["mbo_provenance"])
+    except Exception:
+        return None
+
+
+def _export_atomic(obj, path: Path, prov: dict | None = None) -> None:
     """Export to a temp name and rename, so a crash never leaves a partial
     file that later runs would trust as a cached stage output."""
     tmp = path.with_name(path.name + ".partial")
     if tmp.exists():
         tmp.unlink()
     obj.export(str(tmp))
+    if prov is not None:
+        import h5py
+
+        with h5py.File(tmp, "a") as f:
+            f.attrs["mbo_provenance"] = json.dumps(prov, sort_keys=True)
     os.replace(tmp, path)
 
 
@@ -155,21 +195,30 @@ def _open_raw(plane_dir: Path) -> tuple[np.memmap, dict]:
     return mov, ops
 
 
-def _stage_registration(raw, cfg, runtime, plane_dir: Path, device: str, logger):
-    """Returns (movie_for_compression, shifts_np, template_np, seconds)."""
+def _stage_registration(raw, cfg, runtime, plane_dir: Path, device: str, logger, raw_fp):
+    """Returns (movie_for_compression, shifts_np, template_np, seconds, prov_key)."""
     moco_path = plane_dir / MOCO_FILE
     action = stage_action(cfg.do_registration, moco_path.exists())
     if action == "skip":
         logger.info("masknmf: registration skipped")
-        return raw, None, None, 0.0
+        return raw, None, None, 0.0, raw_fp
 
     import masknmf
 
+    prov = {"settings": _stage_hash(cfg, "do_registration"), "input": raw_fp}
+    key = _hash(prov)
     cls = (
         masknmf.PiecewiseRigidRegistrationArray
         if cfg.strategy == "pwrigid"
         else masknmf.RigidRegistrationArray
     )
+    if action == "reuse":
+        stored = _read_provenance(moco_path)
+        if stored is not None and stored != prov:
+            logger.info(
+                f"masknmf: cached {MOCO_FILE} stale (settings or input changed); recomputing"
+            )
+            action = "compute"
     if action == "reuse":
         try:
             import torch
@@ -187,7 +236,13 @@ def _stage_registration(raw, cfg, runtime, plane_dir: Path, device: str, logger)
             logger.info(f"masknmf: reusing {MOCO_FILE}")
             shifts = _to_np(moco.shifts)
             template = getattr(moco.strategy, "template", None)
-            return moco, shifts, _to_np(template) if template is not None else None, 0.0
+            return (
+                moco,
+                shifts,
+                _to_np(template) if template is not None else None,
+                0.0,
+                key,
+            )
         except Exception as e:
             logger.warning(f"masknmf: cached {MOCO_FILE} unusable ({e}); recomputing")
 
@@ -207,7 +262,7 @@ def _stage_registration(raw, cfg, runtime, plane_dir: Path, device: str, logger)
     logger.info("masknmf: estimating shifts")
     moco = strategy.motion_correct(raw)
     moco.output_device = moco.strategy.device
-    _export_atomic(moco, moco_path)
+    _export_atomic(moco, moco_path, prov)
     shifts = _to_np(moco.shifts)
     template = getattr(moco.strategy, "template", None)
     return (
@@ -215,6 +270,7 @@ def _stage_registration(raw, cfg, runtime, plane_dir: Path, device: str, logger)
         shifts,
         _to_np(template) if template is not None else None,
         time.time() - t0,
+        key,
     )
 
 
@@ -238,9 +294,10 @@ def _shift_mask(shifts, shape: tuple[int, int], border: int) -> np.ndarray:
 
 
 def _stage_compression(
-    moco, cfg, runtime, plane_dir: Path, device: str, mask, fs, logger
+    moco, cfg, runtime, plane_dir: Path, device: str, mask, fs, logger,
+    upstream_key, upstream_computed,
 ):
-    """Returns (PMDArray, seconds)."""
+    """Returns (PMDArray, seconds, prov_key)."""
     pmd_path = plane_dir / PMD_FILE
     cached = pmd_path.exists()
     action = stage_action(cfg.do_compression, cached)
@@ -251,15 +308,28 @@ def _stage_compression(
 
     import masknmf
 
+    prov = {"settings": _stage_hash(cfg, "do_compression"), "input": upstream_key, "fs": fs}
+    key = _hash(prov)
+
     if action == "skip":
         logger.info(f"masknmf: reusing {PMD_FILE} (compression skipped)")
-        return masknmf.PMDArray.from_hdf5(str(pmd_path)), 0.0
+        return masknmf.PMDArray.from_hdf5(str(pmd_path)), 0.0, key
 
+    if action == "reuse" and upstream_computed:
+        logger.info("masknmf: registration recomputed; recomputing compression")
+        action = "compute"
+    if action == "reuse":
+        stored = _read_provenance(pmd_path)
+        if stored is not None and stored != prov:
+            logger.info(
+                f"masknmf: cached {PMD_FILE} stale (settings or input changed); recomputing"
+            )
+            action = "compute"
     if action == "reuse":
         try:
             pmd = masknmf.PMDArray.from_hdf5(str(pmd_path))
             logger.info(f"masknmf: reusing {PMD_FILE}")
-            return pmd, 0.0
+            return pmd, 0.0, key
         except Exception as e:
             logger.warning(f"masknmf: cached {PMD_FILE} unusable ({e}); recomputing")
 
@@ -283,12 +353,15 @@ def _stage_compression(
         )
     logger.info("masknmf: running PMD compression")
     pmd = strat.compress(moco)
-    _export_atomic(pmd, pmd_path)
+    _export_atomic(pmd, pmd_path, prov)
     # reload so demixing always consumes the exact persisted decomposition
-    return masknmf.PMDArray.from_hdf5(str(pmd_path)), time.time() - t0
+    return masknmf.PMDArray.from_hdf5(str(pmd_path)), time.time() - t0, key
 
 
-def _stage_demixing(pmd, cfg, runtime, plane_dir: Path, device: str, fs, logger):
+def _stage_demixing(
+    pmd, cfg, runtime, plane_dir: Path, device: str, fs, logger,
+    upstream_key, upstream_computed,
+):
     """Returns (DemixingResults | None, seconds)."""
     demix_path = plane_dir / DEMIX_FILE
     action = stage_action(cfg.do_demixing, demix_path.exists())
@@ -298,6 +371,17 @@ def _stage_demixing(pmd, cfg, runtime, plane_dir: Path, device: str, fs, logger)
 
     import masknmf
 
+    prov = {"settings": _stage_hash(cfg, "do_demixing"), "input": upstream_key, "fs": fs}
+    if action == "reuse" and upstream_computed:
+        logger.info("masknmf: upstream stage recomputed; recomputing demixing")
+        action = "compute"
+    if action == "reuse":
+        stored = _read_provenance(demix_path)
+        if stored is not None and stored != prov:
+            logger.info(
+                f"masknmf: cached {DEMIX_FILE} stale (settings or input changed); recomputing"
+            )
+            action = "compute"
     if action == "reuse":
         try:
             results = masknmf.DemixingResults.from_hdf5(str(demix_path))
@@ -386,7 +470,7 @@ def _stage_demixing(pmd, cfg, runtime, plane_dir: Path, device: str, fs, logger)
     if results is None:
         raise ValueError("masknmf unfiltered demixing did not complete a pass")
 
-    _export_atomic(results, demix_path)
+    _export_atomic(results, demix_path, prov)
     return results, time.time() - t0
 
 
@@ -506,6 +590,7 @@ def run_plane(
         logger.info("masknmf: reusing existing data_raw.bin")
 
     raw, ops = _open_raw(plane_dir)
+    raw_fp = _raw_fingerprint(plane_dir)
     fs = get_param(ops, "fs") or get_param(dict(metadata or {}), "fs")
     fs = float(fs) if fs else None
     timing: dict = {}
@@ -513,10 +598,11 @@ def run_plane(
 
     # 2) registration
     _progress("registration", f"Registering plane {plane}")
-    moco, shifts, template, timing["registration"] = _stage_registration(
-        raw, reg, runtime, plane_dir, device, logger
+    moco, shifts, template, timing["registration"], reg_key = _stage_registration(
+        raw, reg, runtime, plane_dir, device, logger, raw_fp
     )
-    if timing["registration"]:
+    reg_computed = timing["registration"] > 0
+    if reg_computed:
         history.append(
             _history_entry(
                 "masknmf_registration", timing["registration"], strategy=reg.strategy
@@ -526,10 +612,12 @@ def run_plane(
     # 3) compression
     _progress("compression", f"Compressing plane {plane}")
     mask = _shift_mask(shifts, raw.shape[1:], runtime.exclude_border_radius)
-    pmd, timing["compression"] = _stage_compression(
-        moco, comp, runtime, plane_dir, device, mask, fs, logger
+    pmd, timing["compression"], pmd_key = _stage_compression(
+        moco, comp, runtime, plane_dir, device, mask, fs, logger,
+        reg_key, reg_computed,
     )
-    if timing["compression"]:
+    comp_computed = timing["compression"] > 0
+    if comp_computed:
         history.append(
             _history_entry(
                 "masknmf_compression",
@@ -541,7 +629,8 @@ def run_plane(
     # 4) demixing
     _progress("demixing", f"Demixing plane {plane}")
     results, timing["detection"] = _stage_demixing(
-        pmd, demix, runtime, plane_dir, device, fs, logger
+        pmd, demix, runtime, plane_dir, device, fs, logger,
+        pmd_key, reg_computed or comp_computed,
     )
     if timing["detection"]:
         history.append(_history_entry("masknmf_demixing", timing["detection"]))
@@ -550,7 +639,7 @@ def run_plane(
     _progress("exports", f"Writing outputs for plane {plane}")
     is_registered = shifts is not None
     if runtime.keep_bin and is_registered and (
-        force_bin or not (plane_dir / "data.bin").exists()
+        force_bin or reg_computed or not (plane_dir / "data.bin").exists()
     ):
         mean_img, max_proj = _write_registered_bin(moco, plane_dir, logger)
     else:
