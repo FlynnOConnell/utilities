@@ -244,18 +244,24 @@ def _stage_compression(
     pmd_path = plane_dir / PMD_FILE
     cached = pmd_path.exists()
     action = stage_action(cfg.do_compression, cached)
-    if action == "skip":
-        if not cached:
-            raise ValueError(
-                f"compression set to Skip but {pmd_path} does not exist"
-            )
-        action = "reuse"
+    if action == "skip" and not cached:
+        raise ValueError(
+            f"compression set to Skip but {pmd_path} does not exist"
+        )
 
     import masknmf
 
-    if action == "reuse":
-        logger.info(f"masknmf: reusing {PMD_FILE}")
+    if action == "skip":
+        logger.info(f"masknmf: reusing {PMD_FILE} (compression skipped)")
         return masknmf.PMDArray.from_hdf5(str(pmd_path)), 0.0
+
+    if action == "reuse":
+        try:
+            pmd = masknmf.PMDArray.from_hdf5(str(pmd_path))
+            logger.info(f"masknmf: reusing {PMD_FILE}")
+            return pmd, 0.0
+        except Exception as e:
+            logger.warning(f"masknmf: cached {PMD_FILE} unusable ({e}); recomputing")
 
     t0 = time.time()
     kw = cfg.strategy_kwargs()
@@ -293,8 +299,12 @@ def _stage_demixing(pmd, cfg, runtime, plane_dir: Path, device: str, fs, logger)
     import masknmf
 
     if action == "reuse":
-        logger.info(f"masknmf: reusing {DEMIX_FILE}")
-        return masknmf.DemixingResults.from_hdf5(str(demix_path)), 0.0
+        try:
+            results = masknmf.DemixingResults.from_hdf5(str(demix_path))
+            logger.info(f"masknmf: reusing {DEMIX_FILE}")
+            return results, 0.0
+        except Exception as e:
+            logger.warning(f"masknmf: cached {DEMIX_FILE} unusable ({e}); recomputing")
 
     import torch
     from masknmf.demixing import NoSignalsDetectedError
