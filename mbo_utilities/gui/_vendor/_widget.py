@@ -1111,6 +1111,9 @@ _SLIDER_UI_SIZES = {0: 81, 1: 130, 2: 179}
 def _mbo_replace_data(self, i, new_array):
     """Swap one managed array and re-derive all dimension state."""
     self._data[i] = new_array
+    rgb = getattr(new_array, "rgb", None)
+    if isinstance(rgb, bool):
+        self._rgb[i] = rgb
     self._n_scrollable_dims[i] = self._get_n_scrollable_dims(
         new_array, self._rgb[i]
     )
