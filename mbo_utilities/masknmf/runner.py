@@ -608,6 +608,10 @@ def run_plane(
                 "masknmf_registration", timing["registration"], strategy=reg.strategy
             )
         )
+    elif shifts is not None:
+        history.append(
+            _history_entry("masknmf_registration", strategy=reg.strategy, reused=True)
+        )
 
     # 3) compression
     _progress("compression", f"Compressing plane {plane}")
@@ -625,6 +629,14 @@ def run_plane(
                 rank=int(getattr(pmd, "pmd_rank", 0) or 0),
             )
         )
+    else:
+        history.append(
+            _history_entry(
+                "masknmf_compression",
+                rank=int(getattr(pmd, "pmd_rank", 0) or 0),
+                reused=True,
+            )
+        )
 
     # 4) demixing
     _progress("demixing", f"Demixing plane {plane}")
@@ -634,6 +646,8 @@ def run_plane(
     )
     if timing["detection"]:
         history.append(_history_entry("masknmf_demixing", timing["detection"]))
+    elif results is not None:
+        history.append(_history_entry("masknmf_demixing", reused=True))
 
     # 5) exports: registered binary + summary images + suite2p sidecars
     _progress("exports", f"Writing outputs for plane {plane}")
@@ -690,6 +704,7 @@ def run_plane(
             "total_plane_runtime": timing["total_plane_runtime"],
         },
         "n_rois": n_rois,
+        "pmd_rank": int(getattr(pmd, "pmd_rank", 0) or 0),
         "pipeline": "masknmf",
         "masknmf": settings.to_dict(),
         "processing_history": history,
