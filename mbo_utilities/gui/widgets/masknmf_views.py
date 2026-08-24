@@ -8,17 +8,38 @@ from imgui_bundle import imgui
 
 from mbo_utilities.gui.widgets._base import Widget
 from mbo_utilities.gui._imgui_helpers import set_tooltip
+from mbo_utilities.masknmf.params import DEMIX_FILE, MOCO_FILE, PMD_FILE
+from mbo_utilities.masknmf.views import run_summary
 
 
-def _results_file(fpath) -> Path | None:
+def _plane_dir(fpath) -> Path | None:
     if not fpath:
         return None
     if isinstance(fpath, (list, tuple)):
         fpath = fpath[0]
     p = Path(fpath)
     d = p if p.is_dir() else p.parent
-    f = d / "demixing_results.hdf5"
+    if any((d / f).exists() for f in (MOCO_FILE, PMD_FILE, DEMIX_FILE)):
+        return d
+    return None
+
+
+def _results_file(fpath) -> Path | None:
+    d = _plane_dir(fpath)
+    if d is None:
+        return None
+    f = d / DEMIX_FILE
     return f if f.exists() else None
+
+
+def _draw_dict(d: dict) -> None:
+    for k, v in d.items():
+        if isinstance(v, dict):
+            if imgui.tree_node(str(k)):
+                _draw_dict(v)
+                imgui.tree_pop()
+        else:
+            imgui.text(f"{k}: {v}")
 
 
 class MaskNMFViewsWidget(Widget):
@@ -32,6 +53,7 @@ class MaskNMFViewsWidget(Widget):
 
     def __init__(self, parent: Any):
         super().__init__(parent)
+        self._dir = _plane_dir(getattr(parent, "fpath", None))
         self._file = _results_file(getattr(parent, "fpath", None))
         self._views = None
         self._loading = False
@@ -39,10 +61,13 @@ class MaskNMFViewsWidget(Widget):
         self._pending = None
         self._current = "Registered"
         self._orig = None
+        self._summary = run_summary(self._dir) if self._dir else {}
+        if self._file is not None:
+            self._load_async()
 
     @classmethod
     def is_supported(cls, parent: Any) -> bool:
-        return _results_file(getattr(parent, "fpath", None)) is not None
+        return _plane_dir(getattr(parent, "fpath", None)) is not None
 
     def _load_async(self):
         def _run():
@@ -78,12 +103,15 @@ class MaskNMFViewsWidget(Widget):
         self.parent.logger.info(f"View: {label}")
 
     def draw(self) -> None:
-        parent = self.parent
-
         imgui.spacing()
         imgui.text_colored(imgui.ImVec4(0.8, 0.8, 0.2, 1.0), "MaskNMF View")
         imgui.spacing()
 
+        if self._file is not None:
+            self._draw_combo()
+        self._draw_summary()
+
+    def _draw_combo(self) -> None:
         if self._views is not None:
             labels = ["Registered"] + list(self._views)
         else:
@@ -118,6 +146,43 @@ class MaskNMFViewsWidget(Widget):
         if self._views is not None and self._pending:
             sel, self._pending = self._pending, None
             self._apply(sel)
+
+    def _draw_summary(self) -> None:
+        m = self._summary
+        if not m:
+            return
+        imgui.spacing()
+        stages = m.get("stages") or {}
+        done = [k for k, v in stages.items() if v]
+        missing = [k for k, v in stages.items() if not v]
+        imgui.text(f"stages: {', '.join(done) or 'none'}")
+        if missing:
+            imgui.text_disabled(f"missing: {', '.join(missing)}")
+        if "n_rois" in m or "pmd_rank" in m:
+            imgui.text(
+                f"ROIs: {m.get('n_rois', '?')}   PMD rank: {m.get('pmd_rank', '?')}"
+            )
+        if "nframes" in m:
+            dims = f"{m['nframes']} frames  {m.get('Ly', '?')}x{m.get('Lx', '?')} px"
+            if m.get("fs"):
+                dims += f"  {float(m['fs']):.2f} Hz"
+            imgui.text(dims)
+        if m.get("last_run"):
+            imgui.text_disabled(
+                f"run {m['last_run']} (masknmf {m.get('masknmf_version', '?')})"
+            )
+        timing = m.get("timing") or {}
+        total = timing.get("total_plane_runtime")
+        if total:
+            imgui.text_disabled(
+                f"runtime {total:.0f}s (reg {timing.get('registration', 0):.0f}s, "
+                f"pmd {timing.get('extraction', 0):.0f}s, "
+                f"demix {timing.get('detection', 0):.0f}s)"
+            )
+        settings = m.get("settings") or {}
+        if settings and imgui.tree_node("settings"):
+            _draw_dict(settings)
+            imgui.tree_pop()
 
     def cleanup(self) -> None:
         if self._orig is not None and self._current != "Registered":
