@@ -186,3 +186,33 @@ def test_widget_modified_params():
 
     s2.demixing.filter_sigma = float(np.float32(s2.demixing.filter_sigma))
     assert _is_default(s2.demixing, "filter_sigma")
+
+
+def test_find_masknmf_run(tmp_path):
+    pytest.importorskip("imgui_bundle")
+    from mbo_utilities.gui.widgets.pipelines.masknmf import find_masknmf_run
+
+    # not a run
+    assert find_masknmf_run(tmp_path) == (None, None)
+    assert find_masknmf_run(None) == (None, None)
+
+    # failed run: stage cache exists, ops.npy never stamped -> outdir only
+    plane = tmp_path / "zplane01"
+    plane.mkdir()
+    (plane / "motion_correction.hdf5").touch()
+    params, outdir = find_masknmf_run(tmp_path)
+    assert params is None and outdir == str(tmp_path)
+
+    # partial run whose ops.npy predates the masknmf stamp
+    np.save(plane / "ops.npy", {"Ly": 4, "Lx": 5})
+    params, outdir = find_masknmf_run(plane)
+    assert params is None and outdir == str(tmp_path)
+
+    # completed run: parameters come back, from any entry point
+    saved = MasknmfSettings()
+    saved.demixing.maxiter = 55
+    np.save(plane / "ops.npy", {"pipeline": "masknmf", "masknmf": saved.to_dict()})
+    for entry in (tmp_path, plane, plane / "ops.npy"):
+        params, outdir = find_masknmf_run(entry)
+        assert outdir == str(tmp_path)
+        assert MasknmfSettings.from_dict(params).demixing.maxiter == 55

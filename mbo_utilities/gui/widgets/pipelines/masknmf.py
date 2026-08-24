@@ -48,6 +48,66 @@ def _check_masknmf_available() -> bool:
     return _HAS_MASKNMF
 
 
+_STAGE_FILES = ("motion_correction.hdf5", "compression.hdf5", "demixing_results.hdf5")
+
+
+def _is_masknmf_plane_dir(p: Path) -> bool:
+    return any((p / f).exists() for f in _STAGE_FILES)
+
+
+def find_masknmf_run(fpath) -> tuple[dict | None, str | None]:
+    """Locate a masknmf run at/around ``fpath``.
+
+    Returns ``(params, outdir)``: the settings dict saved in the plane
+    dir's ops.npy (None when the run died before stamping it — the stage
+    HDF5s still mark the tree as a run), and the folder Run should target
+    so stage gating resumes in place. Both None when ``fpath`` is not
+    part of a masknmf run.
+    """
+    if fpath is None:
+        return None, None
+    if isinstance(fpath, (list, tuple)):
+        if not fpath:
+            return None, None
+        fpath = fpath[0]
+    try:
+        p = Path(str(fpath))
+    except (TypeError, ValueError):
+        return None, None
+    if not p.exists():
+        return None, None
+    if p.is_file():
+        p = p.parent
+
+    if _is_masknmf_plane_dir(p):
+        plane_dir, outdir = p, p.parent
+    else:
+        plane_dir = None
+        try:
+            for child in sorted(p.iterdir()):
+                if child.is_dir() and _is_masknmf_plane_dir(child):
+                    plane_dir, outdir = child, p
+                    break
+        except (OSError, PermissionError):
+            return None, None
+        if plane_dir is None:
+            return None, None
+
+    params = None
+    ops_path = plane_dir / "ops.npy"
+    if ops_path.exists():
+        try:
+            import numpy as np
+
+            ops = np.load(ops_path, allow_pickle=True).item()
+            saved = ops.get("masknmf")
+            if isinstance(saved, dict):
+                params = saved
+        except Exception:
+            pass
+    return params, str(outdir)
+
+
 def _field_default(obj, name: str):
     for f in dataclasses.fields(obj):
         if f.name == name:
@@ -140,11 +200,29 @@ class MaskNMFPipelineWidget(PipelineWidget):
         num_channels = int(getattr(self.parent, "nc", 0) or 0) or 1
         return max_frames, num_planes, num_channels
 
+    def _hydrate_from_run(self, fpath) -> None:
+        """Fill parameters + output dir from a previous run's tree
+        (suite2p parity: opening results hydrates the Run tab)."""
+        from mbo_utilities.masknmf.params import MasknmfSettings
+
+        params, outdir = find_masknmf_run(fpath)
+        if outdir is None:
+            return
+        self._outdir = outdir
+        if params is not None:
+            self.settings = MasknmfSettings.from_dict(params)
+            self._last_status = "Loaded parameters from previous run"
+        else:
+            self._last_status = "Previous run found (no saved parameters)"
+
     def _ensure_slice_state(self) -> None:
         """Seed/reset slicing state when the dataset changes (suite2p parity)."""
         fpath = getattr(self.parent, "fpath", None)
         max_frames, num_planes, num_channels = self._dims()
-        if fpath != self._last_fpath or getattr(self, "_masknmf_last_max_tp", None) != max_frames:
+        fpath_changed = fpath != self._last_fpath
+        if fpath_changed:
+            self._hydrate_from_run(fpath)
+        if fpath_changed or getattr(self, "_masknmf_last_max_tp", None) != max_frames:
             self._last_fpath = fpath
             self._masknmf_last_max_tp = max_frames
             self._masknmf_tp_selection = f"1:{max_frames}"
