@@ -168,4 +168,3 @@ class ImageWidgetSliders(EdgeWindow):
             # if any slider dim changed set the new index of the image widget
             self._image_widget.current_index = new_index
 
-        self.size = int(imgui.get_window_height())

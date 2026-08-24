@@ -575,12 +575,14 @@ class ImageWidget:
                 subplot.docks["right"].controller.enabled = False
 
         # hard code the expected height so that the first render looks right in tests, docs etc.
+        # +24 px: the ImguiWindow base draws a custom title row the
+        # original heights did not account for
         if len(self.slider_dims) == 0:
-            ui_size = 57
+            ui_size = 81
         if len(self.slider_dims) == 1:
-            ui_size = 106
+            ui_size = 130
         elif len(self.slider_dims) == 2:
-            ui_size = 155
+            ui_size = 179
 
         self._image_widget_sliders = ImageWidgetSliders(
             figure=self.figure,

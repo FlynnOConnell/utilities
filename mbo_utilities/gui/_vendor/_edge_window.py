@@ -22,7 +22,11 @@ class EdgeWindow(ImguiWindow):
         size: int,
         location: str,
         title: str,
-        window_flags=imgui.WindowFlags_.no_collapse | imgui.WindowFlags_.no_resize,
+        # no_title_bar matches the branch's edge-window default — the base
+        # draws a custom centered title, so the native bar would double it
+        window_flags=imgui.WindowFlags_.no_collapse
+        | imgui.WindowFlags_.no_resize
+        | imgui.WindowFlags_.no_title_bar,
         *args,
         **kwargs,
     ):
@@ -34,6 +38,15 @@ class EdgeWindow(ImguiWindow):
             title=title,
             window_flags=window_flags,
         )
+
+    def draw(self):
+        # mbo-fastplotlib's render entry is draw_window(); subclasses
+        # (PreviewDataWidget) override it to draw popups/dialogs and then
+        # defer here. The branch renders via draw(), so route through it.
+        self.draw_window()
+
+    def draw_window(self):
+        ImguiWindow.draw(self)
 
     def update(self):
         raise NotImplementedError
