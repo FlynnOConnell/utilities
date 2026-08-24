@@ -534,6 +534,27 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
     else:
         figure_kwargs = {"size": (fig_w, fig_h)}
 
+    # ImageWidget scrolls at most two axes. An array with three non-singleton
+    # non-spatial axes (a MESc unit with time + colour channels + ROIs, or a
+    # multi-channel volumetric ScanImage stack) would be rejected outright, so
+    # fan the ROI axis out into subplots instead of asking for a third slider
+    # — the same arrangement `--roi 0` produces. Only the display changes; the
+    # array imread() returned still spans every ROI.
+    _s5 = getattr(data_array, "shape", ())
+    if len(_s5) == 5 and sum(1 for n in _s5[:3] if n > 1) > 2:
+        if (
+            hasattr(data_array, "roi_mode")
+            and getattr(data_array, "num_rois", 1) > 1
+            and getattr(data_array, "roi", None) is None
+        ):
+            data_array.roi = 0
+            from mbo_utilities.log import get as _get_log
+
+            _get_log("gui.boot").info(
+                f"shape {tuple(_s5)} needs 3 sliders but the viewer allows 2; "
+                f"showing {data_array.num_rois} ROIs as separate subplots."
+            )
+
     # Determine slider dimension names from array's dims property if available
     from mbo_utilities.arrays.features import get_slider_dims
 
@@ -675,6 +696,7 @@ def _run_gui_impl(
     show_splash: bool = False,
     runner_params: Any | None = None,
     mode: str = "Fastplotlib viewer (default)",
+    unit: int | str | None = None,
 ):
     """Internal implementation of run_gui with all heavy imports."""
     # Apply persisted Options (GPU adapter, debug logging) before any
@@ -730,10 +752,10 @@ def _run_gui_impl(
         # Dispatch based on Mode
         # pollen calibration is auto-detected in the fastplotlib viewer via get_viewer_class()
         if mode == "Fastplotlib viewer (default)":
-            return _launch_standard_viewer(data_in, roi, widget, metadata_only)
+            return _launch_standard_viewer(data_in, roi, widget, metadata_only, unit)
         if mode == "Napari viewer":
-            return _launch_napari(data_in, roi)
-        return _launch_standard_viewer(data_in, roi, widget, metadata_only)
+            return _launch_napari(data_in, roi, unit)
+        return _launch_standard_viewer(data_in, roi, widget, metadata_only, unit)
 
     finally:
         # ensure splash is closed on any exit path
@@ -741,7 +763,146 @@ def _run_gui_impl(
             splash.close()
 
 
-def _launch_standard_viewer(data_in, roi, widget, metadata_only):
+# returned by the picker when no Qt binding is importable, so the caller can
+# tell "couldn't ask" apart from "user said no".
+_PICKER_UNAVAILABLE = object()
+
+
+def _prompt_for_mesc_unit(path, units):
+    """Pop a Qt dialog listing the measurement units in a ``.mesc`` file.
+
+    A ``.mesc`` holds one MUnit per scan the operator ran — a z-stack, a
+    ribbon time series, a snapshot — and they are unrelated recordings with
+    different shapes, so there is no sensible way to merge them into one
+    array. The user picks which one to open.
+
+    Returns the chosen ``"MSession_N/MUnit_M"`` key, None if the user
+    cancelled, or `_PICKER_UNAVAILABLE` when no Qt binding is importable — the
+    caller then opens the file's default (first) unit rather than treating a
+    dialog we never showed as a refusal.
+    """
+    try:
+        from qtpy.QtCore import Qt
+        from qtpy.QtWidgets import (
+            QAbstractItemView,
+            QApplication,
+            QDialog,
+            QDialogButtonBox,
+            QHeaderView,
+            QLabel,
+            QTableWidget,
+            QTableWidgetItem,
+            QVBoxLayout,
+        )
+    except ImportError:
+        from mbo_utilities.log import get as _get
+        _get("gui.boot").info(
+            "no Qt binding available for the MESc unit picker; "
+            "opening the first unit."
+        )
+        return _PICKER_UNAVAILABLE
+
+    app = QApplication.instance() or QApplication([])
+
+    dialog = QDialog()
+    dialog.setWindowTitle(f"Select a measurement unit — {Path(path).name}")
+    dialog.resize(860, 420)
+    layout = QVBoxLayout(dialog)
+    layout.addWidget(
+        QLabel(
+            f"{Path(path).name} contains {len(units)} measurement units "
+            f"(one per scan). Choose which to open:"
+        )
+    )
+
+    columns = ("Unit", "Type", "T", "C", "Z / ROI", "Y", "X", "Acquired", "Comment")
+    table = QTableWidget(len(units), len(columns))
+    table.setHorizontalHeaderLabels(columns)
+    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.verticalHeader().setVisible(False)
+    for row, unit in enumerate(units):
+        t, c, z, y, x = unit["shape"]
+        z_text = f"{z} ROI" if unit["nrois"] > 1 else str(z)
+        cells = (
+            unit["munit"],
+            unit["modality_name"],
+            str(t),
+            str(c),
+            z_text,
+            str(y),
+            str(x),
+            (unit["start_time"] or "")[:19].replace("T", " "),
+            unit["comment"],
+        )
+        for col, text in enumerate(cells):
+            table.setItem(row, col, QTableWidgetItem(text))
+    table.resizeColumnsToContents()
+    table.horizontalHeader().setStretchLastSection(True)
+    table.horizontalHeader().setSectionResizeMode(
+        len(columns) - 1, QHeaderView.ResizeMode.Stretch
+    )
+    table.selectRow(0)
+    table.cellDoubleClicked.connect(lambda *_: dialog.accept())
+    layout.addWidget(table)
+
+    buttons = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Open | QDialogButtonBox.StandardButton.Cancel
+    )
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    layout.addWidget(buttons)
+
+    dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+    accepted = dialog.exec()
+    app.processEvents()
+    if not accepted:
+        return None
+    row = table.currentRow()
+    return units[max(0, row)]["key"]
+
+
+def _resolve_mesc_unit(data_in, unit):
+    """Reader kwargs selecting which MUnit of a ``.mesc`` to open.
+
+    Returns ``({}, True)`` for anything that isn't a multi-unit ``.mesc``.
+    The second element is False only when the user cancelled the picker, in
+    which case the caller should abort instead of opening something arbitrary.
+    """
+    from mbo_utilities.log import get as _get
+
+    logger = _get("gui.boot")
+    if unit is not None:
+        return {"unit": unit}, True
+    try:
+        path = Path(data_in)
+    except TypeError:
+        return {}, True
+    if not (path.is_file() and path.suffix.lower() == ".mesc"):
+        return {}, True
+
+    from mbo_utilities.arrays.mesc import list_mesc_units
+
+    try:
+        units = list_mesc_units(path)
+    except Exception as e:
+        logger.warning(f"could not list units in {path.name}: {e}")
+        return {}, True
+    if len(units) <= 1:
+        return {}, True
+
+    chosen = _prompt_for_mesc_unit(path, units)
+    if chosen is _PICKER_UNAVAILABLE:
+        return {}, True
+    if chosen is None:
+        logger.info(f"MESc unit selection cancelled for {path.name}")
+        return {}, False
+    logger.info(f"MESc unit selected: {chosen}")
+    return {"unit": chosen}, True
+
+
+def _launch_standard_viewer(data_in, roi, widget, metadata_only, unit=None):
     from mbo_utilities.reader import imread
     from mbo_utilities.arrays import normalize_roi
     from mbo_utilities.log import get as get_logger
@@ -749,8 +910,12 @@ def _launch_standard_viewer(data_in, roi, widget, metadata_only):
 
     logger = get_logger("gui.boot")
     roi = normalize_roi(roi)
+    # a .mesc holds many unrelated scans; pick one before opening anything
+    mesc_kwargs, proceed = _resolve_mesc_unit(data_in, unit)
+    if not proceed:
+        return None
     t0 = _time.perf_counter()
-    data_array = imread(data_in, roi=roi)
+    data_array = imread(data_in, roi=roi, **mesc_kwargs)
     t_imread = _time.perf_counter() - t0
     logger.debug(
         f"[boot] imread: {t_imread*1000:.0f} ms  "
@@ -942,7 +1107,7 @@ def _prompt_for_dz(default: float = 16.0) -> float | None:
     return float(value) if ok else None
 
 
-def _launch_napari(data_in, roi=None):
+def _launch_napari(data_in, roi=None, unit=None):
     from mbo_utilities.log import get as get_logger
     logger = get_logger("gui.napari")
 
@@ -961,6 +1126,11 @@ def _launch_napari(data_in, roi=None):
 
         path_str = str(data_in)
 
+        # a .mesc holds many unrelated scans; pick one before opening anything
+        mesc_kwargs, proceed = _resolve_mesc_unit(data_in, unit)
+        if not proceed:
+            return None
+
         # Probe the source up front so we can pick the right viewer mode
         # (3D when there's a real Z axis) and log the spatial scale we'll
         # be passing to napari. We re-load below for the actual layer when
@@ -969,7 +1139,7 @@ def _launch_napari(data_in, roi=None):
         probe_dims = None
         probe_z_size = 1
         try:
-            probe_arr = imread(data_in, roi=normalize_roi(roi))
+            probe_arr = imread(data_in, roi=normalize_roi(roi), **mesc_kwargs)
             probe_dims = get_dims(probe_arr)
             if "Z" in probe_dims:
                 probe_z_size = int(probe_arr.shape[probe_dims.index("Z")])
@@ -1011,7 +1181,7 @@ def _launch_napari(data_in, roi=None):
             # Load via mbo_utilities and add as layer
             try:
                 arr = probe_arr if probe_arr is not None else imread(
-                    data_in, roi=normalize_roi(roi)
+                    data_in, roi=normalize_roi(roi), **mesc_kwargs
                 )
                 dims = probe_dims if probe_dims is not None else get_dims(arr)
 
@@ -1169,6 +1339,7 @@ def run_gui(
     metadata_only: bool = False,
     select_only: bool = False,
     runner_params: Any | None = None,
+    unit: int | str | None = None,
 ):
     """
     Open a GUI to preview data of any supported type.
@@ -1192,6 +1363,10 @@ def run_gui(
         Does not load data or open the image viewer.
     runner_params : Any, optional
         hello_imgui.RunnerParams instance for custom window configuration.
+    unit : int or str, optional
+        For ``.mesc`` inputs, which measurement unit to open — an index or a
+        ``"MSession_0/MUnit_3"`` key. When omitted and the file holds more
+        than one unit, a picker dialog is shown.
 
     Returns
     -------
@@ -1232,6 +1407,7 @@ def run_gui(
         metadata_only=metadata_only,
         select_only=select_only,
         runner_params=runner_params,
+        unit=unit,
     )
 
 

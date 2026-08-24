@@ -511,6 +511,7 @@ class FileDialog:
                 ("TIFF", ".tif, .tiff"),
                 ("Zarr", ".zarr/"),
                 ("HDF5", ".h5, .hdf5"),
+                ("Femtonics", ".mesc"),
                 ("Suite2p", ".bin, ops.npy"),
                 ("NumPy", ".npy"),
             ]

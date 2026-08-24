@@ -84,6 +84,7 @@ tiff = "mbo_utilities.arrays.tiff:TiffArray"
 zarr = "mbo_utilities.arrays.zarr:ZarrArray"
 suite2p = "mbo_utilities.arrays.suite2p:Suite2pArray"
 h5 = "mbo_utilities.arrays.h5:H5Array"
+mesc = "mbo_utilities.arrays.mesc:MescArray"
 numpy = "mbo_utilities.arrays.numpy:NumpyArray"
 isoview = "mbo_utilities.arrays.isoview.array:IsoviewArray"
 

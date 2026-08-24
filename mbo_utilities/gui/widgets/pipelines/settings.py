@@ -245,6 +245,7 @@ def _ghost_button():
         imgui.pop_style_color(3)
 from mbo_utilities.gui._selection_ui import draw_selection_table, resolve_dim_labels
 from mbo_utilities.preferences import get_last_dir, set_last_dir
+from mbo_utilities.reader import widget_reader_kwargs
 from mbo_utilities._writers import _convert_paths_to_strings
 
 # lazy availability check - avoid heavy import at module load
@@ -4331,6 +4332,9 @@ def run_process(self):
 
                 worker_args = {
                     "input_path": input_path,
+                    "reader_kwargs": widget_reader_kwargs(
+                        getattr(self, "image_widget", None)
+                    ),
                     "output_dir": output_dir,
                     "planes": plane_list,
                     "roi": roi,

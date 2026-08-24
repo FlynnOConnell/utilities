@@ -140,7 +140,7 @@ def task_save_as(args: dict, logger: logging.Logger) -> None:
     # Load array
     monitor.update(0.05, f"Loading {Path(input_path).name}...")
     logger.info(f"Loading {input_path}")
-    arr = imread(input_path)
+    arr = imread(input_path, **(args.get("reader_kwargs") or {}))
 
     # Apply on-the-fly settings if supported
     if hasattr(arr, "fix_phase"):
@@ -367,7 +367,7 @@ def task_suite2p(args: dict, logger: logging.Logger) -> None:
 
     _src_arr = None
     try:
-        _src_arr = imread(input_path)
+        _src_arr = imread(input_path, **(args.get("reader_kwargs") or {}))
         src_meta = dict(getattr(_src_arr, "metadata", {}) or {})
         src_shape = (
             tuple(_src_arr._shape5d()) if hasattr(_src_arr, "_shape5d") else None
@@ -550,7 +550,7 @@ def task_suite2p(args: dict, logger: logging.Logger) -> None:
     # paths). Path-based pipeline_input survives unchanged.
     channel = args.get("channel")
     pipeline_input = input_path
-    reader_kwargs: dict = {}
+    reader_kwargs: dict = dict(args.get("reader_kwargs") or {})
     if channel is not None:
         ops["functional_chan"] = 1
         ops["align_by_chan"] = 1
@@ -713,7 +713,7 @@ def task_masknmf(args: dict, logger: logging.Logger) -> None:
     channel = args.get("channel")
 
     try:
-        src_arr = imread(input_path)
+        src_arr = imread(input_path, **(args.get("reader_kwargs") or {}))
     except Exception as e:
         monitor.fail(str(e), details={"traceback": traceback.format_exc()})
         logger.exception(f"masknmf: cannot open input {input_path!r}: {e}")

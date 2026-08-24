@@ -302,6 +302,14 @@ def main(
     help="Show only metadata (no image viewer).",
 )
 @click.option(
+    "--unit",
+    default=None,
+    help=(
+        "For .mesc files: which measurement unit to open, as an index (0, 1, ...) "
+        "or a 'MSession_0/MUnit_3' key. Omit to get a picker. `mbo info` lists them."
+    ),
+)
+@click.option(
     "--gpu",
     "gpu_index",
     type=int,
@@ -313,7 +321,7 @@ def main(
     is_flag=True,
     help="List available GPU adapters and exit.",
 )
-def view(data_in=None, roi=None, widget=True, metadata=False, gpu_index=None, list_gpus=False):
+def view(data_in=None, roi=None, widget=True, metadata=False, unit=None, gpu_index=None, list_gpus=False):
     r"""
     Open imaging data in the GUI viewer.
 
@@ -323,6 +331,7 @@ def view(data_in=None, roi=None, widget=True, metadata=False, gpu_index=None, li
       mbo view /data/raw.tiff        Open specific file
       mbo view /data/raw --metadata  Show only metadata
       mbo view /data --roi 0 --roi 2 View specific ROIs
+      mbo view /data/scan.mesc --unit 2   Open one MESc measurement unit
       mbo view --list-gpus           Show available GPU adapters
       mbo view /data/raw --gpu 0     Force GPU index 0
     """
@@ -376,6 +385,7 @@ def view(data_in=None, roi=None, widget=True, metadata=False, gpu_index=None, li
         roi=roi if roi else None,
         widget=widget,
         metadata_only=metadata,
+        unit=_parse_unit(unit),
     )
 
 
@@ -841,6 +851,45 @@ def _info_segmentation_counts(ops_dir):
     return n_rois, n_cells
 
 
+def _parse_unit(unit):
+    """Coerce a --unit value to an int index when it looks like one."""
+    if unit is None:
+        return None
+    text = str(unit).strip()
+    return int(text) if text.isdigit() else text
+
+
+def _echo_mesc_units(input_path, unit):
+    """Print the measurement units of a .mesc; return imread kwargs for `unit`.
+
+    A .mesc holds one MUnit per scan, so `mbo info` shows the whole table
+    before describing the single unit it opens.
+    """
+    from pathlib import Path
+
+    path = Path(input_path)
+    if not (path.is_file() and path.suffix.lower() == ".mesc"):
+        return {}
+
+    from mbo_utilities.arrays.mesc import list_mesc_units
+
+    units = list_mesc_units(path)
+    click.echo("")
+    click.secho(f"Measurement units ({len(units)})", fg="cyan")
+    click.echo(f"  {'idx':<5}{'unit':<12}{'type':<20}{'shape (T,C,Z,Y,X)':<26}comment")
+    for u in units:
+        shape = ",".join(str(v) for v in u["shape"])
+        click.echo(
+            f"  {u['index']:<5}{u['munit']:<12}{u['modality_name']:<20}"
+            f"({shape}){'':<{max(0, 24 - len(shape))}}{u['comment']}"
+        )
+    if unit is None and len(units) > 1:
+        click.secho(
+            f"  -> no --unit given; describing {units[0]['key']}", fg="yellow"
+        )
+    return {"unit": _parse_unit(unit)} if unit is not None else {}
+
+
 def _info_kv(label, value, unit=""):
     """Print an aligned label/value line; skip when value is None/empty."""
     if value is None or value == "":
@@ -864,7 +913,12 @@ def _info_kv(label, value, unit=""):
     is_flag=True,
     help="Also dump the full raw metadata dict.",
 )
-def info(input_path, metadata, show_all):
+@click.option(
+    "--unit",
+    default=None,
+    help="For .mesc files: which measurement unit to describe (index or key).",
+)
+def info(input_path, metadata, show_all, unit):
     r"""
     Show information about an imaging dataset.
 
@@ -874,12 +928,15 @@ def info(input_path, metadata, show_all):
       mbo info /data/volume.zarr
       mbo info /data/suite2p/plane0
       mbo info /data/raw --all
+      mbo info /data/scan.mesc --unit 2
     """
     from pathlib import Path
     from mbo_utilities import imread
 
+    reader_kwargs = _echo_mesc_units(input_path, unit)
+
     click.echo(f"Loading: {input_path}")
-    data = imread(input_path)
+    data = imread(input_path, **reader_kwargs)
     md = getattr(data, "metadata", None) or {}
     sizes = _info_dim_sizes(data)
 
@@ -1047,6 +1104,7 @@ def list_formats():
     click.echo("  .zarr        - Zarr v3 arrays")
     click.echo("  .bin         - Suite2p binary format (with ops.npy)")
     click.echo("  .h5, .hdf5   - HDF5 files")
+    click.echo("  .mesc        - Femtonics MESc (one array per measurement unit)")
     click.echo("  .npy         - NumPy arrays")
     click.echo("  .json        - Zarr array metadata (loads parent .zarr)")
 

@@ -24,6 +24,7 @@ from mbo_utilities.gui.widgets.pipelines.settings import (
     _format_size,
 )
 from mbo_utilities.preferences import get_last_dir, set_last_dir
+from mbo_utilities.reader import widget_reader_kwargs
 
 # palette matched to the Suite2p settings panel
 _TITLE_COLOR = imgui.ImVec4(1.0, 0.85, 0.4, 1.0)
@@ -754,6 +755,9 @@ class MaskNMFPipelineWidget(PipelineWidget):
             )
             args = {
                 "input_path": str(self.parent.fpath),
+                "reader_kwargs": widget_reader_kwargs(
+                    getattr(self.parent, "image_widget", None)
+                ),
                 "output_dir": output_dir,
                 "planes": planes,
                 "settings": self.settings.to_dict(),

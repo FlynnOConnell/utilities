@@ -170,7 +170,10 @@ class RoiFeatureMixin:
                     )
             elif isinstance(value, (list, tuple)):
                 for v in value:
-                    if v < 1 or v > num:
+                    # 0 inside a list means "split all", which iter_rois()
+                    # already expands; rejecting it here made `--roi 0`
+                    # (click hands over the tuple `(0,)`) raise on load.
+                    if v != 0 and (v < 1 or v > num):
                         raise ValueError(
                             f"ROI index {v} in {value} out of bounds. "
                             f"Valid range: 1 to {num} (1-indexed)."

@@ -86,6 +86,10 @@ if TYPE_CHECKING:
     )
     from mbo_utilities.arrays.bin import BinArray as BinArray
     from mbo_utilities.arrays.h5 import H5Array as H5Array
+    from mbo_utilities.arrays.mesc import (
+        MescArray as MescArray,
+        list_mesc_units as list_mesc_units,
+    )
     from mbo_utilities.arrays.isoview import (
         IsoviewArray as IsoviewArray,
         consolidate_isoview as consolidate_isoview,
@@ -117,6 +121,8 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     # array classes
     "Suite2pArray": (".suite2p", "Suite2pArray"),
     "H5Array": (".h5", "H5Array"),
+    "MescArray": (".mesc", "MescArray"),
+    "list_mesc_units": (".mesc", "list_mesc_units"),
     "MP4Array": (".mp4", "MP4Array"),
     "TiffArray": (".tiff", "TiffArray"),
     "ScanImageArray": (".tiff", "ScanImageArray"),
@@ -196,6 +202,7 @@ __all__ = [
     "consolidate_isoview",
     "detect_isoview_kind",
     "LBMArray",
+    "MescArray",
     "MP4Array",
     "NumpyArray",
     "PiezoArray",
@@ -214,6 +221,7 @@ __all__ = [
     # Features subpackage
     "features",
     "isoview_to_ome_zarr",
+    "list_mesc_units",
     "iter_rois",
     "normalize_roi",
     "open_scanimage",

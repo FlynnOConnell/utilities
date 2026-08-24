@@ -350,7 +350,7 @@ def get_metadata_single(file: Path):
     >>> print(meta_verbose["all"])
     {... Includes all ScanImage FrameData ...}
     """
-    if file.suffix in [".zarr", ".h5"]:
+    if file.suffix in [".zarr", ".h5", ".mesc"]:
         from mbo_utilities import imread
 
         file = imread(file)

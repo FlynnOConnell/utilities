@@ -1,0 +1,435 @@
+"""
+Femtonics MESc reader contract tests.
+
+A ``.mesc`` file holds one MUnit per scan, and ``MethodType`` decides both
+what axis 0 of ``Channel_N`` means and how the scanned sub-regions are packed
+into the raw page. These tests build a synthetic file covering every layout
+`MescArray` claims to handle, and pin the unpacking against hand-computed
+expectations read straight out of h5py.
+"""
+
+from __future__ import annotations
+
+import json
+
+import h5py
+import numpy as np
+import pytest
+
+from mbo_utilities.arrays.mesc import MescArray, list_mesc_units
+from mbo_utilities.reader import imread
+
+
+# ============================================================
+# synthetic fixture
+# ============================================================
+
+def _curve(unit, idx, name, values, delta=1.0):
+    g = unit.create_group(f"Curve_{idx}")
+    g.attrs["Name"] = name
+    g.attrs["CurveDataXRawDelta"] = delta
+    g.create_dataset(
+        "CurveDataYIdxNextSample", data=np.arange(1, len(values) + 1, dtype=np.int64)
+    )
+    g.create_dataset("CurveDataYRawData", data=np.asarray(values))
+
+
+def _protocol(pattern):
+    return json.dumps(
+        {
+            "protocol": {"scanners": {"mainPatternIndex": 1}},
+            "scanPatterns": {"patterns": [pattern]},
+        }
+    )
+
+
+def _boxes(boxes):
+    """MESc stores 1-based, lower-left/upper-right pixel corners."""
+    return [
+        {"lowerLeftFramePix": [c0 + 1, r0 + 1], "upperRightFramePix": [c1, r1]}
+        for (r0, r1, c0, c1) in boxes
+    ]
+
+
+_GUIDELINE = [[[0, 1], [0, 0], [0, 0]], [[0, 1], [1, 1], [0, 0]]]
+
+
+@pytest.fixture(scope="module")
+def mesc_path(tmp_path_factory):
+    """A .mesc with one unit per layout MescArray supports."""
+    path = tmp_path_factory.mktemp("mesc") / "synthetic.mesc"
+    rng = np.random.default_rng(0)
+    with h5py.File(path, "w") as f:
+        s = f.create_group("MSession_0")
+
+        # MUnit_0 - MethodType 2 z-stack: axis 0 is depth, no time axis
+        u = s.create_group("MUnit_0")
+        u.attrs.update(
+            {"MethodType": 2, "VecChannelsSize": 2, "TStepInMs": 33.0,
+             "MeasurementDatePosix": 1_700_000_000, "Comment": "zstack"}
+        )
+        for c in range(2):
+            u.create_dataset(
+                f"Channel_{c}",
+                data=(rng.integers(0, 4000, (20, 64, 48)) + c).astype(np.uint16),
+            )
+
+        # MUnit_1 - MethodType 8 chessboard: 4 ROIs tiled along X
+        u = s.create_group("MUnit_1")
+        u.attrs.update(
+            {"MethodType": 8, "VecChannelsSize": 2, "TStepInMs": 50.0,
+             "MeasurementDatePosix": 1_700_000_100, "Comment": "chessboard"}
+        )
+        u.attrs["MultiROIProtocolJSON"] = _protocol(
+            {
+                "centerPoints": np.arange(12).reshape(3, 4).tolist(),
+                "pixelSizeX": 0.8,
+                "rotation": {"e": [0.0, 0.0, 0.0]},
+            }
+        )
+        for c in range(2):
+            u.create_dataset(
+                f"Channel_{c}",
+                data=np.arange(6 * 32 * 96, dtype=np.uint16).reshape(6, 32, 96) + c,
+            )
+
+        # MUnit_2 - MethodType 9 ribbon transverse: ragged ROI boxes
+        u = s.create_group("MUnit_2")
+        u.attrs.update(
+            {"MethodType": 9, "VecChannelsSize": 1, "TStepInMs": 25.0,
+             "MeasurementDatePosix": 1_700_000_200, "Comment": "ribbon"}
+        )
+        u.attrs["BreakViewJSON"] = json.dumps(
+            {"measurementROIMaps": _boxes([(0, 10, 0, 20), (12, 30, 0, 16)])}
+        )
+        u.attrs["MultiROIProtocolJSON"] = _protocol(
+            {"guideLine": _GUIDELINE, "pixelSizeL": 1.5}
+        )
+        u.create_dataset(
+            "Channel_0", data=np.arange(5 * 40 * 24, dtype=np.uint16).reshape(5, 40, 24)
+        )
+
+        # MUnit_3 - MethodType 6 linescan: 8 frames of 4 lines packed into Y
+        u = s.create_group("MUnit_3")
+        u.attrs.update(
+            {"MethodType": 6, "VecChannelsSize": 1, "TStepInMs": 2.0,
+             "MeasurementDatePosix": 1_700_000_300, "Comment": "linescan"}
+        )
+        u.attrs["CoordinateMapJSON"] = json.dumps(
+            {"maps": [{"measurementROIs": _boxes([(0, 4, 0, 12), (0, 4, 12, 30)])}]}
+        )
+        u.attrs["MultiROIProtocolJSON"] = _protocol(
+            {"guideLine": _GUIDELINE, "pixelSize": 0.5}
+        )
+        u.create_dataset(
+            "Channel_0", data=np.arange(1 * 32 * 30, dtype=np.uint16).reshape(1, 32, 30)
+        )
+        _curve(u, 0, "DiI2", [1, 0, 1], delta=4.0)
+
+        # MUnit_4 - MethodType 1 plain timeseries
+        u = s.create_group("MUnit_4")
+        u.attrs.update(
+            {"MethodType": 1, "VecChannelsSize": 1, "TStepInMs": 100.0,
+             "MeasurementDatePosix": 1_700_000_400, "Comment": "timeseries"}
+        )
+        u.create_dataset(
+            "Channel_0", data=np.arange(7 * 16 * 18, dtype=np.uint16).reshape(7, 16, 18)
+        )
+
+        # MUnit_5 - MethodType 7 multiline with dichroic light-path switching
+        u = s.create_group("MUnit_5")
+        u.attrs.update(
+            {"MethodType": 7, "VecChannelsSize": 2, "TStepInMs": 3.0,
+             "MeasurementDatePosix": 1_700_000_500, "Comment": "dichro"}
+        )
+        u.attrs["CoordinateMapJSON"] = json.dumps(
+            {"maps": [{"measurementROIs": _boxes([(0, 2, 0, 10)])}]}
+        )
+        u.attrs["MultiROIProtocolJSON"] = _protocol(
+            {"centerPoints": np.arange(9).reshape(3, 3).tolist(), "pixelSize": 0.25}
+        )
+        for c in range(2):
+            u.create_dataset(
+                f"Channel_{c}",
+                data=np.arange(1 * 20 * 10, dtype=np.uint16).reshape(1, 20, 10)
+                + c * 1000,
+            )
+        _curve(u, 0, "DichroSw_AO1", [1, 2] * 5)
+    return path
+
+
+@pytest.fixture
+def raw(mesc_path):
+    """Direct h5py access to the fixture, for expectation-building."""
+    with h5py.File(mesc_path, "r") as f:
+        yield f
+
+
+# ============================================================
+# discovery + dispatch
+# ============================================================
+
+def test_list_units_reports_every_layout(mesc_path):
+    units = list_mesc_units(mesc_path)
+    assert [u["munit"] for u in units] == [f"MUnit_{i}" for i in range(6)]
+    assert [u["kind"] for u in units] == [
+        "zstack", "tiled", "boxes", "packed", "frames", "packed",
+    ]
+    assert [u["shape"] for u in units] == [
+        (1, 2, 20, 64, 48),
+        (6, 2, 4, 32, 24),
+        (5, 1, 2, 18, 20),
+        (8, 1, 2, 4, 18),
+        (7, 1, 1, 16, 18),
+        (5, 2, 1, 2, 10),
+    ]
+
+
+def test_imread_dispatches_to_mesc_array(mesc_path):
+    arr = imread(mesc_path)
+    assert isinstance(arr, MescArray)
+    # no explicit unit -> the file's first unit, deterministically
+    assert arr.unit_key == "MSession_0/MUnit_0"
+    assert arr.reader_kwargs == {"unit": "MSession_0/MUnit_0"}
+
+
+@pytest.mark.parametrize("selector", [2, "MUnit_2", "MSession_0/MUnit_2"])
+def test_unit_selectors_are_equivalent(mesc_path, selector):
+    assert MescArray(mesc_path, unit=selector).unit_key == "MSession_0/MUnit_2"
+
+
+@pytest.mark.parametrize("selector", [99, -1, "MUnit_77", "MSession_9/MUnit_0"])
+def test_bad_unit_selector_raises(mesc_path, selector):
+    with pytest.raises(ValueError, match="unit"):
+        MescArray(mesc_path, unit=selector)
+
+
+# ============================================================
+# per-layout unpacking
+# ============================================================
+
+def test_zstack_axis0_is_depth(mesc_path, raw):
+    arr = MescArray(mesc_path, unit=0)
+    src = raw["MSession_0/MUnit_0/Channel_1"][:]
+    assert arr.shape == (1, 2, 20, 64, 48)
+    assert arr.metadata["mesc_z_axis_meaning"] == "depth"
+    assert arr.metadata["dz"] is None  # MESc records no trustworthy z-step
+    assert arr.num_rois == 1
+    assert np.array_equal(arr[0, 1, 7], src[7])
+    assert np.array_equal(arr[0, 1, 3:6], src[3:6])
+
+
+def test_chessboard_rois_tile_along_x_and_flip_y(mesc_path, raw):
+    arr = MescArray(mesc_path, unit=1)
+    src = raw["MSession_0/MUnit_1/Channel_0"][:]
+    assert arr.shape == (6, 2, 4, 32, 24)
+    assert arr.num_rois == 4
+    assert arr.metadata["mesc_flip_y"] is True
+    for r in range(4):
+        expected = src[:, :, r * 24 : (r + 1) * 24][:, ::-1, :]
+        assert np.array_equal(arr[:, 0, r], expected), f"roi {r}"
+
+
+def test_ribbon_boxes_are_padded_to_the_largest_roi(mesc_path, raw):
+    arr = MescArray(mesc_path, unit=2)
+    src = raw["MSession_0/MUnit_2/Channel_0"][:]
+    assert arr.shape == (5, 1, 2, 18, 20)
+
+    padded = np.zeros((5, 18, 20), dtype=src.dtype)
+    padded[:, :10, :20] = src[:, 0:10, 0:20]
+    assert np.array_equal(arr[:, 0, 0], padded[:, ::-1, :])
+
+    padded = np.zeros((5, 18, 20), dtype=src.dtype)
+    padded[:, :18, :16] = src[:, 12:30, 0:16]
+    assert np.array_equal(arr[:, 0, 1], padded[:, ::-1, :])
+
+    # the padding is recorded so a consumer can mask it out
+    extents = arr.metadata["mesc_roi_extents"]
+    assert (extents[0]["height"], extents[0]["y_start"]) == (10, 8)
+    assert (extents[1]["height"], extents[1]["y_start"]) == (18, 0)
+
+
+def test_linescan_frames_unpack_from_the_y_axis(mesc_path, raw):
+    arr = MescArray(mesc_path, unit=3)
+    src = raw["MSession_0/MUnit_3/Channel_0"][:]
+    assert arr.shape == (8, 1, 2, 4, 18)
+    for t in range(8):
+        assert np.array_equal(arr[t, 0, 1], src[0, t * 4 : (t + 1) * 4, 12:30])
+    # out-of-order timepoints must not be silently sorted
+    assert np.array_equal(
+        arr[[5, 1], 0, 1],
+        np.stack([src[0, 20:24, 12:30], src[0, 4:8, 12:30]]),
+    )
+
+
+def test_dichroic_multiline_splits_light_paths_across_channels(mesc_path, raw):
+    arr = MescArray(mesc_path, unit=5)
+    green = raw["MSession_0/MUnit_5/Channel_0"][:]
+    red = raw["MSession_0/MUnit_5/Channel_1"][:]
+    # 10 source frames alternating green/red -> 5 paired timepoints
+    assert arr.shape == (5, 2, 1, 2, 10)
+    assert arr.metadata["mesc_dichroic"] is True
+    assert arr.metadata["channel_names"] == ["Green", "Red"]
+    for t in range(5):
+        assert np.array_equal(arr[t, 0, 0], green[0, 4 * t : 4 * t + 2, 0:10])
+        assert np.array_equal(arr[t, 1, 0], red[0, 4 * t + 2 : 4 * t + 4, 0:10])
+
+
+def test_timeseries_indexes_like_a_plain_stack(mesc_path, raw):
+    arr = MescArray(mesc_path, unit=4)
+    src = raw["MSession_0/MUnit_4/Channel_0"][:]
+    assert arr.shape == (7, 1, 1, 16, 18)
+    assert arr.metadata["mesc_z_axis_meaning"] == "none"
+    assert np.array_equal(arr[2, 0, 0], src[2])
+    # spatial keys are honoured, and integer keys drop their axis
+    assert np.array_equal(arr[1:4, 0, 0, 2:5, ::2], src[1:4, 2:5, ::2])
+    assert arr[3, 0, 0].shape == (16, 18)
+    assert arr[3:4, :, :].shape == (1, 1, 1, 16, 18)
+
+
+# ============================================================
+# ROI interface
+# ============================================================
+
+def test_roi_selection_collapses_z_to_one_roi(mesc_path, raw):
+    arr = MescArray(mesc_path, unit=1)
+    src = raw["MSession_0/MUnit_1/Channel_0"][:]
+    arr.roi = 3
+    assert arr.shape == (6, 2, 1, 32, 24)
+    assert np.array_equal(arr[:, 0, 0], src[:, :, 48:72][:, ::-1, :])
+
+
+def test_roi_zero_splits_all(mesc_path):
+    arr = MescArray(mesc_path, unit=1)
+    arr.roi = 0
+    assert list(arr.iter_rois()) == [1, 2, 3, 4]
+    # click hands `--roi 0` over as a list; iter_rois expands it the same way
+    arr.roi = [0]
+    assert list(arr.iter_rois()) == [1, 2, 3, 4]
+
+
+def test_slider_labels_match_what_the_viewer_renders(mesc_path):
+    arr = MescArray(mesc_path, unit=1)
+    assert arr.slider_dim_labels == ("Timepoint", "Channel", "ROI")
+    # each split subplot holds a single ROI, so Z stops being scrollable
+    arr.roi = 0
+    assert arr.slider_dim_labels == ("Timepoint", "Channel")
+    assert MescArray(mesc_path, unit=0).slider_dim_labels == ("Channel", "Z-plane")
+
+
+# ============================================================
+# alignment + metadata
+# ============================================================
+
+def test_sync_frame_is_reported_but_not_applied_by_default(mesc_path):
+    arr = MescArray(mesc_path, unit=3)
+    assert arr.metadata["mesc_sync_frame"] == 2
+    assert arr.metadata["mesc_start_frame"] == 0
+    assert arr.shape[0] == 8
+
+
+def test_sync_key_crops_to_the_detected_frame(mesc_path, raw):
+    arr = MescArray(mesc_path, unit=3, sync_key="DiI2")
+    src = raw["MSession_0/MUnit_3/Channel_0"][:]
+    assert arr.shape[0] == 6
+    assert np.array_equal(arr[0, 0, 1], src[0, 8:12, 12:30])
+
+
+def test_start_frame_beyond_the_recording_is_ignored(mesc_path):
+    arr = MescArray(mesc_path, unit=4, start_frame=999)
+    assert arr.shape[0] == 7
+
+
+def test_canonical_metadata_is_populated(mesc_path):
+    md = MescArray(mesc_path, unit=2).metadata
+    assert md["fs"] == pytest.approx(40.0)
+    assert md["dx"] == md["dy"] == pytest.approx(1.5)
+    assert (md["num_timepoints"], md["num_zplanes"], md["nchannels"]) == (5, 2, 1)
+    assert (md["Ly"], md["Lx"]) == (18, 20)
+    assert md["num_mrois"] == 2
+    assert md["mesc_modality_name"] == "ribbon_transverse"
+    assert md["mesc_unit"] == "MSession_0/MUnit_2"
+    # the big embedded protocol JSON is parsed, not dumped into metadata
+    assert "MultiROIProtocolJSON" not in md["mesc_attrs"]
+    assert len(md["mesc_centroids"]) == 2
+
+
+def test_metadata_overrides_do_not_touch_the_read_only_file(mesc_path):
+    arr = MescArray(mesc_path, unit=4)
+    arr.metadata = {"dz": 12.0}
+    assert arr.metadata["dz"] == 12.0
+    assert MescArray(mesc_path, unit=4).metadata["dz"] is None
+
+
+# ============================================================
+# lazy-array contract
+# ============================================================
+
+def test_reads_only_the_requested_frames(mesc_path, monkeypatch):
+    """A single-timepoint read must not pull the whole channel into memory."""
+    arr = MescArray(mesc_path, unit=1)
+    dataset = arr._channels[0]
+    reads = []
+    original = dataset.__class__.__getitem__
+    monkeypatch.setattr(
+        dataset.__class__,
+        "__getitem__",
+        lambda self, key: (reads.append(key), original(self, key))[1],
+    )
+    frame = arr[2, 0, 0]
+    assert frame.shape == (32, 24)
+    assert reads, "expected at least one h5py read"
+    for key in reads:
+        # every read is bounded: never a bare full-dataset slice
+        assert key != slice(None)
+
+
+def test_squeeze_and_dims_follow_the_canonical_contract(mesc_path):
+    arr = MescArray(mesc_path, unit=4)
+    assert arr.dims == ("T", "C", "Z", "Y", "X")
+    assert arr.ndim == 5
+    assert arr.squeeze().shape == (7, 16, 18)
+    assert (arr.nt, arr.nc, arr.nz, arr.ny, arr.nx) == (7, 1, 1, 16, 18)
+
+
+def test_astype_converts_lazily(mesc_path):
+    arr = MescArray(mesc_path, unit=4).astype(np.float32)
+    assert arr.dtype == np.float32
+    assert arr[0, 0, 0].dtype == np.float32
+
+
+def test_phase_correction_is_available_but_off(mesc_path):
+    arr = MescArray(mesc_path, unit=4)
+    assert hasattr(arr, "phase_correction")
+    assert arr.fix_phase is False
+    baseline = np.asarray(arr[0, 0, 0])
+    arr.fix_phase = True
+    assert arr.fix_phase is True
+    corrected = np.asarray(arr[0, 0, 0])
+    assert corrected.shape == baseline.shape
+    assert arr.get_offset_at(0, 0, 0) is not None
+
+
+def test_imwrite_round_trips_through_zarr(mesc_path, tmp_path):
+    from mbo_utilities import imwrite
+
+    arr = MescArray(mesc_path, unit=1)
+    out = tmp_path / "out"
+    out.mkdir()
+    imwrite(arr, out, ext=".zarr", overwrite=True)
+    back = imread(next(out.glob("*.zarr")))
+    assert back.shape == arr.shape
+    assert np.array_equal(np.asarray(back[:, :, :]), np.asarray(arr[:, :, :]))
+
+
+def test_imwrite_roi_zero_fans_out_one_directory_per_roi(mesc_path, tmp_path):
+    from mbo_utilities import imwrite
+
+    arr = MescArray(mesc_path, unit=1)
+    arr.roi = 0
+    out = tmp_path / "split"
+    out.mkdir()
+    imwrite(arr, out, ext=".tiff", overwrite=True)
+    assert sorted(p.name for p in out.iterdir()) == [
+        "roi01", "roi02", "roi03", "roi04",
+    ]

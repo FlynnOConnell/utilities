@@ -45,7 +45,9 @@ logger = log.get("reader")
 # UI dropdown shows these formats (excludes .tif to avoid duplication)
 MBO_SUPPORTED_FTYPES = [".tiff", ".zarr", ".bin", ".h5", ".klb", ".mp4"]
 # reading accepts .tif as alias for .tiff
-MBO_READABLE_FTYPES = [".tiff", ".tif", ".zarr", ".bin", ".h5", ".npy", ".klb", ".mp4"]
+MBO_READABLE_FTYPES = [
+    ".tiff", ".tif", ".zarr", ".bin", ".h5", ".mesc", ".npy", ".klb", ".mp4",
+]
 
 # extensions that require an optional third-party package. when the package
 # isn't importable we drop the extension from the GUI dropdown so the user
@@ -59,6 +61,28 @@ MBO_AVAILABLE_FTYPES = [
 ]
 
 # Re-export PIPELINE_TAGS for backward compatibility (canonical location is file_io.py)
+
+
+def source_reader_kwargs(arr) -> dict:
+    """Extra `imread` kwargs needed to re-create `arr` from its `source_path`.
+
+    Most arrays are fully determined by their path and return ``{}``. Formats
+    whose file holds several independent datasets (``.mesc``, one array per
+    measurement unit) return the selector, so a task that re-opens the path in
+    a worker process gets the same data the user is looking at rather than the
+    file's default.
+    """
+    return dict(getattr(arr, "reader_kwargs", None) or {})
+
+
+def widget_reader_kwargs(image_widget) -> dict:
+    """`source_reader_kwargs` for the array an ImageWidget is displaying.
+
+    Returns ``{}`` for a missing or empty widget, so a task's argument dict can
+    always ask without guarding.
+    """
+    data = getattr(image_widget, "data", None) or []
+    return source_reader_kwargs(data[0]) if len(data) else {}
 
 
 @lru_cache(maxsize=32)
@@ -115,6 +139,7 @@ def imread(
     - .bin: Suite2p binary files (.bin + ops.npy)
     - .tif/.tiff: TIFF files (BigTIFF, OME-TIFF and raw ScanImage TIFFs)
     - .h5: HDF5 files
+    - .mesc: Femtonics MESc acquisitions (one MUnit per array)
     - .zarr: Zarr v3
     - .npy: NumPy arrays
     - np.ndarray: In-memory numpy arrays (wrapped as NumpyArray)
@@ -423,6 +448,19 @@ def _imread_impl(
     if first.suffix == ".h5":
         logger.debug(f"Reading HDF5 files from {first}.")
         return H5Array(first, **_filter_kwargs(H5Array, kwargs))
+
+    if first.suffix == ".mesc":
+        # reached only for directory / multi-file inputs; a direct .mesc path
+        # is claimed by MescArray.can_open() in the dispatch above.
+        from mbo_utilities.arrays.mesc import MescArray
+
+        if len(paths) > 1:
+            logger.warning(
+                f"{len(paths)} .mesc files in {inputs}; opening {first.name}. "
+                f"Each file holds its own units - open them one at a time."
+            )
+        logger.debug(f"Reading MESc file: {first}")
+        return MescArray(first, **_filter_kwargs(MescArray, kwargs))
 
     if first.suffix == ".mp4":
         logger.debug(f"Reading MP4 file as MP4Array: {first}")

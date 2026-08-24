@@ -13,7 +13,7 @@ from typing import Any
 
 from imgui_bundle import imgui, hello_imgui, portable_file_dialogs as pfd
 
-from mbo_utilities.reader import MBO_AVAILABLE_FTYPES, imread
+from mbo_utilities.reader import MBO_AVAILABLE_FTYPES, imread, widget_reader_kwargs
 from mbo_utilities.writer import imwrite
 from mbo_utilities.metadata import get_param
 from mbo_utilities.arrays import _sanitize_suffix
@@ -1419,6 +1419,11 @@ def _draw_save_button(parent: Any):
 
                     worker_args = {
                         "input_path": input_path,
+                        # multi-dataset sources (.mesc) need the selector so
+                        # the worker re-opens the unit on screen, not unit 0
+                        "reader_kwargs": widget_reader_kwargs(
+                            getattr(parent, "image_widget", None)
+                        ),
                         "output_path": str(parent._saveas_outdir),
                         "ext": parent._ext,
                         "planes": save_planes,
