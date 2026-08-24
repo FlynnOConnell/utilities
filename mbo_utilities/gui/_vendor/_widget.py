@@ -1086,3 +1086,75 @@ def _fixed_draw_histogram(self, draw_list, x_left, x_right, bar_y, bar_h):
 from fastplotlib.ui import ImguiColorbar as _PatchedColorbar
 
 _PatchedColorbar._draw_histogram = _fixed_draw_histogram
+
+
+# --- data replacement (mbo-fastplotlib indexer contract) ---------------------
+# the file dialog swaps datasets with `iw.data[0] = new_array` and expects
+# dimensions to re-derive; the legacy property returned the raw list, which
+# made the swap silently structural-noop and crashed the next index change
+class _MboDataList(list):
+    def __init__(self, iw, items):
+        super().__init__(items)
+        self._iw = iw
+
+    def __setitem__(self, i, new_array):
+        self._iw._mbo_replace_data(i, new_array)
+
+
+def _mbo_data_get(self):
+    return _MboDataList(self, self._data)
+
+
+_SLIDER_UI_SIZES = {0: 81, 1: 130, 2: 179}
+
+
+def _mbo_replace_data(self, i, new_array):
+    """Swap one managed array and re-derive all dimension state."""
+    self._data[i] = new_array
+    self._n_scrollable_dims[i] = self._get_n_scrollable_dims(
+        new_array, self._rgb[i]
+    )
+
+    self._slider_dims = []
+    for dim in range(max(self.n_scrollable_dims)):
+        if dim in ALLOWED_SLIDER_DIMS:
+            self._slider_dims.append(ALLOWED_SLIDER_DIMS[dim])
+
+    self._dims_max_bounds = {k: 0 for k in self.slider_dims}
+    for j, _dim in enumerate(list(self._dims_max_bounds.keys())):
+        for array, partition in zip(self._data, self.n_scrollable_dims):
+            if partition <= j:
+                continue
+            self._dims_max_bounds[_dim] = max(
+                self._dims_max_bounds[_dim], array.shape[j]
+            )
+
+    # stale closures over the old data are invalid
+    self._window_funcs = None
+    self._frame_apply = dict()
+    self._current_index = {d: 0 for d in self.slider_dims}
+
+    # rebuild the graphic + colorbar for the new array
+    subplot = list(self.figure)[i]
+    frame = self._process_indices(new_array, slice_indices=self._current_index)
+    frame = self._process_frame_apply(frame, i)
+    new_graphic = ImageGraphic(data=frame, name="image_widget_managed")
+    if self._histogram_widget and i < len(self._colorbars):
+        self._colorbars[i].images = new_graphic
+        self._colorbars[i].histogram = np.histogram(
+            np.asarray(frame).ravel(), bins=100
+        )
+    subplot.delete_graphic(graphic=subplot["image_widget_managed"])
+    subplot.insert_graphic(graphic=new_graphic)
+    new_graphic.reset_vmin_vmax()
+
+    # resize the playback bar to the new slider count
+    size = _SLIDER_UI_SIZES.get(len(self._slider_dims))
+    if size is not None:
+        self._image_widget_sliders.size = size
+
+    self.current_index = dict(self._current_index)
+
+
+ImageWidget.data = property(_mbo_data_get)
+ImageWidget._mbo_replace_data = _mbo_replace_data
