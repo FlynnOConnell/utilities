@@ -28,6 +28,16 @@ from mbo_utilities.masknmf.params import (
 from mbo_utilities.masknmf import outputs as _outputs
 
 
+def _export_atomic(obj, path: Path) -> None:
+    """Export to a temp name and rename, so a crash never leaves a partial
+    file that later runs would trust as a cached stage output."""
+    tmp = path.with_name(path.name + ".partial")
+    if tmp.exists():
+        tmp.unlink()
+    obj.export(str(tmp))
+    os.replace(tmp, path)
+
+
 def _to_np(x) -> np.ndarray:
     if hasattr(x, "detach"):
         return x.detach().cpu().numpy()
@@ -197,9 +207,7 @@ def _stage_registration(raw, cfg, runtime, plane_dir: Path, device: str, logger)
     logger.info("masknmf: estimating shifts")
     moco = strategy.motion_correct(raw)
     moco.output_device = moco.strategy.device
-    if moco_path.exists():
-        moco_path.unlink()
-    moco.export(str(moco_path))
+    _export_atomic(moco, moco_path)
     shifts = _to_np(moco.shifts)
     template = getattr(moco.strategy, "template", None)
     return (
@@ -269,9 +277,7 @@ def _stage_compression(
         )
     logger.info("masknmf: running PMD compression")
     pmd = strat.compress(moco)
-    if pmd_path.exists():
-        pmd_path.unlink()
-    pmd.export(str(pmd_path))
+    _export_atomic(pmd, pmd_path)
     # reload so demixing always consumes the exact persisted decomposition
     return masknmf.PMDArray.from_hdf5(str(pmd_path)), time.time() - t0
 
@@ -370,9 +376,7 @@ def _stage_demixing(pmd, cfg, runtime, plane_dir: Path, device: str, fs, logger)
     if results is None:
         raise ValueError("masknmf unfiltered demixing did not complete a pass")
 
-    if demix_path.exists():
-        demix_path.unlink()
-    results.export(str(demix_path))
+    _export_atomic(results, demix_path)
     return results, time.time() - t0
 
 
