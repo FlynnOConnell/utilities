@@ -1039,13 +1039,13 @@ def _mbo_indices_get(self):
 
 
 def _mbo_indices_set(self, value):
-    adapter = _MboNamedIndices(self)
-    if isinstance(value, _MboNamedIndices):
-        return
     if isinstance(value, dict):
+        adapter = _MboNamedIndices(self)
         for k, v in value.items():
             adapter[k] = v
     else:
+        # positional values in slider order — also what assigning the
+        # adapter back yields, which is how refreshes are forced
         self.current_index = {
             d: int(v) for d, v in zip(self.slider_dims, value)
         }

@@ -11,7 +11,6 @@ adapter onto the instance so GUI call sites work unchanged.
 """
 
 import inspect
-from collections.abc import MutableMapping
 
 import fastplotlib as fpl
 
@@ -46,11 +45,17 @@ def supports_named_sliders() -> bool:
     )
 
 
-class _NamedIndices(MutableMapping):
-    """name -> current_index adapter over fixed "t"/"z" slider dims."""
+class _NamedIndices:
+    """Adapter over the fixed "t"/"z" slider dims with mbo-fastplotlib's
+    indices contract: name-keyed get/set, positional list assignment, and
+    iteration yields the index VALUES in slider order (consumers do
+    ``list(iw.indices)`` to snapshot positions)."""
 
     def __init__(self, iw):
         self._iw = iw
+
+    def _ordered_dims(self) -> list[str]:
+        return [d for d in _SLIDER_DIM_ORDER if d in self._iw.current_index]
 
     def _dim(self, name: str) -> str:
         current = self._iw.current_index
@@ -61,7 +66,7 @@ class _NamedIndices(MutableMapping):
             pos = names.index(name)
         except ValueError:
             raise KeyError(name) from None
-        dims = [d for d in _SLIDER_DIM_ORDER if d in current]
+        dims = self._ordered_dims()
         if pos >= len(dims):
             raise KeyError(name)
         return dims[pos]
@@ -72,15 +77,16 @@ class _NamedIndices(MutableMapping):
     def __setitem__(self, name, value):
         self._iw.current_index = {self._dim(name): int(value)}
 
-    def __delitem__(self, name):
-        raise TypeError("slider dims cannot be removed")
-
     def __iter__(self):
-        names = tuple(getattr(self._iw, "_slider_dim_names", None) or ())
-        return iter(names or self._iw.current_index)
+        current = self._iw.current_index
+        return iter([current[d] for d in self._ordered_dims()])
 
     def __len__(self):
         return len(self._iw.current_index)
+
+    def __repr__(self):
+        current = self._iw.current_index
+        return repr({d: current[d] for d in self._ordered_dims()})
 
 
 def _fold_window_funcs(names, funcs, sizes):
