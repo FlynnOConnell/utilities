@@ -525,32 +525,36 @@ def _resolve_layout(unit, modality: int, curves: dict, flip_y=None) -> _Layout:
 
     if modality in _TILED_MODALITIES or (modality in _BOX_MODALITIES and not boxes):
         # ROIs occupy contiguous, equal-width column blocks of the raw page.
+        # A single-ROI scan has nothing to unpack — the page already is the
+        # ROI — so it falls through to the framed read below without comment.
         n_rois = len(_spatial_info(unit, modality)["centroids"]) or 1
-        if n_rois > 1 and page_x % n_rois == 0:
-            x_per = page_x // n_rois
-            rois = [
-                {
-                    "row0": 0,
-                    "row1": page_y,
-                    "col0": i * x_per,
-                    "col1": (i + 1) * x_per,
-                }
-                for i in range(n_rois)
-            ]
-            return _Layout(
-                kind="tiled",
-                nt=n0,
-                nz=n_rois,
-                ny=page_y,
-                nx=x_per,
-                rois=rois,
-                z_meaning="roi_index",
-                **common,
+        if n_rois > 1:
+            if page_x % n_rois == 0:
+                x_per = page_x // n_rois
+                rois = [
+                    {
+                        "row0": 0,
+                        "row1": page_y,
+                        "col0": i * x_per,
+                        "col1": (i + 1) * x_per,
+                    }
+                    for i in range(n_rois)
+                ]
+                return _Layout(
+                    kind="tiled",
+                    nt=n0,
+                    nz=n_rois,
+                    ny=page_y,
+                    nx=x_per,
+                    rois=rois,
+                    z_meaning="roi_index",
+                    **common,
+                )
+            logger.warning(
+                f"{unit.name}: MethodType {modality} declares {n_rois} ROIs but "
+                f"the {page_x}px page doesn't divide evenly; reading as a "
+                f"single FOV."
             )
-        logger.warning(
-            f"{unit.name}: MethodType {modality} declares {n_rois} ROI(s) but the "
-            f"{page_x}px page doesn't divide evenly; reading as a single FOV."
-        )
 
     # timeseries, multicube, and every unrecognised modality: axis 0 is time,
     # the page is one FOV.

@@ -274,8 +274,15 @@ arr = mbo.imread("scan.mesc", unit=2)          # by index
 arr = mbo.imread("scan.mesc", unit="MUnit_2")  # or by key
 ```
 
-From the CLI, `mbo info scan.mesc` prints the unit table, `mbo scan.mesc --unit 2`
-opens one directly, and `mbo scan.mesc` with more than one unit pops a picker.
+From the CLI, `mbo info scan.mesc` prints the unit table and
+`mbo scan.mesc --unit 2` opens one directly. Without `--unit`, opening a
+`.mesc` always pops a picker listing every unit — which scan to look at is
+never a safe default to guess at.
+
+Once the viewer is up, the **MESc Units** panel at the top of the Preview tab
+switches between units in place, re-deriving the sliders each time (a z-stack
+scrolls Z, a ribbon scrolls time and ROI, a reference snapshot scrolls nothing).
+Units stay open behind the panel, so switching back is instant.
 
 #### Layout
 
@@ -312,6 +319,10 @@ arr.roi = 0      # split: per-ROI viewer subplots, one roiNN/ dir per ROI on wri
 Ribbon and linescan ROIs differ in size and are zero-padded to the largest.
 `metadata["mesc_roi_extents"]` records where each ROI's valid region lands, so
 padding is distinguishable from genuinely dark pixels.
+
+In the viewer every non-spatial axis is a slider, ROIs included — one image,
+not a row of subplots. A unit with timepoints, channels *and* ROIs gets three
+sliders, labelled with the axis names the array reports.
 
 #### MESc-specific metadata
 
