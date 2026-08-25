@@ -86,12 +86,38 @@ def _to_np(x) -> np.ndarray:
     return np.asarray(x)
 
 
-def _resolve_device(device: str) -> str:
-    if device and device != "auto":
-        return device
+def _cuda_usable(device: str = "cuda") -> bool:
+    """A torch build without this GPU's architecture reports cuda available
+    but fails at the first kernel launch; probe with a real kernel."""
     import torch
 
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        (torch.ones(2, device=device) * 2).sum().item()
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_device(device: str, logger=None) -> str:
+    import torch
+
+    if device and device != "auto":
+        if device.startswith("cuda") and not _cuda_usable(device):
+            raise RuntimeError(
+                f"device '{device}' cannot run torch kernels: this torch build "
+                "has no kernels for the installed GPU. Reinstall torch for this "
+                "GPU architecture or set device='cpu'."
+            )
+        return device
+    if torch.cuda.is_available():
+        if _cuda_usable():
+            return "cuda"
+        if logger is not None:
+            logger.warning(
+                "masknmf: CUDA available but this torch build has no kernels "
+                "for the installed GPU; falling back to cpu"
+            )
+    return "cpu"
 
 
 def generate_plane_dirname(
@@ -561,7 +587,7 @@ def run_plane(
     save_path = Path(save_path)
     plane_dir = save_path / (plane_name or generate_plane_dirname(plane, frame_indices))
     plane_dir.mkdir(parents=True, exist_ok=True)
-    device = _resolve_device(runtime.device)
+    device = _resolve_device(runtime.device, logger)
     total_t0 = time.time()
 
     def _progress(step: str, message: str):
