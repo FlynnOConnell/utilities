@@ -48,15 +48,8 @@ dependencies = [
 	"fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@ndwidget",
 	# [multisession] is required: the branch imports roicat at module load
 	"masknmf[multisession] @ git+https://github.com/apasarkar/masknmf-toolbox.git@xarray-compatability",
-	# direct deps so tool.uv.sources routes them to the cu130 index;
-	# left transitive they resolve as CPU-only builds
-	# cu130, not cu126: cu126 wheels stop at sm_90, so they have no kernel
-	# image for Blackwell (RTX 50-series, sm_120) and every CUDA op dies with
-	# cudaErrorNoKernelImageForDevice
-	# <2.13: the cu130 index has no Windows wheels past torch 2.12 /
-	# torchvision 0.27
-	"torch>2,<2.13",
-	"torchvision<0.28",
+	# torch/torchvision deliberately unpinned: the right CUDA build is
+	# per-machine (GPU arch dependent), so install it into the env manually
 	"rendercanvas>=2.4.2",
 	# 1.92.900 dropped ImDrawData.cmd_lists_count, which wgpu's imgui
 	# backend still reads — pin the last known-good build
@@ -141,19 +134,6 @@ all = ["utilities[napari,notebooks]"]
 [tool.uv]
 # repo dev env keeps the full stack so `uv run mbo` is unchanged.
 default-groups = ["dev"]
-
-[[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
-
-[tool.uv.sources]
-torch = [
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-torchvision = [
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
 
 [tool.ruff]
 line-length = 88
