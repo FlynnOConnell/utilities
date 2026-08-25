@@ -115,7 +115,11 @@ def _resolve_device(device: str, logger=None) -> str:
         if logger is not None:
             logger.warning(
                 "masknmf: CUDA available but this torch build has no kernels "
-                "for the installed GPU; falling back to cpu"
+                "for the installed GPU; falling back to cpu (much slower). "
+                "Install a torch build for this GPU, e.g.: uv pip install "
+                "torch torchvision --index-url "
+                "https://download.pytorch.org/whl/cu126 "
+                "(pre-Turing GPUs need cu126 or cu118, not cu13x)"
             )
     return "cpu"
 
