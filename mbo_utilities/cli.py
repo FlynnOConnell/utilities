@@ -1530,6 +1530,107 @@ def shortcut(name):
     click.secho(f"Created: {path}", fg="green")
 
 
+@main.command("netcheck")
+@click.option(
+    "--host",
+    default="lab-research",
+    help="SSH host or ssh_config alias to test against.",
+)
+@click.option(
+    "--path",
+    "remote_path",
+    default=None,
+    help="Remote file to measure storage read/metadata against. "
+         "Skipped if omitted.",
+)
+@click.option(
+    "--size",
+    "size_mb",
+    type=int,
+    default=512,
+    help="MiB to transfer per throughput probe (default 512).",
+)
+@click.option(
+    "--streams",
+    type=int,
+    default=4,
+    help="Concurrent SSH streams for the aggregate-bandwidth probe.",
+)
+@click.option(
+    "--quick",
+    is_flag=True,
+    help="Latency + single-stream throughput only; skip parallel and end-to-end.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit raw measurements as JSON.",
+)
+def netcheck(host, remote_path, size_mb, streams, quick, as_json):
+    r"""
+    Measure latency, bandwidth, and storage speed on the remote data path.
+
+    Reports the SSH link to the server and the storage mount behind it as
+    separate legs, so a slow remote dataset can be traced to the one that is
+    actually limiting it. Read-only: nothing is written to the remote host.
+
+    \b
+    Examples:
+      mbo netcheck
+      mbo netcheck --quick
+      mbo netcheck --path /biohpc/data4/rudra/eunji/mini2p/x.tif
+      mbo netcheck --host lab4 --size 1024
+      mbo netcheck --json > netcheck-$(date +%F).json
+    """
+    from mbo_utilities import netcheck as nc
+
+    if not nc.ssh_available():
+        raise click.ClickException(
+            "ssh not found on PATH - install OpenSSH client, then retry."
+        )
+
+    # --path names a file on a Linux host, so a drive letter here means the
+    # shell rewrote it: git-bash/MSYS turns /biohpc/... into C:/Program
+    # Files/Git/biohpc/... on its way to a native exe. Caught here because the
+    # remote probe would otherwise just report the file as unreadable.
+    if remote_path and len(remote_path) > 1 and remote_path[1] == ":":
+        raise click.ClickException(
+            f"--path was rewritten by the shell into a Windows path:\n"
+            f"    {remote_path}\n"
+            f"It names a file on {host}, so it must stay POSIX. Either run this "
+            f"from PowerShell, prefix the path with a second slash "
+            f"(//biohpc/...), or set MSYS_NO_PATHCONV=1 for the command."
+        )
+
+    # probes take tens of seconds; without progress it reads as a hang
+    def _progress(msg):
+        if not as_json:
+            click.echo(f"  ... {msg}", err=True)
+
+    if not as_json:
+        click.echo(f"Probing {host} (this takes ~30-60s)...", err=True)
+
+    results = nc.run_checks(
+        host,
+        path=remote_path,
+        size_mb=size_mb,
+        streams=streams,
+        quick=quick,
+        on_progress=_progress,
+    )
+
+    if as_json:
+        import json as _json
+        click.echo(_json.dumps(results, indent=2))
+        return
+
+    click.echo("")
+    click.echo(nc.format_report(results))
+    if not results.get("reachable"):
+        raise click.Abort
+
+
 # hpc subcommand group (light import: heavy deps load lazily inside the commands).
 from mbo_utilities.hpc.cli import hpc as _hpc_group  # noqa: E402
 
