@@ -15,7 +15,11 @@ from typing import Any, Callable
 
 from imgui_bundle import imgui, portable_file_dialogs as pfd
 
-from mbo_utilities.gui._imgui_helpers import PopupAutoSize, set_tooltip
+from mbo_utilities.gui._imgui_helpers import (
+    PopupAutoSize,
+    draw_boxed_label,
+    set_tooltip,
+)
 from mbo_utilities.gui._selection_ui import draw_selection_table, resolve_dim_labels
 from mbo_utilities.gui.widgets.pipelines._base import PipelineWidget
 from mbo_utilities.gui.widgets.pipelines.settings import (
@@ -35,6 +39,38 @@ _MODIFIED_COLOR = imgui.ImVec4(1.0, 0.72, 0.40, 1.0)
 
 _RUN_W = 220
 _BTN_W = 90
+
+# "look at these first" — bold boxed labels, like the suite2p popup's
+# _IMPORTANT_FIELDS. Chosen from the reference notebook's guidance: raise
+# max_shifts if shift traces clip; mad_correlation_threshold is the main
+# signal-vs-noise knob; block_sizes tracks feature size; merge_threshold
+# is the notebook's ####-flagged tuning point; filter_sigma drives init.
+_IMPORTANT_FIELDS: set[str] = {
+    "max_shifts",
+    "block_sizes",
+    "mad_correlation_threshold",
+    "filter_sigma",
+    "merge_threshold",
+}
+
+# marked stable / do-not-change by the upstream notebook; grouped under a
+# collapsed header and flagged in the modified table
+_STABLE_FIELDS: set[str] = {
+    "sim_conf",
+    "spatial_avg_factor",
+    "temporal_avg_factor",
+    "num_epochs",
+    "noise_variance_quantile",
+    "mad_threshold",
+    "residual_threshold",
+    "patch_size",
+    "min_peak_distance",
+    "deletion_threshold",
+    "support_threshold_hi",
+    "min_brightness",
+    "update_frequency",
+    "background_downsampling_factor",
+}
 
 # lazy availability check cache
 _HAS_MASKNMF: bool | None = None
@@ -400,6 +436,72 @@ class MaskNMFPipelineWidget(PipelineWidget):
         if pushed:
             imgui.pop_style_color()
 
+    def _param_label(self, obj, field: str, text: str) -> None:
+        """suite2p _emp_label pattern: bold boxed label for important
+        fields, plain text otherwise; modified-orange tint on both."""
+        pushed = self._mod_push(obj, field)
+        if field in _IMPORTANT_FIELDS:
+            draw_boxed_label(text, font=getattr(self.parent, "_bold_font", None))
+        else:
+            imgui.text(text)
+        self._mod_pop(pushed)
+
+    def _row_tail(self, obj, field: str, label: str, tooltip: str | None) -> None:
+        imgui.same_line(0, imgui.get_style().item_inner_spacing.x)
+        self._param_label(obj, field, label)
+        if tooltip:
+            set_tooltip(tooltip, show_mark=False)
+
+    def _f_int(self, obj, field: str, label: str, lo=1, tooltip=None) -> None:
+        pushed = self._mod_push(obj, field)
+        imgui.set_next_item_width(110)
+        _, val = imgui.input_int(f"##masknmf_{field}", getattr(obj, field))
+        self._mod_pop(pushed)
+        setattr(obj, field, max(lo, val))
+        self._row_tail(obj, field, label, tooltip)
+
+    def _f_int2(self, obj, field: str, label: str, lo=1, tooltip=None) -> None:
+        pushed = self._mod_push(obj, field)
+        imgui.set_next_item_width(110)
+        _, v = imgui.input_int2(f"##masknmf_{field}", list(getattr(obj, field)))
+        self._mod_pop(pushed)
+        setattr(obj, field, (max(lo, v[0]), max(lo, v[1])))
+        self._row_tail(obj, field, label, tooltip)
+
+    def _f_float(
+        self, obj, field: str, label: str, step=0.05, fmt="%.2f", tooltip=None
+    ) -> None:
+        pushed = self._mod_push(obj, field)
+        imgui.set_next_item_width(110)
+        _, val = imgui.input_float(
+            f"##masknmf_{field}", getattr(obj, field), step, step * 2, fmt
+        )
+        self._mod_pop(pushed)
+        setattr(obj, field, val)
+        self._row_tail(obj, field, label, tooltip)
+
+    def _f_check(self, obj, field: str, label: str, tooltip=None) -> None:
+        pushed = self._mod_push(obj, field)
+        _, val = imgui.checkbox(f"{label}##masknmf_{field}", getattr(obj, field))
+        self._mod_pop(pushed)
+        setattr(obj, field, bool(val))
+        if tooltip:
+            set_tooltip(tooltip, show_mark=False)
+
+    def _stable_header(self, id_suffix: str, body: Callable[[], None]) -> None:
+        imgui.set_next_item_open(False, imgui.Cond_.appearing)
+        imgui.push_style_color(imgui.Col_.text, _DIM_COLOR)
+        opened = imgui.collapsing_header(f"Stable — don't change##masknmf_{id_suffix}")
+        imgui.pop_style_color()
+        set_tooltip(
+            "Marked stable by the masknmf authors — leave at defaults unless "
+            "you have a reason. Changes show orange here and (stable) in the "
+            "modified table.",
+            show_mark=False,
+        )
+        if opened:
+            body()
+
     def _draw_settings_popup(self) -> None:
         popup_title = "MaskNMF Pipeline Settings##masknmf_settings_popup"
         if self._settings_sizer is None:
@@ -517,84 +619,66 @@ class MaskNMFPipelineWidget(PipelineWidget):
         self._mod_pop(pushed)
         if changed:
             reg.strategy = "pwrigid" if idx == 1 else "rigid"
-        pushed = self._mod_push(reg, "max_shifts")
-        imgui.set_next_item_width(110)
-        _, ms = imgui.input_int2("Max shifts##masknmf_ms", list(reg.max_shifts))
-        self._mod_pop(pushed)
-        reg.max_shifts = (max(1, ms[0]), max(1, ms[1]))
+        self._f_int2(
+            reg, "max_shifts", "Max shifts",
+            tooltip="Max allowed shift in px (y, x). Raise it if the shift "
+                    "traces look clipped/flat at the extremes.",
+        )
         if reg.strategy == "pwrigid":
-            pushed = self._mod_push(reg, "num_blocks")
-            imgui.set_next_item_width(110)
-            _, nb = imgui.input_int2("Blocks##masknmf_nb", list(reg.num_blocks))
-            self._mod_pop(pushed)
-            reg.num_blocks = (max(1, nb[0]), max(1, nb[1]))
-            pushed = self._mod_push(reg, "overlaps")
-            imgui.set_next_item_width(110)
-            _, ov = imgui.input_int2("Overlaps##masknmf_ov", list(reg.overlaps))
-            self._mod_pop(pushed)
-            reg.overlaps = (max(0, ov[0]), max(0, ov[1]))
-            pushed = self._mod_push(reg, "max_deviation_rigid")
-            imgui.set_next_item_width(110)
-            _, md = imgui.input_int2(
-                "Max deviation##masknmf_md", list(reg.max_deviation_rigid)
-            )
-            self._mod_pop(pushed)
-            reg.max_deviation_rigid = (max(0, md[0]), max(0, md[1]))
+            self._f_int2(reg, "num_blocks", "Blocks")
+            self._f_int2(reg, "overlaps", "Overlaps", lo=0)
+            self._f_int2(reg, "max_deviation_rigid", "Max deviation", lo=0)
 
     def _draw_compression_params(self) -> None:
         comp = self.settings.compression
-        pushed = self._mod_push(comp, "denoise")
-        _, comp.denoise = imgui.checkbox(
-            "Temporal denoiser##masknmf_denoise", comp.denoise
+        self._f_check(
+            comp, "denoise", "Temporal denoiser",
+            tooltip="Train a blind-spot denoiser and re-run PMD.",
         )
-        self._mod_pop(pushed)
-        set_tooltip("Train a blind-spot denoiser and re-run PMD.", show_mark=False)
-        pushed = self._mod_push(comp, "detrend")
-        _, comp.detrend = imgui.checkbox("Detrend##masknmf_detrend", comp.detrend)
-        self._mod_pop(pushed)
-        pushed = self._mod_push(comp, "block_sizes")
-        imgui.set_next_item_width(110)
-        _, bs = imgui.input_int2("Block sizes##masknmf_bs", list(comp.block_sizes))
-        self._mod_pop(pushed)
-        comp.block_sizes = (max(4, bs[0]), max(4, bs[1]))
-        pushed = self._mod_push(comp, "max_components")
-        imgui.set_next_item_width(110)
-        _, comp.max_components = imgui.input_int(
-            "Max components##masknmf_mc", comp.max_components
+        self._f_check(
+            comp, "detrend", "Detrend",
+            tooltip="Maximin spline detrend sized from the frame rate.",
         )
-        self._mod_pop(pushed)
-        comp.max_components = max(1, comp.max_components)
-        if comp.denoise:
-            pushed = self._mod_push(comp, "num_epochs")
-            imgui.set_next_item_width(110)
-            _, comp.num_epochs = imgui.input_int(
-                "Denoiser epochs##masknmf_ep", comp.num_epochs
-            )
-            self._mod_pop(pushed)
-            comp.num_epochs = max(1, comp.num_epochs)
+        self._f_int2(
+            comp, "block_sizes", "Block sizes", lo=4,
+            tooltip="PMD patch size in px; ~2x the largest feature you "
+                    "expect (10-20 for dendrites/spines, 20+ for somata).",
+        )
+        self._f_int(
+            comp, "max_components", "Max components",
+            tooltip="Max PMD components per block.",
+        )
+
+        def _stable() -> None:
+            self._f_int(comp, "sim_conf", "Sim conf")
+            self._f_int(comp, "spatial_avg_factor", "Spatial avg")
+            self._f_int(comp, "temporal_avg_factor", "Temporal avg")
+            if comp.denoise:
+                self._f_int(comp, "num_epochs", "Denoiser epochs")
+                self._f_float(comp, "noise_variance_quantile", "Noise quantile")
+
+        self._stable_header("pmd_stable", _stable)
 
     def _draw_demixing_params(self) -> None:
         dmx = self.settings.demixing
-        pushed = self._mod_push(dmx, "mad_correlation_threshold")
-        imgui.set_next_item_width(110)
-        _, dmx.mad_correlation_threshold = imgui.input_float(
-            "Correlation thr##masknmf_corr",
-            dmx.mad_correlation_threshold, 0.05, 0.1, "%.2f",
+        self._f_float(
+            dmx, "mad_correlation_threshold", "Correlation thr",
+            tooltip="Superpixel seed threshold — the main signal-vs-noise "
+                    "knob. Lower finds more, dimmer cells.",
         )
-        self._mod_pop(pushed)
-        set_tooltip("Superpixel seed threshold. Lower finds more, dimmer cells.",
-                    show_mark=False)
-        pushed = self._mod_push(dmx, "filter_sigma")
-        imgui.set_next_item_width(110)
-        _, dmx.filter_sigma = imgui.input_float(
-            "Highpass sigma##masknmf_sigma", dmx.filter_sigma, 0.5, 1.0, "%.1f"
+        self._f_float(
+            dmx, "filter_sigma", "Highpass sigma", step=0.5, fmt="%.1f",
+            tooltip="Spatial highpass width (px) for the init passes.",
         )
-        self._mod_pop(pushed)
-        pushed = self._mod_push(dmx, "maxiter")
-        imgui.set_next_item_width(110)
-        _, dmx.maxiter = imgui.input_int("NMF iterations##masknmf_iter", dmx.maxiter)
-        self._mod_pop(pushed)
-        dmx.maxiter = max(1, dmx.maxiter)
+        self._f_float(
+            dmx, "merge_threshold", "Merge thr",
+            tooltip="Temporal correlation above which overlapping "
+                    "components merge.",
+        )
+        self._f_int(
+            dmx, "maxiter", "NMF iterations",
+            tooltip="HALS iterations per pass.",
+        )
         pushed = self._mod_push(dmx, "sign")
         sign_idx = ("positive", "negative", "unconstrained").index(dmx.sign)
         imgui.set_next_item_width(140)
@@ -605,34 +689,28 @@ class MaskNMFPipelineWidget(PipelineWidget):
         self._mod_pop(pushed)
         if changed:
             dmx.sign = ("positive", "negative", "unconstrained")[sign_idx]
+        imgui.set_next_item_open(False, imgui.Cond_.appearing)
         if imgui.collapsing_header("Advanced##masknmf_demix_adv"):
-            for field, label, lo in (
-                ("filtered_passes", "Filtered passes", 1),
-                ("unfiltered_passes", "Unfiltered passes", 1),
-                ("ring_radius", "Ring radius", 1),
-            ):
-                pushed = self._mod_push(dmx, field)
-                imgui.set_next_item_width(110)
-                _, val = imgui.input_int(f"{label}##masknmf_{field}", getattr(dmx, field))
-                self._mod_pop(pushed)
-                setattr(dmx, field, max(lo, val))
-            for field, label in (
-                ("support_threshold_lo", "Support thr"),
-                ("unfiltered_support_lo", "Unfiltered support"),
-                ("merge_threshold", "Merge thr"),
-            ):
-                pushed = self._mod_push(dmx, field)
-                imgui.set_next_item_width(110)
-                _, val = imgui.input_float(
-                    f"{label}##masknmf_{field}", getattr(dmx, field), 0.05, 0.1, "%.2f"
-                )
-                self._mod_pop(pushed)
-                setattr(dmx, field, val)
-            pushed = self._mod_push(dmx, "reassign_background")
-            _, dmx.reassign_background = imgui.checkbox(
-                "Reassign background##masknmf_rb", dmx.reassign_background
-            )
-            self._mod_pop(pushed)
+            self._f_int(dmx, "filtered_passes", "Filtered passes")
+            self._f_int(dmx, "unfiltered_passes", "Unfiltered passes")
+            self._f_int(dmx, "ring_radius", "Ring radius")
+            self._f_float(dmx, "support_threshold_lo", "Support thr")
+            self._f_float(dmx, "unfiltered_support_lo", "Unfiltered support")
+            self._f_float(dmx, "merge_overlap_threshold", "Merge overlap")
+            self._f_check(dmx, "reassign_background", "Reassign background")
+
+        def _stable() -> None:
+            self._f_float(dmx, "mad_threshold", "MAD thr", step=0.1, fmt="%.1f")
+            self._f_float(dmx, "residual_threshold", "Residual thr")
+            self._f_int2(dmx, "patch_size", "Patch size", lo=8)
+            self._f_int(dmx, "min_peak_distance", "Min peak dist")
+            self._f_float(dmx, "deletion_threshold", "Deletion thr")
+            self._f_float(dmx, "support_threshold_hi", "Support thr hi")
+            self._f_float(dmx, "min_brightness", "Min brightness", step=0.1, fmt="%.1f")
+            self._f_int(dmx, "update_frequency", "Update freq")
+            self._f_int(dmx, "background_downsampling_factor", "Bg downsample")
+
+        self._stable_header("demix_stable", _stable)
 
     def _draw_runtime_row(self) -> None:
         rt = self.settings.runtime
@@ -701,9 +779,18 @@ class MaskNMFPipelineWidget(PipelineWidget):
                 for field, cur, default in mods:
                     cur_s = f"{cur:.3g}" if isinstance(cur, float) else str(cur)
                     def_s = f"{default:.3g}" if isinstance(default, float) else str(default)
+                    stable = field.split(".", 1)[-1] in _STABLE_FIELDS
                     imgui.table_next_row()
                     imgui.table_set_column_index(0)
                     imgui.text_colored(_MODIFIED_COLOR, field)
+                    if stable:
+                        imgui.same_line()
+                        imgui.text_colored(_WARN_COLOR, "(stable)")
+                        set_tooltip(
+                            "Marked stable by the masknmf authors — change "
+                            "only with reason.",
+                            show_mark=False,
+                        )
                     imgui.table_set_column_index(1)
                     imgui.text(cur_s)
                     imgui.table_set_column_index(2)
