@@ -253,6 +253,11 @@ print(arr.shape)       # (T, C, Z, Y, X)
 arr = mbo.imread("/path/to/data.h5", dataset="imaging_data")
 ```
 
+On write, the dataset rank follows the channel count: one channel gives a 4D
+`TZYX` dataset, two or more give 5D `TCZYX`. Either is read back as the
+canonical 5D shape, and the dataset carries a `dims` attribute recording which
+it is.
+
 (mescarray)=
 ### MescArray
 
@@ -334,8 +339,24 @@ sliders, labelled with the axis names the array reports.
 | `mesc_z_axis_meaning` | `"roi_index"`, `"depth"`, or `"none"` |
 | `mesc_centroids` / `mesc_rotations` | per-ROI 3D centroid and orientation |
 | `mesc_roi_extents` | per-ROI valid region inside the padded frame |
-| `mesc_sync_frame` / `mesc_start_frame` | detected sync frame, and the crop actually applied |
+| `mesc_sync_frame` / `mesc_start_frame` | detected sync frame, and the crop actually applied — both in timepoints |
+| `mesc_sync_frame_raw` | the same sync event as a raw scanner-frame index (`TStepInMs` units) |
+| `mesc_light_paths` / `mesc_dichroic` | interleaved light paths per scanner frame, and whether switching is on |
+| `mesc_raw_frame_rate` | scanner frame rate, `1000 / TStepInMs`, before the light-path split |
 | `mesc_flip_y` | whether Y was flipped on read |
+
+#### Frame rate and dichroic switching
+
+`fs` always describes the timepoints the array reports, not the rate the
+scanner ran at. With dichroic light-path switching (`MethodType` 7) each path
+receives every other raw frame, so one timepoint spans two scanner frames and
+`fs` is halved accordingly — `num_timepoints / fs` gives the real duration
+either way. The scanner's own rate stays available as `mesc_raw_frame_rate`.
+
+The same conversion applies to alignment: `TStepInMs` ticks once per raw
+frame, so a sync edge is found at a raw index (`mesc_sync_frame_raw`) and then
+divided down into timepoints (`mesc_sync_frame`) before it is used as a crop.
+An explicit `start_frame=` is always in timepoints.
 
 #### Alignment and correction
 

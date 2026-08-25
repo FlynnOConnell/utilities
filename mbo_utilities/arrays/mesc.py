@@ -421,6 +421,16 @@ class _Layout:
         for name in self.__slots__:
             setattr(self, name, kw.get(name))
 
+    @property
+    def light_paths(self) -> int:
+        """Interleaved light paths per scanner frame; 1 unless dichroic switching.
+
+        With switching on, one timepoint of this layout consumes `light_paths`
+        raw scanner frames -- the divisor between anything expressed in
+        ``TStepInMs`` units and anything expressed in this layout's T axis.
+        """
+        return len(self.frame_maps) if self.frame_maps else 1
+
     def describe(self) -> str:
         return (
             f"kind={self.kind} raw={self.raw_shape} -> "
@@ -715,7 +725,9 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
     sync_key : str, optional
         Timing curve whose edge marks t=0 (e.g. ``"DiI2"``). When given, the
         detected frame is used as ``start_frame``. The detected value is always
-        reported as ``metadata["mesc_sync_frame"]``, applied or not.
+        reported as ``metadata["mesc_sync_frame"]``, applied or not -- in
+        timepoints of this array, with the raw scanner-frame count it was
+        derived from kept as ``metadata["mesc_sync_frame_raw"]``.
     sync_edge : {"falling", "rising"}, optional
         Edge to look for. Default ``"falling"``.
     fix_phase : bool, default False
@@ -754,6 +766,10 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
         "dz": (
             "Z-step. None for AOD multi-ROI -- those ROIs are not a uniform "
             "depth series."
+        ),
+        "fs": (
+            "Rate of the timepoints this array reports. Halved (per light path) "
+            "for dichroic multiline; see mesc_raw_frame_rate for the scanner's."
         ),
     }
 
@@ -795,12 +811,18 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
 
         frame_period_ms = _attr(self._unit, "TStepInMs")
         self._frame_period_ms = float(frame_period_ms) if frame_period_ms else None
-        self._sync_frame = _find_sync_frame(
+        # `TStepInMs` ticks once per *raw* scanner frame, so the sync search
+        # lands on a raw frame index. Dichroic switching makes one layout
+        # timepoint span several raw frames, so convert before it is used as a
+        # crop -- rounding up keeps the crop at or after the sync edge.
+        self._sync_frame_raw = _find_sync_frame(
             self._curves,
             self._frame_period_ms,
             sync_key or SYNC_KEY_DEFAULT,
             sync_edge or SYNC_EDGE_DEFAULT,
         )
+        paths = self._layout.light_paths
+        self._sync_frame = math.ceil(self._sync_frame_raw / paths)
         self._start_frame = self._resolve_start_frame(start_frame, sync_key)
         self._nt = max(0, self._layout.nt - self._start_frame)
 
@@ -924,7 +946,13 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
         layout = self._layout
         info = _spatial_info(self._unit, self.modality)
         pixel_size = info["pixel_size_um"]
-        fs = 1000.0 / self._frame_period_ms if self._frame_period_ms else None
+        # `TStepInMs` is the raw scanner frame period. Dichroic switching hands
+        # each light path every Nth raw frame, so a channel's own timepoints
+        # arrive N times slower than the scanner runs -- and it is those
+        # timepoints the T axis counts. Reporting the raw rate here would make
+        # `num_timepoints / fs` claim half the duration actually recorded.
+        raw_fs = 1000.0 / self._frame_period_ms if self._frame_period_ms else None
+        fs = raw_fs / layout.light_paths if raw_fs else None
 
         if layout.frame_maps is not None:
             channel_names = ["Green", "Red"]
@@ -948,6 +976,7 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
             "num_timepoints": self._nt,
             "num_zplanes": layout.nz,
             "nchannels": layout.nc,
+            "num_color_channels": layout.nc,
             "Ly": layout.ny,
             "Lx": layout.nx,
             "dtype": np.dtype(self._dtype).name,
@@ -974,7 +1003,10 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
                 for r in self._rois
             ],
             "mesc_sync_frame": self._sync_frame,
+            "mesc_sync_frame_raw": self._sync_frame_raw,
             "mesc_start_frame": self._start_frame,
+            "mesc_raw_frame_rate": raw_fs,
+            "mesc_light_paths": layout.light_paths,
             "mesc_curves": sorted(self._curves),
             "mesc_dichroic": layout.frame_maps is not None,
             "channel_names": channel_names,
@@ -1083,6 +1115,7 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
             {
                 "num_timepoints": nt,
                 "nchannels": nc,
+                "num_color_channels": nc,
                 "num_zplanes": nz,
                 "Ly": ny,
                 "Lx": nx,

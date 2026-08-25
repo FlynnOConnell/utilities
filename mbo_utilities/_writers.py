@@ -1105,7 +1105,7 @@ def _write_volumetric_h5(
     compression: str | None = "gzip",
     compression_level: int = 1,
 ):
-    """Write volumetric TZYX data into a single HDF5 file.
+    """Write volumetric TZYX (or TCZYX) data into a single HDF5 file.
 
     This is the h5 analogue of `_write_volumetric_zarr`. Previously, h5
     output went through the per-plane streaming writer (`_write_plane`),
@@ -1118,8 +1118,10 @@ def _write_volumetric_h5(
     parameters
     ----------
     data : array-like
-        Source array. The 5D TCZYX shape is read via `read_chunk`; the
-        singleton C dim is dropped before writing (h5 dataset is 4D).
+        Source array. The 5D TCZYX shape is read via `read_chunk`. A singleton
+        C dim is dropped before writing, giving a 4D TZYX dataset; two or more
+        channels are written as 5D TCZYX instead, which `H5Array` reads back
+        unchanged.
     path : Path
         Output directory. Filename is auto-generated from dim tags.
     metadata : dict | None
@@ -1183,19 +1185,27 @@ def _write_volumetric_h5(
     n_frames = slicing.selections["T"].count if "T" in slicing.selections else 1
     n_planes = slicing.selections["Z"].count if "Z" in slicing.selections else 1
     n_channels = slicing.selections["C"].count if "C" in slicing.selections else 1
-    if n_channels != 1:
-        raise NotImplementedError(
-            f"_write_volumetric_h5 writes 4D TZYX and only supports a single "
-            f"channel; got n_channels={n_channels}. Select one channel via the "
-            f"`channels` kwarg."
-        )
 
     Ly, Lx = slicing.spatial_shape
     Ly_out, Lx_out = int(Ly), int(Lx)
     n_frames = int(n_frames)
     n_planes = int(n_planes)
+    n_channels = int(n_channels)
 
-    target_shape = (n_frames, n_planes, Ly_out, Lx_out)
+    # Single-channel data stays 4D TZYX — that is what every existing mbo h5
+    # holds and what suite2p-adjacent consumers expect. Multi-channel data
+    # (dual-PMT MESc, two-colour ScanImage) keeps the canonical 5D TCZYX
+    # instead of being silently reduced to channel 0; H5Array reads a 5D
+    # dataset back as TCZYX unchanged.
+    multichannel = n_channels > 1
+    if multichannel:
+        out_dims = ("T", "C", "Z", "Y", "X")
+        target_shape = (n_frames, n_channels, n_planes, Ly_out, Lx_out)
+        inner_chunk = (1, 1, 1, Ly_out, Lx_out)
+    else:
+        out_dims = ("T", "Z", "Y", "X")
+        target_shape = (n_frames, n_planes, Ly_out, Lx_out)
+        inner_chunk = (1, 1, Ly_out, Lx_out)
 
     # update metadata using OutputMetadata for reactive dz/fs values
     source_dims = get_dims(data)
@@ -1217,22 +1227,20 @@ def _write_volumetric_h5(
     md = out_meta.to_dict()
     md["shape"] = target_shape
     md["dataset_name"] = dataset_name
-    md["dims"] = ("T", "Z", "Y", "X")
+    md["dims"] = out_dims
 
     if debug:
         logger.info(f"Writing volumetric h5: {filename}")
-        logger.info(f"  Shape: {target_shape} (TZYX)")
+        logger.info(f"  Shape: {target_shape} ({''.join(out_dims)})")
         logger.info(f"  Dataset: /{dataset_name}")
         logger.info(
             f"  Output metadata: dz={out_meta.dz}, fs={out_meta.fs}, contiguous={out_meta.is_contiguous}"
         )
 
-    # h5 chunking — one Y×X plane per chunk so a fixed-(t, z) GUI scrub
-    # pulls exactly that plane off disk. The previous (1, n_planes, Y, X)
-    # spec packed every Z layer into one chunk, forcing the whole volume
-    # to decompress for any single-plane read — the same Z-bunching bug
-    # the zarr writers fixed.
-    inner_chunk = (1, 1, Ly_out, Lx_out)
+    # h5 chunking — one Y×X plane per chunk (see inner_chunk above) so a
+    # fixed-(t, c, z) GUI scrub pulls exactly that plane off disk. Packing
+    # every Z layer into one chunk forces the whole volume to decompress for
+    # any single-plane read — the same Z-bunching bug the zarr writers fixed.
 
     # h5 compression knobs
     h5_compression = None
@@ -1257,7 +1265,7 @@ def _write_volumetric_h5(
             dset = f.create_dataset(
                 dataset_name,
                 shape=target_shape,
-                maxshape=(None, n_planes, Ly_out, Lx_out),
+                maxshape=(None, *target_shape[1:]),
                 chunks=inner_chunk,
                 dtype=data.dtype,
                 compression=h5_compression,
@@ -1273,20 +1281,20 @@ def _write_volumetric_h5(
                     f.attrs[k] = v if np.isscalar(v) else str(v)
                 except (TypeError, ValueError):
                     f.attrs[k] = str(v)
-            dset.attrs["dims"] = ["T", "Z", "Y", "X"]
+            dset.attrs["dims"] = list(out_dims)
 
             t_offset = 0
             for chunk_info in slicing.iter_chunks(
                 chunk_dim="T", target_mb=target_chunk_mb
             ):
                 chunk_data = read_chunk(data, chunk_info, slicing.dims)
-                if chunk_data.ndim == 5:
+                if chunk_data.ndim == 5 and not multichannel:
                     chunk_data = chunk_data[:, 0, :, :, :]
                 chunk_data = np.ascontiguousarray(chunk_data)
 
                 t_start = t_offset
                 t_end = t_start + chunk_data.shape[0]
-                dset[t_start:t_end, :, :, :] = chunk_data
+                dset[t_start:t_end] = chunk_data
                 t_offset = t_end
 
                 if pbar:

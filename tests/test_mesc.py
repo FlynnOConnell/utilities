@@ -341,6 +341,71 @@ def test_start_frame_beyond_the_recording_is_ignored(mesc_path):
     assert arr.shape[0] == 7
 
 
+def test_dichroic_frame_rate_follows_the_timepoints_reported(mesc_path):
+    """fs must describe the T axis, not the scanner.
+
+    Switching hands each light path every other raw frame, so a channel's own
+    timepoints arrive half as fast as TStepInMs ticks. Reporting the raw rate
+    would make num_timepoints / fs claim half the duration recorded.
+    """
+    md = MescArray(mesc_path, unit=5).metadata
+    assert md["mesc_light_paths"] == 2
+    assert md["mesc_raw_frame_rate"] == pytest.approx(1000 / 3.0)
+    assert md["fs"] == md["frame_rate"] == pytest.approx(1000 / 3.0 / 2)
+    # 10 raw frames at 3 ms each is 30 ms, however the pairs are counted
+    assert md["num_timepoints"] / md["fs"] == pytest.approx(0.030)
+
+    # a unit without switching is untouched
+    plain = MescArray(mesc_path, unit=2).metadata
+    assert plain["mesc_light_paths"] == 1
+    assert plain["fs"] == plain["mesc_raw_frame_rate"] == pytest.approx(40.0)
+
+
+@pytest.mark.parametrize("unit,expected", [(1, 2), (2, 1), (5, 2)])
+def test_num_color_channels_is_reported_next_to_nchannels(mesc_path, unit, expected):
+    md = MescArray(mesc_path, unit=unit).metadata
+    assert md["num_color_channels"] == md["nchannels"] == expected
+
+
+def test_dichroic_sync_frame_is_converted_to_light_path_timepoints(tmp_path):
+    """The sync search counts raw frames; the crop counts timepoints.
+
+    TStepInMs ticks once per raw scanner frame, so `_find_sync_frame` lands on
+    a raw index. One timepoint of a switched unit spans two raw frames, so
+    applying that index unconverted would crop twice as much as the edge asks.
+    """
+    path = tmp_path / "dichro_sync.mesc"
+    with h5py.File(path, "w") as f:
+        u = f.create_group("MSession_0").create_group("MUnit_0")
+        u.attrs.update(
+            {"MethodType": 7, "VecChannelsSize": 2, "TStepInMs": 2.0,
+             "MeasurementDatePosix": 1_700_000_000, "Comment": "dichro+sync"}
+        )
+        u.attrs["CoordinateMapJSON"] = json.dumps(
+            {"maps": [{"measurementROIs": _boxes([(0, 2, 0, 10)])}]}
+        )
+        for c in range(2):
+            u.create_dataset(
+                f"Channel_{c}",
+                data=np.arange(24 * 10, dtype=np.uint16).reshape(1, 24, 10) + c * 1000,
+            )
+        _curve(u, 0, "DichroSw_AO1", [1, 2] * 6)
+        _curve(u, 1, "DiI2", [1, 0, 1], delta=8.0)
+
+    arr = MescArray(path, unit=0)
+    # falling edge at 8 ms / 2 ms = raw frame 4, which is timepoint 2
+    assert arr.metadata["mesc_sync_frame_raw"] == 4
+    assert arr.metadata["mesc_sync_frame"] == 2
+    assert arr.shape[0] == 6  # 12 raw frames -> 6 pairs, nothing cropped yet
+
+    cropped = MescArray(path, unit=0, sync_key="DiI2")
+    assert cropped.metadata["mesc_start_frame"] == 2
+    assert cropped.shape[0] == 4
+    # timepoint 0 of the cropped array is the pair at raw frames 4 and 5
+    assert cropped._source_frames(0, [0]) == 4
+    assert cropped._source_frames(1, [0]) == 5
+
+
 def test_canonical_metadata_is_populated(mesc_path):
     md = MescArray(mesc_path, unit=2).metadata
     assert md["fs"] == pytest.approx(40.0)
@@ -421,6 +486,48 @@ def test_imwrite_round_trips_through_zarr(mesc_path, tmp_path):
     back = imread(next(out.glob("*.zarr")))
     assert back.shape == arr.shape
     assert np.array_equal(np.asarray(back[:, :, :]), np.asarray(arr[:, :, :]))
+
+
+def test_imwrite_round_trips_two_channels_through_h5(mesc_path, tmp_path):
+    """Dual-PMT is the normal case here, so h5 must keep the C axis.
+
+    A single channel still writes 4D TZYX -- that is what every existing mbo
+    h5 holds -- but two channels write 5D TCZYX rather than silently reducing
+    to channel 0.
+    """
+    from mbo_utilities import imwrite
+
+    arr = MescArray(mesc_path, unit=1)
+    assert arr.shape[1] == 2
+    out = tmp_path / "dual"
+    out.mkdir()
+    written = imwrite(arr, out, ext=".h5", overwrite=True)
+
+    with h5py.File(written, "r") as f:
+        dset = f[next(iter(f))]
+        assert dset.shape == arr.shape
+        assert list(dset.attrs["dims"]) == ["T", "C", "Z", "Y", "X"]
+
+    back = imread(written)
+    assert back.shape == arr.shape
+    assert np.array_equal(np.asarray(back[:, :, :]), np.asarray(arr[:, :, :]))
+
+
+def test_imwrite_single_channel_h5_stays_four_dimensional(mesc_path, tmp_path):
+    from mbo_utilities import imwrite
+
+    arr = MescArray(mesc_path, unit=2)
+    assert arr.shape[1] == 1
+    out = tmp_path / "single"
+    out.mkdir()
+    written = imwrite(arr, out, ext=".h5", overwrite=True)
+
+    with h5py.File(written, "r") as f:
+        dset = f[next(iter(f))]
+        assert dset.shape == (arr.shape[0], *arr.shape[2:])
+        assert list(dset.attrs["dims"]) == ["T", "Z", "Y", "X"]
+
+    assert imread(written).shape == arr.shape
 
 
 def test_imwrite_roi_zero_fans_out_one_directory_per_roi(mesc_path, tmp_path):
