@@ -404,20 +404,23 @@ class MaskNMFPipelineWidget(PipelineWidget):
         popup_title = "MaskNMF Pipeline Settings##masknmf_settings_popup"
         if self._settings_sizer is None:
             self._settings_sizer = PopupAutoSize(popup_title)
-        self._settings_sizer.before_open()
 
         if self._show_settings_popup:
-            self._settings_sizer.before_open()
             imgui.open_popup(popup_title)
             self._show_settings_popup = False
 
+        # suite2p popup sizing: always_auto_resize tracks content every
+        # frame; constraints cap at the viewport so nothing is cut off
         viewport = imgui.get_main_viewport()
-        imgui.set_next_window_size(
-            imgui.ImVec2(min(1000, viewport.size.x * 0.9), 0),
-            imgui.Cond_.first_use_ever,
+        self._settings_sizer.before_open()
+        imgui.set_next_window_size_constraints(
+            imgui.ImVec2(min(720.0, viewport.size.x * 0.9), 200.0),
+            imgui.ImVec2(viewport.size.x * 0.98, viewport.size.y * 0.98),
         )
         opened, visible = imgui.begin_popup_modal(
-            popup_title, p_open=True, flags=imgui.WindowFlags_.no_saved_settings
+            popup_title,
+            p_open=True,
+            flags=self._settings_sizer.flags(imgui.WindowFlags_.no_saved_settings),
         )
         if not opened:
             return
@@ -644,10 +647,11 @@ class MaskNMFPipelineWidget(PipelineWidget):
         if changed:
             rt.device = ("auto", "cuda", "cpu")[dev_idx]
         if rt.device == "cpu":
-            imgui.same_line()
+            imgui.push_text_wrap_pos(0.0)
             imgui.text_colored(
                 _WARN_COLOR, "masknmf superpixel init currently requires CUDA"
             )
+            imgui.pop_text_wrap_pos()
         pushed = self._mod_push(rt, "frame_batch_size")
         imgui.set_next_item_width(110)
         _, rt.frame_batch_size = imgui.input_int(
