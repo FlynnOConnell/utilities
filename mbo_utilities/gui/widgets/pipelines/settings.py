@@ -2034,6 +2034,9 @@ def _draw_section_suite2p_content(self):
 
     # === CURRENT DATASET ===
     _draw_current_dataset_section(self)
+    from mbo_utilities.gui._gpu_status import draw_gpu_status
+
+    draw_gpu_status(self.s2p.torch_device or "auto")
 
     # === OUTPUT FOLDER ===
     # Section title + small folder-icon Browse button + full-width

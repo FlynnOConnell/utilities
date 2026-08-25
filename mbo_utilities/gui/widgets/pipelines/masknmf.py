@@ -274,6 +274,9 @@ class MaskNMFPipelineWidget(PipelineWidget):
         self._ensure_slice_state()
         imgui.spacing()
         self._draw_dataset_block()
+        from mbo_utilities.gui._gpu_status import draw_gpu_status
+
+        draw_gpu_status(self.settings.runtime.device)
         imgui.separator()
         self._draw_output_row()
         self._draw_slice_row()
