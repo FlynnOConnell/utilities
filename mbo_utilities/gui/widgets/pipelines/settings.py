@@ -4477,7 +4477,13 @@ def run_process(self):
                 last_savedir = get_last_savedir_path()
                 s2p_path = str(Path(last_savedir) if last_savedir else get_mbo_dirs()["data"])
 
-            fpath_str = str(self.fpath) if self.fpath else ""
+            # legacy multi-file loads carry a list/tuple fpath — unwrap to
+            # the first element (mirrors _outdir_from_fpath); str() of the
+            # list itself would be path garbage like "['C:\\a.tif']"
+            _fpath = self.fpath
+            if isinstance(_fpath, (list, tuple)):
+                _fpath = _fpath[0] if _fpath else None
+            fpath_str = str(_fpath) if _fpath else ""
 
             # Snapshot the user's selections so the worker can rebuild
             # the OutputMetadata reactive layer (fs/dz reactively scaled
@@ -4582,6 +4588,30 @@ def run_process(self):
             threading.Thread(target=run_all_planes_sequential, daemon=True).start()
 
 
+def _rebase_worker_provenance(md: dict, fpath, logger) -> dict:
+    """Repair stale recorded paths in worker metadata against the loaded tree.
+
+    ``fpath`` is the viewer's loaded path: a list/tuple unwraps to its first
+    element (legacy multi-file loads — str() of the list is path garbage).
+    An empty/None fpath skips the rebase AND the data_path fallback
+    entirely: Path('') is '.', so anchoring there would embed cwd-relative
+    provenance (md['data_path'] = ['.']) into ops.npy.
+    """
+    if isinstance(fpath, (list, tuple)):
+        fpath = fpath[0] if fpath else None
+    if not fpath:
+        return md
+
+    from mbo_utilities.metadata.base import rebase_provenance_paths
+
+    anchor = Path(str(fpath))
+    anchor = anchor if anchor.is_dir() else anchor.parent
+    md = rebase_provenance_paths(md, anchor, logger)
+    if "data_path" not in md:
+        md["data_path"] = [str(anchor)]
+    return md
+
+
 def _run_plane_worker_thread(config):
     """
     Decoupled pure worker function for processing planes on a thread.
@@ -4666,6 +4696,15 @@ def _run_plane_worker_thread(config):
     # to_dict() gives reactively-scaled fs/dz/dx/dy and consistent
     # timepoint aliases. Add only the per-plane bookkeeping on top.
     md = out_meta.to_dict()
+
+    # When the source is itself a pipeline output (re-run of a copied
+    # suite2p dir), its metadata carries the ORIGINAL machine's paths.
+    # Repair them against the actually-opened tree — or drop them — so
+    # the new run's db.npy/ops.npy never re-embed dead provenance. The
+    # fresh ops_path/save_path/raw_file assignments below still win.
+    # Skipped when no fpath was loaded (anchoring at Path('') == cwd
+    # would embed '.'-relative provenance).
+    md = _rebase_worker_provenance(md, config["fpath"], config["logger"])
 
     # Strip fs/dz keys if they're None — otherwise `defaults.update(md)`
     # below would clobber the lbm default with None, which then leaks

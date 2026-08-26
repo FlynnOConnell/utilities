@@ -99,6 +99,8 @@ def _try_hydrate_s2p_from_binary(parent: Any, path: str | Path) -> bool:
     except Exception as e:
         parent.logger.warning(f"suite2p hydrate: schema warm-up failed: {e}")
 
+    raw_db: dict | None = None
+    raw_ops: dict | None = None
     if settings_file.is_file():
         d = _load_npy_dict(settings_file)
         if d:
@@ -107,6 +109,7 @@ def _try_hydrate_s2p_from_binary(parent: Any, path: str | Path) -> bool:
     if db_file.is_file():
         d = _load_npy_dict(db_file)
         if d:
+            raw_db = d
             # db.npy is flat (paths/nplanes/keep_movie_raw at top level),
             # so route via from_flat — it covers keep_movie_raw and any
             # other db fields with entries in _FLAT_TO_MBO.
@@ -122,6 +125,7 @@ def _try_hydrate_s2p_from_binary(parent: Any, path: str | Path) -> bool:
     if ops_file.is_file():
         d = _load_npy_dict(ops_file)
         if d:
+            raw_ops = d
             ops_view = _from_flat(d)
             new_keys = []
             for k, v in ops_view.items():
@@ -142,6 +146,27 @@ def _try_hydrate_s2p_from_binary(parent: Any, path: str | Path) -> bool:
             "leaving pipeline settings untouched."
         )
         return False
+
+    # dead custom file paths recorded on another machine fail deep inside
+    # suite2p later; drop them so the run falls back to defaults.
+    # cellpose_model doubles as a bare model NAME ('cpsam'), so only
+    # separator-containing values are treated as paths and validated.
+    for _pf in ("classifier_path", "cellpose_model"):
+        try:
+            v = loaded.get(_pf)
+            if (
+                isinstance(v, str)
+                and v
+                and ("/" in v or "\\" in v)
+                and not Path(v).exists()
+            ):
+                loaded.pop(_pf)
+                parent.logger.info(
+                    f"suite2p hydrate: dropping {_pf}={v!r} "
+                    "(path does not exist on this machine)"
+                )
+        except Exception:
+            pass
 
     # access via lazy properties so the dataclasses get instantiated
     # if they haven't been touched yet.
@@ -220,6 +245,41 @@ def _try_hydrate_s2p_from_binary(parent: Any, path: str | Path) -> bool:
     # parent (.../res). re-running with output=ROOT recreates the same
     # plane subdir in place.
     parent._s2p_outdir = str(plane_dir.parent)
+
+    # one-line heads-up when the run dir was copied from another machine:
+    # its recorded paths are dead here, and re-runs target _s2p_outdir.
+    try:
+        from mbo_utilities.metadata.base import PROVENANCE_PATH_KEYS
+
+        stale_example = None
+        for src in (raw_db, raw_ops):
+            if not isinstance(src, dict):
+                continue
+            for key in PROVENANCE_PATH_KEYS:
+                v = src.get(key)
+                entries = v if isinstance(v, (list, tuple)) else [v]
+                for entry in entries:
+                    s = str(entry) if isinstance(entry, (str, Path)) else ""
+                    if not s or ("/" not in s and "\\" not in s):
+                        continue
+                    try:
+                        dead = not Path(s).exists()
+                    except OSError:
+                        dead = True
+                    if dead:
+                        stale_example = s
+                        break
+                if stale_example:
+                    break
+            if stale_example:
+                break
+        if stale_example:
+            parent.logger.info(
+                f"suite2p hydrate: run was recorded on another machine "
+                f"({stale_example}); outputs rebased to {parent._s2p_outdir}"
+            )
+    except Exception:
+        pass
 
     parent.logger.debug(
         f"suite2p hydrate: loaded {n_settings} settings + {n_db} db + "
@@ -440,6 +500,13 @@ def load_new_data(parent: Any, path: str):
         parent._viewer = viewer_cls(parent.image_widget, parent.fpath, parent=parent)
         parent._viewer.on_data_loaded()
         parent.logger.debug(f"Viewer switched to: {parent._viewer.name}")
+
+        # seed the playback rate from the new dataset's frame rate
+        # (never overrides an fps the user typed).
+        try:
+            parent._seed_playback_fps()
+        except Exception:
+            parent.logger.debug("playback fps seed skipped", exc_info=True)
 
         try:
             from mbo_utilities.gui.widgets.pipelines.isoview import (

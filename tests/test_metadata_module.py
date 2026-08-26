@@ -699,3 +699,290 @@ class TestExtractRoiSlices:
         assert rois[0]["y_end"] == 512
         assert rois[0]["height"] == 512
         assert rois[0]["slice"] == slice(0, 512)
+
+
+def _rate_alias_source(fs: float = 19.66) -> dict:
+    """metadata dict with every registered rate alias stamped, as the
+    zarr writer's normalize_metadata pass does at ingest."""
+    from mbo_utilities.metadata import METADATA_PARAMS
+
+    src = {"fs": fs}
+    for alias in METADATA_PARAMS["fs"].aliases:
+        src[alias] = fs
+    src["finterval"] = 1.0 / fs
+    for alias in METADATA_PARAMS["finterval"].aliases:
+        src[alias] = 1.0 / fs
+    return src
+
+
+class TestOutputMetadataRateAliases:
+    """OutputMetadata.to_dict keeps every present rate alias consistent."""
+
+    def test_strided_selection_updates_all_aliases(self):
+        """stride-4 T selection divides every fs alias, multiplies every
+        finterval alias."""
+        from mbo_utilities.metadata import METADATA_PARAMS, OutputMetadata
+
+        base = 19.66
+        source = _rate_alias_source(base)
+        out = OutputMetadata(
+            source,
+            (11793, 14, 512, 512),
+            ("T", "Z", "Y", "X"),
+            selections={"T": list(range(0, 11793, 4))},
+        )
+        result = out.to_dict()
+
+        assert result["is_contiguous"] is True
+        expected_fs = pytest.approx(base / 4, rel=1e-6)
+        expected_fint = pytest.approx(4 / base, rel=1e-6)
+        for key in ("fs", "frame_rate", *METADATA_PARAMS["fs"].aliases):
+            assert result[key] == expected_fs, key
+        for key in ("finterval", *METADATA_PARAMS["finterval"].aliases):
+            assert result[key] == expected_fint, key
+
+    def test_non_contiguous_nulls_all_aliases(self):
+        """non-contiguous T selection nulls every present rate alias."""
+        from mbo_utilities.metadata import METADATA_PARAMS, OutputMetadata
+
+        base = 19.66
+        source = _rate_alias_source(base)
+        out = OutputMetadata(
+            source,
+            (11793, 14, 512, 512),
+            ("T", "Z", "Y", "X"),
+            selections={"T": [0, 1, 5, 7]},
+        )
+        result = out.to_dict()
+
+        assert result["is_contiguous"] is False
+        assert result["source_fs"] == pytest.approx(base, rel=1e-6)
+        for key in ("fs", "frame_rate", *METADATA_PARAMS["fs"].aliases):
+            assert result[key] is None, key
+        for key in ("finterval", *METADATA_PARAMS["finterval"].aliases):
+            assert result[key] is None, key
+
+    def test_no_invented_alias_keys(self):
+        """a source without rate aliases gains only the canonical keys."""
+        from mbo_utilities.metadata import OutputMetadata
+
+        out = OutputMetadata(
+            {"fs": 10.0},
+            (100, 1, 32, 32),
+            ("T", "Z", "Y", "X"),
+        )
+        result = out.to_dict()
+
+        assert result["fs"] == 10.0
+        assert result["frame_rate"] == 10.0
+        assert result["finterval"] == pytest.approx(0.1)
+        for absent in ("framerate", "fps", "scanFrameRate", "dt",
+                       "frame_interval", "FrameInterval", "time_interval"):
+            assert absent not in result, absent
+
+
+class TestTimeSelectionMetadata:
+    """TimeSelection.to_metadata keeps long index lists out of store attrs."""
+
+    def test_long_selection_emits_summary(self):
+        """2949-index selection stores first/last/n, not the full list."""
+        from mbo_utilities.arrays.features._slicing import (
+            parse_timepoint_selection,
+        )
+
+        sel = parse_timepoint_selection("1:11793:4", 11793)
+        assert sel.count == 2949
+        meta = sel.to_metadata()
+
+        assert "include_indices_0based" not in meta
+        assert meta["count"] == 2949
+        assert meta["include"] == "1:11793:4"
+        summary = meta["include_indices_summary"]
+        assert summary == {
+            "first": sel.final_indices[0],
+            "last": sel.final_indices[-1],
+            "n": 2949,
+        }
+
+    def test_short_selection_emits_explicit_list(self):
+        """selections up to max_explicit keep the explicit index list."""
+        from mbo_utilities.arrays.features._slicing import (
+            parse_timepoint_selection,
+        )
+
+        sel = parse_timepoint_selection("1:100", 1000)
+        meta = sel.to_metadata()
+
+        assert meta["include_indices_0based"] == list(range(100))
+        assert meta["count"] == 100
+        assert "include_indices_summary" not in meta
+
+    def test_include_string_round_trips(self):
+        """reparsing the stored include string reproduces the indices."""
+        from mbo_utilities.arrays.features._slicing import (
+            parse_timepoint_selection,
+        )
+
+        sel = parse_timepoint_selection("1:11793:4", 11793)
+        meta = sel.to_metadata()
+        reparsed = parse_timepoint_selection(meta["include"], 11793)
+
+        assert reparsed.final_indices == sel.final_indices
+        assert reparsed.count == meta["count"]
+
+    def test_exclude_preserved(self):
+        """exclude string and its (small) index list survive."""
+        from mbo_utilities.arrays.features._slicing import (
+            parse_timepoint_selection,
+        )
+
+        sel = parse_timepoint_selection("1:100,50:60", 1000)
+        meta = sel.to_metadata()
+
+        assert meta["exclude"] == "50:60"
+        assert meta["exclude_indices_0based"] == sel.exclude_indices
+        assert "exclude_indices_summary" not in meta
+
+    def test_long_exclude_emits_summary(self):
+        """a 40k-index exclude stores first/last/n, not the full list."""
+        from mbo_utilities.arrays.features._slicing import (
+            parse_timepoint_selection,
+        )
+
+        sel = parse_timepoint_selection("1:50000,1:40000", 60000)
+        meta = sel.to_metadata()
+
+        assert "exclude_indices_0based" not in meta
+        assert meta["exclude"] == "1:40000"
+        assert meta["exclude_indices_summary"] == {
+            "first": sel.exclude_indices[0],
+            "last": sel.exclude_indices[-1],
+            "n": len(sel.exclude_indices),
+        }
+
+    def test_exclude_at_cap_keeps_explicit_list(self):
+        """an exclude list exactly at max_explicit stays explicit."""
+        from mbo_utilities.arrays.features._slicing import (
+            parse_timepoint_selection,
+        )
+
+        sel = parse_timepoint_selection("1:2000,1:1024", 3000)
+        assert len(sel.exclude_indices) == 1024
+        meta = sel.to_metadata(max_explicit=1024)
+
+        assert meta["exclude_indices_0based"] == sel.exclude_indices
+        assert "exclude_indices_summary" not in meta
+
+
+class TestStripForExport:
+    """strip_for_export size guard and allowlist."""
+
+    def test_drops_oversized_list(self):
+        """a 100k-element list is dropped from export metadata."""
+        from mbo_utilities.metadata import strip_for_export
+
+        md = {"fs": 10.0, "huge": list(range(100_000))}
+        out = strip_for_export(md)
+
+        assert "huge" not in out
+        assert out["fs"] == 10.0
+
+    def test_allowlisted_keys_survive(self):
+        """plane_shifts / scanphase / ome pass through regardless of size."""
+        from mbo_utilities.metadata import strip_for_export
+
+        md = {
+            "plane_shifts": [[1, 2]] * 10_000,
+            "scanphase": list(range(20_000)),
+            "ome": {"multiscales": [{"datasets": [0] * 20_000}]},
+        }
+        out = strip_for_export(md)
+
+        assert out["plane_shifts"] == md["plane_shifts"]
+        assert out["scanphase"] == md["scanphase"]
+        assert out["ome"] == md["ome"]
+
+    def test_denylisted_suite2p_fields_dropped(self):
+        """suite2p-only fields never reach export metadata."""
+        from mbo_utilities.metadata import strip_for_export
+
+        md = {"fs": 10.0, "meanImg_crop": [[0.0]], "badframes0": [0, 1],
+              "ihop": [1], "plane_times": [0.1]}
+        out = strip_for_export(md)
+
+        assert out == {"fs": 10.0}
+
+    def test_deeply_nested_value_does_not_recurse_out(self):
+        """a 2000-deep nested list must not raise RecursionError."""
+        from mbo_utilities.metadata import strip_for_export
+
+        deep = [1]
+        for _ in range(2000):
+            deep = [deep]
+        out = strip_for_export({"deep": deep, "fs": 10.0})
+
+        assert out["fs"] == 10.0
+        assert out["deep"] == deep  # one leaf element, well under the cap
+
+
+class TestDecimatedZarrOmeScale:
+    """decimating zarr->zarr re-saves must regenerate the OME time scale.
+
+    regression: OutputMetadata.to_dict repaired fs aliases but carried the
+    source ome/multiscales/_ome_time_scale through, and the zarr writer's
+    attr loop overwrote the freshly written root.attrs['ome'] with that
+    stale copy — B ended up with fs=5.0 but the source's t-scale, warning
+    on every metadata access.
+    """
+
+    def test_every_2nd_frame_resave_updates_ome_time_scale(self, tmp_path):
+        import json
+        import logging
+
+        import numpy as np
+
+        from mbo_utilities import imread, imwrite
+        from mbo_utilities.metadata import params
+
+        data = np.random.randint(0, 100, size=(20, 1, 16, 16), dtype=np.int16)
+
+        a_dir = tmp_path / "A"
+        imwrite(data, a_dir, ext=".zarr", metadata={"fs": 10.0},
+                dim_order="TZYX", show_progress=False, overwrite=True)
+        arr_a = imread(next(a_dir.glob("*.zarr")))
+        assert arr_a.metadata["fs"] == pytest.approx(10.0)
+        assert arr_a.metadata["_ome_time_scale"] == pytest.approx(0.1)
+
+        b_dir = tmp_path / "B"
+        imwrite(arr_a, b_dir, ext=".zarr", timepoints=list(range(1, 21, 2)),
+                show_progress=False, overwrite=True)
+        b_store = next(b_dir.glob("*.zarr"))
+
+        attrs = json.loads((b_store / "zarr.json").read_text())["attributes"]
+        ms = attrs["ome"]["multiscales"][0]
+        axes = [ax["name"] for ax in ms["axes"]]
+        scale = ms["datasets"][0]["coordinateTransformations"][0]["scale"]
+        assert scale[axes.index("t")] == pytest.approx(0.2)
+        assert attrs["fs"] == pytest.approx(5.0)
+        assert "_ome_time_scale" not in attrs
+
+        # metadata access on B resolves cleanly, with no stale-alias warning
+        params._STALE_WARNED.clear()
+        arr_b = imread(b_store)
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        log = logging.getLogger("mbo_utilities")
+        log.addHandler(handler)
+        try:
+            from mbo_utilities.metadata.params import get_param
+
+            assert get_param(arr_b.metadata, "fs") == pytest.approx(5.0)
+        finally:
+            log.removeHandler(handler)
+        stale = [
+            r for r in records
+            if r.levelno >= logging.WARNING
+            and "stale frame-rate" in r.getMessage()
+        ]
+        assert stale == []

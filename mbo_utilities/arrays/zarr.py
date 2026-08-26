@@ -46,6 +46,25 @@ _ZARR_INFO = PipelineInfo(
 register_pipeline(_ZARR_INFO)
 
 
+def _ome_time_scale_attr(md: dict) -> float | None:
+    """Level-0 time-axis scale from an OME multiscales attr, if present."""
+    ome = md.get("ome")
+    multiscales = ome.get("multiscales") if isinstance(ome, dict) else None
+    if multiscales is None:
+        multiscales = md.get("multiscales")
+    try:
+        entry = multiscales[0]
+        idx = next(
+            i for i, ax in enumerate(entry["axes"])
+            if isinstance(ax, dict) and ax.get("type") == "time"
+        )
+        return float(
+            entry["datasets"][0]["coordinateTransformations"][0]["scale"][idx]
+        )
+    except (TypeError, KeyError, IndexError, ValueError, StopIteration):
+        return None
+
+
 class ZarrArray(ReductionMixin, Shape5DMixin):
     """
     Reader for Zarr stores (including OME-Zarr).
@@ -181,6 +200,10 @@ class ZarrArray(ReductionMixin, Shape5DMixin):
             md["num_timepoints"] = tp
             md["nframes"] = tp  # suite2p alias
             md["num_frames"] = tp  # legacy alias
+
+        time_scale = _ome_time_scale_attr(md)
+        if time_scale is not None:
+            md.setdefault("_ome_time_scale", time_scale)
 
         return md
 

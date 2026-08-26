@@ -643,6 +643,8 @@ def fmt_value(x) -> str:
     """Format a value for display."""
     if x is None:
         return "—"
+    if isinstance(x, str) and len(x) > 256:
+        return repr(x[:253] + "...")
     if isinstance(x, (str, bool, int, float)):
         return repr(x)
     if isinstance(x, (bytes, bytearray)):

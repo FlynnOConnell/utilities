@@ -195,15 +195,38 @@ class TimeSelection:
         include_set = set(self.include_indices)
         return any(i in include_set for i in self.exclude_indices)
 
-    def to_metadata(self) -> dict:
-        """convert to metadata dict for saving."""
+    def to_metadata(self, max_explicit: int = 1024) -> dict:
+        """convert to metadata dict for saving.
+
+        the include/exclude strings plus count always round-trip through
+        parse_timepoint_selection; an explicit index list (include or
+        exclude) is emitted only when it has at most max_explicit entries,
+        otherwise a small first/last/n summary stands in so store attrs
+        stay compact.
+        """
+        final = self.final_indices
         result = {
             "include": self.include_str,
-            "include_indices_0based": self.final_indices,
+            "count": len(final),
         }
+        if len(final) <= max_explicit:
+            result["include_indices_0based"] = final
+        else:
+            result["include_indices_summary"] = {
+                "first": final[0],
+                "last": final[-1],
+                "n": len(final),
+            }
         if self.exclude_str:
             result["exclude"] = self.exclude_str
-            result["exclude_indices_0based"] = self.exclude_indices
+            if len(self.exclude_indices) <= max_explicit:
+                result["exclude_indices_0based"] = self.exclude_indices
+            else:
+                result["exclude_indices_summary"] = {
+                    "first": self.exclude_indices[0],
+                    "last": self.exclude_indices[-1],
+                    "n": len(self.exclude_indices),
+                }
         return result
 
 

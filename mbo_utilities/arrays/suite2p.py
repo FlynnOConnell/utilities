@@ -246,12 +246,17 @@ def _load_scanphase_sidecar(plane_dir: Path) -> dict | None:
         return None
 
 
-def _resolve_reconstruct_raw_source(sp: dict | None, ops: dict):
+def _resolve_reconstruct_raw_source(sp: dict | None, ops: dict, plane_dir: Path | None = None):
     """Open the raw movie the run registered from, as a 5D lazy array.
 
     Tries, in order: the scan-phase sidecar's raw_source dir then its file
-    list, then ops['raw_source'] / ops['data_path'] (set by streamed runs).
-    Returns (array, reader_kwargs) or (None, {}).
+    list, then ops['raw_source'] / ops['data_path'] (a list in vanilla
+    suite2p and our worker's ops; a scalar in streamed runs). When
+    ``plane_dir`` is given, dead recorded paths are additionally rebased
+    by basename against the plane dir, its three ancestors, and their
+    ``raw/`` subdirectories (run dirs copied from another machine embed
+    that machine's paths, but the raw movie usually travels with the
+    share). Returns (array, reader_kwargs) or (None, {}).
     """
     from mbo_utilities import imread
 
@@ -269,10 +274,44 @@ def _resolve_reconstruct_raw_source(sp: dict | None, ops: dict):
         cands.append(ops["raw_source"])
     dp = ops.get("data_path")
     if dp:
-        p = Path(dp)
-        if p.suffix and p.parent != p:
-            cands.append(p.parent)
-        cands.append(p)
+        # vanilla suite2p (and our worker's write_ops) store data_path as a
+        # LIST of dirs/files; streamed runs store a scalar. Treat each entry
+        # as its own candidate — Path(list) is a TypeError.
+        entries = dp if isinstance(dp, (list, tuple)) else [dp]
+        for entry in entries:
+            try:
+                p = Path(entry)
+            except TypeError:
+                continue
+            if p.suffix and p.parent != p:
+                cands.append(p.parent)
+            cands.append(p)
+
+    rebased_keys: set[str] = set()
+    if plane_dir is not None:
+        from mbo_utilities.metadata.base import _rebase_dirs, _rebase_one
+
+        search_dirs = _rebase_dirs(Path(plane_dir))
+        for c in list(cands):
+            entries = c if isinstance(c, list) else [c]
+            fixed = []
+            for entry in entries:
+                try:
+                    if Path(entry).exists():
+                        fixed.append(Path(entry))
+                        continue
+                except OSError:
+                    pass
+                found = _rebase_one(entry, search_dirs)
+                if found is None:
+                    break
+                fixed.append(found)
+            if len(fixed) != len(entries):
+                continue
+            rb = fixed if isinstance(c, list) else fixed[0]
+            if str(rb) != str(c):
+                cands.append(rb)
+                rebased_keys.add(str(rb))
 
     seen = set()
     for c in cands:
@@ -287,9 +326,13 @@ def _resolve_reconstruct_raw_source(sp: dict | None, ops: dict):
         if not exists:
             continue
         try:
-            return imread(c, **reader_kwargs), reader_kwargs
+            arr = imread(c, **reader_kwargs)
         except Exception as e:
             logger.debug(f"reconstruct raw source {key} failed: {e}")
+            continue
+        if key in rebased_keys:
+            logger.info(f"reconstruct raw source: recorded path was dead, rebased to {key}")
+        return arr, reader_kwargs
     return None, reader_kwargs
 
 
@@ -387,13 +430,16 @@ class _Suite2pReconstructReader:
         self._nonrigid = bool(self.metadata.get("nonrigid", True))
 
         sp = _load_scanphase_sidecar(plane_dir)
-        self._raw, _ = _resolve_reconstruct_raw_source(sp, self.metadata)
+        self._raw, _ = _resolve_reconstruct_raw_source(sp, self.metadata, plane_dir=plane_dir)
         if self._raw is None:
+            from mbo_utilities.metadata.base import _rebase_dirs
+
+            searched = ", ".join(str(d) for d in _rebase_dirs(plane_dir))
             raise FileNotFoundError(
                 f"No data.bin, data_raw.bin, or reg_tif/ in {plane_dir}, and the "
                 "raw source to rebuild it from could not be located "
-                f"(raw_source={self.metadata.get('raw_source')!r}). Re-point the "
-                "raw data or keep the binary."
+                f"(raw_source={self.metadata.get('raw_source')!r}; also searched "
+                f"rebase dirs: {searched}). Re-point the raw data or keep the binary."
             )
 
         self.Ly = int(get_param(self.metadata, "Ly"))

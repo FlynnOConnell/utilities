@@ -6,10 +6,224 @@ and their aliases, with type conversion and defaults.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .base import METADATA_PARAMS, ALIAS_MAP, VoxelSize
 import contextlib
+
+
+def _rate_precedence() -> tuple[dict[str, tuple[int, str]], int]:
+    """Build lowercase key -> (rank, kind) for frame-rate resolution.
+
+    kind is "interval" (seconds per frame) or "rate" (Hz). Canonical ``fs``
+    ranks first — it is the key user overrides (metadata editor, suite2p
+    custom_metadata merges) write — then ``frame_rate``, then ``finterval``.
+    Canonical keys outrank the OME time scale, which outranks the remaining
+    aliases in registry order (``fps`` last).
+    """
+    order: dict[str, tuple[int, str]] = {
+        "fs": (0, "rate"),
+        "frame_rate": (1, "rate"),
+        "finterval": (2, "interval"),
+    }
+    ome_rank = 3
+    rank = 4
+    for alias in METADATA_PARAMS["finterval"].aliases:
+        key = alias.lower()
+        if key not in order:
+            order[key] = (rank, "interval")
+            rank += 1
+    fs_aliases = [a for a in METADATA_PARAMS["fs"].aliases if a.lower() != "fps"]
+    fs_aliases.append("fps")
+    for alias in fs_aliases:
+        key = alias.lower()
+        if key not in order:
+            order[key] = (rank, "rate")
+            rank += 1
+    return order, ome_rank
+
+
+def _exact_rate_spellings() -> frozenset[str]:
+    """Exact registered spellings of every rate key (case-sensitive)."""
+    return frozenset(
+        {
+            "fs",
+            "finterval",
+            *METADATA_PARAMS["fs"].aliases,
+            *METADATA_PARAMS["finterval"].aliases,
+        }
+    )
+
+
+_RATE_PRECEDENCE, _OME_RATE_RANK = _rate_precedence()
+_EXACT_RATE_SPELLINGS = _exact_rate_spellings()
+
+# ranks of the canonical timing keys; a None stored under any of these is an
+# explicit "rate invalid" sentinel (non-contiguous selections) that must not
+# be bypassed by falling through to lower-precedence aliases
+_CANONICAL_RATE_MAX_RANK = 2
+
+# stale-alias divergence warnings, deduped per unique signature. hot paths
+# (the masknmf panel calls get_param(md, "fs") per rendered frame) would
+# otherwise emit the identical warning ~60x/s; repeats log at DEBUG.
+_STALE_WARNED: set = set()
+_STALE_WARNED_MAX = 256
+
+
+def _rate_value(val: Any) -> float | None:
+    """Numeric, non-zero, finite value or None."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    if f == 0 or f != f:
+        return None
+    return f
+
+
+def _ome_time_scale(metadata: dict) -> tuple[float, str] | None:
+    """Level-0 time-axis scale (seconds per frame) from OME metadata.
+
+    Checks ``metadata["ome"]["multiscales"]``, a top-level ``multiscales``,
+    then the ``_ome_time_scale`` key stamped by the zarr reader. A scale of
+    1.0 is the writer default and treated as unset.
+    """
+    sources = []
+    ome = metadata.get("ome")
+    if isinstance(ome, dict):
+        sources.append((ome.get("multiscales"), "ome.multiscales"))
+    sources.append((metadata.get("multiscales"), "multiscales"))
+    for multiscales, label in sources:
+        try:
+            entry = multiscales[0]
+            axes = entry["axes"]
+            idx = next(
+                i for i, ax in enumerate(axes)
+                if isinstance(ax, dict) and ax.get("type") == "time"
+            )
+            scale = float(
+                entry["datasets"][0]["coordinateTransformations"][0]["scale"][idx]
+            )
+        except (TypeError, KeyError, IndexError, ValueError, StopIteration):
+            continue
+        if scale > 0 and scale != 1.0:
+            return scale, label
+    raw = _rate_value(metadata.get("_ome_time_scale"))
+    if raw is not None and raw > 0 and raw != 1.0:
+        return raw, "_ome_time_scale"
+    return None
+
+
+def resolve_effective_rate(
+    metadata: dict | None,
+) -> tuple[float | None, float | None, str]:
+    """
+    Resolve the effective frame rate from a metadata dict.
+
+    Older mbo stores stamp every registered rate alias at ingest but only
+    update the canonical keys on decimating writes, so a dict can carry a
+    correct ``fs``/``finterval`` alongside stale ``framerate``/``dt``/...
+    values. This resolves one authoritative rate using a fixed precedence:
+
+    1. canonical ``fs``, then ``frame_rate`` (case-insensitive) — ``fs``
+       ranks first because it is the key user overrides (metadata editor,
+       suite2p custom_metadata merges) write
+    2. canonical ``finterval`` (case-insensitive) -> ``fs = 1/v``
+    3. the OME per-level time scale (``ome.multiscales``, top-level
+       ``multiscales``, or ``_ome_time_scale``; 1.0 is treated as unset)
+    4. the remaining ``finterval`` then ``fs`` aliases (``fps`` last),
+       case-insensitive, in registry order
+
+    At equal precedence, the exactly-registered spelling outranks a case
+    variant (``{"FS": ..., "fs": ...}`` resolves from ``fs``).
+
+    A canonical key stored as None (stamped by non-contiguous selections)
+    blocks fallback to (3) and (4) — the rate is genuinely undefined.
+
+    Parameters
+    ----------
+    metadata : dict or None
+        Metadata dictionary to search.
+
+    Returns
+    -------
+    tuple[float | None, float | None, str]
+        ``(fs_hz, finterval_s, source_key)``; ``(None, None, "")`` when no
+        usable value exists. Logs one warning (per unique divergence
+        signature; repeats at DEBUG) when the resolved rate disagrees with
+        any other candidate by more than 0.1% relative.
+    """
+    if not isinstance(metadata, dict) or not metadata:
+        return None, None, ""
+
+    # (rank, key, fs, finterval, raw value)
+    candidates: list[tuple[int, str, float, float, Any]] = []
+    canonical_nulled = False
+    for key, val in metadata.items():
+        if not isinstance(key, str):
+            continue
+        low = key.lower()
+        if low == "_ome_time_scale":
+            continue
+        info = _RATE_PRECEDENCE.get(low)
+        if info is None:
+            continue
+        rank, kind = info
+        value = _rate_value(val)
+        if value is None:
+            if val is None and rank <= _CANONICAL_RATE_MAX_RANK:
+                canonical_nulled = True
+            continue
+        if kind == "interval":
+            candidates.append((rank, key, 1.0 / value, value, val))
+        else:
+            candidates.append((rank, key, value, 1.0 / value, val))
+
+    ome = _ome_time_scale(metadata)
+    if ome is not None:
+        scale, label = ome
+        candidates.append((_OME_RATE_RANK, label, 1.0 / scale, scale, scale))
+
+    if not candidates:
+        return None, None, ""
+
+    # at equal rank the exactly-registered spelling outranks a case variant
+    # ({"FS": 10, "fs": 20} must resolve from "fs", not dict order)
+    candidates.sort(
+        key=lambda c: (c[0], 0 if c[1] in _EXACT_RATE_SPELLINGS else 1)
+    )
+    best_rank, best_key, best_fs, best_finterval, _ = candidates[0]
+    if canonical_nulled and best_rank > _CANONICAL_RATE_MAX_RANK:
+        return None, None, ""
+
+    stale = [
+        (key, raw)
+        for _rank, key, fs, _fint, raw in candidates[1:]
+        if abs(fs - best_fs) > 1e-3 * abs(best_fs)
+    ]
+    if stale:
+        listing = ", ".join(f"{k}={v!r}" for k, v in stale)
+        message = (
+            f"metadata carries stale frame-rate aliases: resolved "
+            f"fs={best_fs:.6g} Hz from {best_key!r}, but {listing} disagree"
+        )
+        signature = (
+            best_key,
+            round(best_fs, 6),
+            frozenset((k, round(float(v), 6)) for k, v in stale),
+        )
+        log = logging.getLogger("mbo_utilities")
+        if signature in _STALE_WARNED:
+            log.debug(message)
+        else:
+            if len(_STALE_WARNED) >= _STALE_WARNED_MAX:
+                _STALE_WARNED.clear()
+            _STALE_WARNED.add(signature)
+            log.warning(message)
+    return best_fs, best_finterval, best_key
 
 
 def get_param(
@@ -83,6 +297,16 @@ def get_param(
                 return int(shape[-1])
             if canonical == "Ly" and len(shape) >= 2:
                 return int(shape[-2])
+        return final_default
+
+    # timing params resolve through the effective-rate precedence so stale
+    # aliases stamped by older writers can never shadow the canonical value
+    if canonical in ("fs", "finterval") and _apply_transforms:
+        fs_hz, finterval_s, _src = resolve_effective_rate(metadata)
+        resolved = fs_hz if canonical == "fs" else finterval_s
+        if resolved is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                return param.dtype(resolved)
         return final_default
 
     # check canonical name first, then all aliases

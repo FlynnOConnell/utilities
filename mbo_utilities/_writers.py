@@ -60,7 +60,7 @@ def _make_json_serializable(obj, filter_disabled: bool = True):
     if isinstance(obj, (list, tuple)):
         return [_make_json_serializable(v, filter_disabled=False) for v in obj]
     if isinstance(obj, np.ndarray):
-        if obj.nbytes > _MAX_NDARRAY_NBYTES:
+        if obj.nbytes >= _MAX_NDARRAY_NBYTES:
             return None
         return obj.tolist()
     if isinstance(obj, (np.integer, np.floating, np.bool_)):
@@ -1685,6 +1685,11 @@ def _write_volumetric_zarr(
     from .metadata.base import strip_for_export
     serializable_md = _make_json_serializable(strip_for_export(md))
     for k, v in serializable_md.items():
+        # never let a carried source OME block (or the reader-stamped
+        # _ome_time_scale) overwrite the freshly computed one above — a
+        # decimated re-save would otherwise persist the source time scale
+        if k in ("ome", "multiscales", "_ome_time_scale"):
+            continue
         root.attrs[k] = v
 
     # napari-compatible scale on level 0 array (dimension_names is set as

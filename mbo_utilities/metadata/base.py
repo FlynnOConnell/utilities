@@ -10,7 +10,14 @@ this module contains the core types used across the metadata system:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import NamedTuple, Any
+
+
+def _logger():
+    # lazy: mbo_utilities.log pulls in package init; base.py is imported early
+    from mbo_utilities import log
+    return log.get("metadata")
 
 
 @dataclass
@@ -155,6 +162,8 @@ METADATA_PARAMS: dict[str, MetadataParameter] = {
             "pixelResolutionX",
             "pixel_size_x",
             "pixel_resolution_um",
+            # scalar µm/px stamped by the MINI2P h5 converter; applies to x and y
+            "pixel_size_um",
         ),
         dtype=float,
         unit="µm",
@@ -171,6 +180,10 @@ METADATA_PARAMS: dict[str, MetadataParameter] = {
             "PhysicalSizeY",
             "pixelResolutionY",
             "pixel_size_y",
+            # same scalar as dx's "pixel_size_um": square pixels assumed.
+            # ALIAS_MAP keeps the last registration (dy), but get_param walks
+            # each parameter's own alias tuple, so dx resolves it too.
+            "pixel_size_um",
         ),
         dtype=float,
         unit="µm",
@@ -209,6 +222,8 @@ METADATA_PARAMS: dict[str, MetadataParameter] = {
             "frameRate",
             "scanFrameRate",
             "fps",
+            # MINI2P h5 converter group attr (Hz)
+            "frame_rate_hz",
         ),
         dtype=float,
         unit="Hz",
@@ -236,6 +251,9 @@ METADATA_PARAMS: dict[str, MetadataParameter] = {
             "FrameInterval",
             "dt",
             "time_interval",
+            # AOD mesc2h5 converter dataset attr (seconds per frame);
+            # fs is derived as 1/frame_period by the fs<->finterval transform
+            "frame_period",
         ),
         dtype=float,
         unit="s",
@@ -383,7 +401,7 @@ METADATA_PARAMS: dict[str, MetadataParameter] = {
     ),
     "num_color_channels": MetadataParameter(
         canonical="num_color_channels",
-        aliases=("color_channels", "ncolors", "num_colors"),
+        aliases=("color_channels", "ncolors", "num_colors", "n_channel"),
         dtype=int,
         default=1,
         description="Number of color channels (1 or 2)",
@@ -457,6 +475,9 @@ def get_canonical_name(name: str) -> str | None:
 # these are the essential parameters for calcium imaging data
 IMAGING_METADATA_KEYS: tuple[str, ...] = (
     "fs",
+    # shown with fs so its aliases (dt, frame_interval, ...) are absorbed
+    # into the imaging section instead of contradicting it under "Other"
+    "finterval",
     "dx",
     "dy",
     "dz",
@@ -482,7 +503,7 @@ _SUITE2P_REGISTRATION_INTERNALS = (
 )
 
 _SUITE2P_SUMMARY_IMAGES = (
-    "meanImg", "meanImgE", "meanImg_chan2",
+    "meanImg", "meanImgE", "meanImg_chan2", "meanImg_crop",
     "Vmap", "Vcorr", "Vsplit", "Vmax",
     "max_proj",
     "refImg", "refImg1", "refAndMasks",
@@ -491,7 +512,8 @@ _SUITE2P_SUMMARY_IMAGES = (
 _PER_FRAME_VECTORS = (
     "xoff", "yoff", "corrXY",
     "xoff1", "yoff1", "corrXY1",
-    "badframes",
+    "badframes", "badframes0",
+    "ihop", "plane_times",
 )
 
 # plane_shifts / plane_shifts_params are intentionally NOT denylisted:
@@ -545,6 +567,36 @@ EXPORT_DENYLIST: frozenset[str] = frozenset(
 )
 
 
+# backstop for ops keys the denylist doesn't know by name: anything with
+# more elements than this is image/vector payload, not metadata. keys that
+# legitimately carry long arrays must be allowlisted.
+_MAX_EXPORT_ELEMENTS = 8192
+
+_SIZE_GUARD_ALLOW = frozenset({
+    "plane_shifts", "scanphase", "frames_per_file", "roi_groups",
+    "timepoint_selection", "file_paths", "ome",
+})
+
+
+def _element_count(value) -> int:
+    """Total leaf elements in a scalar / ndarray / (nested) list or tuple.
+
+    Iterative so pathologically deep nesting can't hit the recursion limit.
+    """
+    total = 0
+    stack = [value]
+    while stack:
+        v = stack.pop()
+        size = getattr(v, "size", None)  # ndarray and numpy scalars
+        if isinstance(size, int):
+            total += size
+        elif isinstance(v, (list, tuple)):
+            stack.extend(v)
+        else:
+            total += 1
+    return total
+
+
 def strip_for_export(md: dict) -> dict:
     """drop fields that should not be embedded in tiff/h5/zarr metadata.
 
@@ -552,8 +604,130 @@ def strip_for_export(md: dict) -> dict:
     vectors, pipeline settings) and mbo-internal additions are kept only
     in suite2p layouts (ops.npy alongside data.bin). everything else —
     OME, ImageJ aliases, voxel size, frame rate, user description, etc. —
-    passes through untouched.
+    passes through untouched, except values whose element count exceeds
+    ``_MAX_EXPORT_ELEMENTS`` (embedded image planes and per-frame vectors
+    under names the denylist doesn't know inflate root attrs to MBs).
     """
-    return {k: v for k, v in md.items() if k not in EXPORT_DENYLIST}
+    out = {}
+    for k, v in md.items():
+        if k in EXPORT_DENYLIST:
+            continue
+        if k not in _SIZE_GUARD_ALLOW:
+            n = _element_count(v)
+            if n > _MAX_EXPORT_ELEMENTS:
+                _logger().warning(
+                    "dropping oversized metadata %r (%d elements) from export",
+                    k, n,
+                )
+                continue
+        out[k] = v
+    return out
 
 
+
+# keys whose values are filesystem paths recorded by a pipeline run —
+# provenance that goes stale the moment the output directory is copied to
+# another machine or share (db.npy data_path, ops raw_file, ...).
+PROVENANCE_PATH_KEYS: tuple[str, ...] = (
+    "data_path", "save_path", "save_path0", "fast_disk", "ops_path",
+    "raw_file", "reg_file", "raw_source", "file_paths", "file_list",
+)
+
+
+def _path_basename(p) -> str:
+    """Basename of a path string regardless of which OS recorded it."""
+    return str(p).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+
+def _rebase_dirs(anchor: Path) -> list[Path]:
+    """Small fixed candidate set: the opened dir, three ancestors, their raw/.
+
+    Three ancestors because run layouts nest as <share>/<user>/<group>/<run>/
+    <plane> with raw/ beside <group> (e.g. eunji/raw vs eunji/demo/s2p_*/
+    zplane01_*), so a plane-dir anchor needs to climb three levels.
+    """
+    dirs: list[Path] = []
+    for d in (
+        anchor,
+        anchor.parent,
+        anchor.parent.parent,
+        anchor.parent.parent.parent,
+    ):
+        for sub in (d, d / "raw"):
+            if sub not in dirs:
+                dirs.append(sub)
+    return dirs
+
+
+def _rebase_one(dead, dirs: list[Path]) -> Path | None:
+    name = _path_basename(dead)
+    if not name:
+        return None
+    for d in dirs:
+        try:
+            cand = d / name
+            if cand.exists():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def rebase_provenance_paths(md: dict, anchor: Path | str, logger=None) -> dict:
+    """Repair or drop stale recorded paths against the actually-opened tree.
+
+    For each :data:`PROVENANCE_PATH_KEYS` entry in ``md``: paths that exist
+    are kept; dead paths are rebased by basename against ``anchor``, its
+    three ancestors, and their ``raw/`` subdirectories (the layout lab
+    shares use);
+    unresolvable entries are dropped so run outputs never re-embed another
+    machine's paths. Empty/None values pass through untouched. Never raises.
+
+    Returns a new dict; ``md`` is not modified.
+    """
+    lg = logger or _logger()
+    anchor = Path(anchor)
+    dirs = _rebase_dirs(anchor)
+    out = dict(md)
+    for key in PROVENANCE_PATH_KEYS:
+        if key not in out:
+            continue
+        val = out[key]
+        # type-check before any equality: ndarray values make `==` elementwise
+        if val is None:
+            continue
+        if isinstance(val, (str, Path)):
+            if not str(val):
+                continue
+            entries, was_scalar = [val], True
+        elif isinstance(val, (list, tuple)):
+            if not val or not all(isinstance(v, (str, Path)) for v in val):
+                continue  # empty, or unexpected element types: leave untouched
+            entries, was_scalar = list(val), False
+        else:
+            continue  # unexpected shape (ndarray, dict, ...): leave untouched
+        kept: list[str] = []
+        for entry in entries:
+            try:
+                alive = Path(entry).exists()
+            except OSError:
+                alive = False
+            if alive:
+                kept.append(str(entry))
+                continue
+            found = _rebase_one(entry, dirs)
+            if found is not None:
+                lg.info(f"provenance rebase: {key} {str(entry)!r} -> {found}")
+                kept.append(str(found))
+            else:
+                lg.info(
+                    f"provenance: dropping stale {key}={str(entry)!r} "
+                    f"(path does not exist on this machine)"
+                )
+        if not kept:
+            del out[key]
+        elif was_scalar:
+            out[key] = kept[0]
+        else:
+            out[key] = kept
+    return out

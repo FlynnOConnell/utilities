@@ -14,7 +14,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from mbo_utilities.metadata.params import get_param, get_voxel_size
-from mbo_utilities.metadata.base import VoxelSize
+from mbo_utilities.metadata.base import METADATA_PARAMS, VoxelSize
+
+# lowercase spellings of every registered rate key, used to keep all rate
+# aliases present in a source dict consistent with the recomputed rate
+_FS_ALIASES_LOWER = frozenset(
+    a.lower() for a in ("fs", *METADATA_PARAMS["fs"].aliases)
+)
+_FINTERVAL_ALIASES_LOWER = frozenset(
+    a.lower() for a in ("finterval", *METADATA_PARAMS["finterval"].aliases)
+)
 
 
 @dataclass
@@ -507,22 +516,51 @@ class OutputMetadata:
         if prov_stamp:
             result["_metadata_provenance"] = prov_stamp
 
-        # frame rate / timing
+        # frame rate / timing. any rate alias the source carried is repaired
+        # (or nulled) alongside the canonicals — otherwise a decimated write
+        # would leave e.g. `framerate` at the source rate while `fs` changed.
+        fs = self.fs
+        finterval = self.finterval
+        rate_adjusted = False
         if self._is_contiguous:
-            if self.fs is not None:
-                result["fs"] = self.fs
-                result["frame_rate"] = self.fs
-            if self.finterval is not None:
-                result["finterval"] = self.finterval
+            if fs is not None:
+                result["fs"] = fs
+                result["frame_rate"] = fs
+                rate_adjusted = True
+            if finterval is not None:
+                result["finterval"] = finterval
+            for key in list(result):
+                if not isinstance(key, str):
+                    continue
+                low = key.lower()
+                if low in _FS_ALIASES_LOWER and fs is not None:
+                    result[key] = fs
+                elif low in _FINTERVAL_ALIASES_LOWER and finterval is not None:
+                    result[key] = finterval
             result["is_contiguous"] = True
         else:
             result["is_contiguous"] = False
             result["fs"] = None
             result["frame_rate"] = None
             result["finterval"] = None
+            rate_adjusted = True
+            for key in list(result):
+                if not isinstance(key, str):
+                    continue
+                low = key.lower()
+                if low in _FS_ALIASES_LOWER or low in _FINTERVAL_ALIASES_LOWER:
+                    result[key] = None
             source_fs = get_param(self.source, "fs")
             if source_fs is not None:
                 result["source_fs"] = source_fs
+
+        # a recomputed (or nulled) rate invalidates any OME block carried
+        # from the source: its time scale still describes the pre-selection
+        # rate, and writers regenerate a fresh OME block from this dict —
+        # a stale carried copy would shadow it and warn on every access.
+        if rate_adjusted:
+            for key in ("ome", "multiscales", "_ome_time_scale"):
+                result.pop(key, None)
 
         # update dimension counts with all aliases
         result["num_timepoints"] = self.num_timepoints

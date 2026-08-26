@@ -65,23 +65,100 @@ def _matches_filter_shallow(key: str, value, filter_text: str) -> bool:
     return False
 
 
-def _matches_filter_recursive(key: str, value, filter_text: str) -> bool:
-    """Recursively check if key, value, or any nested children match the filter."""
+# recursion bounds for the search filter: huge attr dicts (multi-MB
+# scanimage/ops blobs) made an unbounded walk cost hundreds of ms per
+# imgui frame. results are memoized per (key, id(value), depth) for the
+# lifetime of one filter string. Each entry also stores the value itself:
+# holding the reference keeps live entries' ids from being recycled, and
+# the `is` check on lookup rejects entries whose object died and whose id
+# was reused by a different value (metadata dicts are rebuilt per frame).
+# depth is in the key because the walk is depth-bounded — a False cached
+# at max depth must not answer a near-root query for the same object.
+_MATCH_MAX_ITEMS = 64
+_MATCH_MAX_DEPTH = 6
+_MATCH_CACHE_MAX = 4096
+_match_cache: dict = {}
+_match_cache_filter: str | None = None
+
+
+def _matches_filter_recursive(key: str, value, filter_text: str, _depth: int = 0) -> bool:
+    """Recursively check if key, value, or any nested children match the filter.
+
+    Bounded to the first _MATCH_MAX_ITEMS children per container and
+    _MATCH_MAX_DEPTH levels; memoized per filter string so the walk runs
+    once per value, not once per frame.
+    """
+    global _match_cache_filter
     if not filter_text:
         return True
+    if filter_text != _match_cache_filter:
+        _match_cache.clear()
+        _match_cache_filter = filter_text
+    cache_key = (str(key), id(value), _depth)
+    cached = _match_cache.get(cache_key)
+    if cached is not None and cached[0] is value:
+        return cached[1]
+    result = _matches_filter_walk(key, value, filter_text, _depth)
+    if len(_match_cache) >= _MATCH_CACHE_MAX:
+        _match_cache.clear()
+    _match_cache[cache_key] = (value, result)
+    return result
 
+
+def _matches_filter_walk(key: str, value, filter_text: str, depth: int) -> bool:
     if _matches_filter_shallow(key, value, filter_text):
         return True
+    if depth >= _MATCH_MAX_DEPTH:
+        return False
 
     if isinstance(value, Mapping):
-        for k, v in value.items():
-            if _matches_filter_recursive(k, v, filter_text):
+        for i, (k, v) in enumerate(value.items()):
+            if i >= _MATCH_MAX_ITEMS:
+                break
+            if _matches_filter_recursive(k, v, filter_text, depth + 1):
                 return True
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        # sequences too large to render show only the hidden-summary row;
+        # let the filter hit that exact text — but ONLY for those, or
+        # filters like 'e'/'n'/'=' would match every inline-rendered list
+        if _sequence_too_large(value) and (
+            filter_text.lower()
+            in f"<list len={len(value)} — hidden (too large to display)>".lower()
+        ):
+            return True
         for i, v in enumerate(value):
-            if _matches_filter_recursive(f"[{i}]", v, filter_text):
+            if i >= _MATCH_MAX_ITEMS:
+                break
+            if _matches_filter_recursive(f"[{i}]", v, filter_text, depth + 1):
                 return True
 
+    return False
+
+
+# sequence display limits: above _SEQ_HIDE_LEN entries (or an estimated
+# _SEQ_HIDE_ELEMENTS nested elements) a list renders as a summary row
+# only; expandable lists page at _SEQ_PAGE rendered rows.
+_SEQ_HIDE_LEN = 512
+_SEQ_HIDE_ELEMENTS = 8192
+_SEQ_PAGE = 100
+
+
+def _sequence_too_large(val) -> bool:
+    n = len(val)
+    if n > _SEQ_HIDE_LEN:
+        return True
+    if n == 0:
+        return False
+    try:
+        first = val[0]
+    except Exception:
+        return False
+    if isinstance(first, Sequence) and not isinstance(first, (str, bytes, bytearray)):
+        try:
+            if n * len(first) > _SEQ_HIDE_ELEMENTS:
+                return True
+        except TypeError:
+            pass
     return False
 
 
@@ -171,6 +248,16 @@ def _render_item(name, val, prefix="", depth=0, filter_text="", name_color=None,
             imgui.text_colored(val_color, fmt_value(val))
     elif isinstance(val, Sequence) and not isinstance(val, (str, bytes, bytearray)):
         val_color = _OTHER_COLOR if is_disabled else _VALUE_COLOR
+        if _sequence_too_large(val):
+            imgui.text_colored(color, full_name)
+            if name in METADATA_TOOLTIPS and imgui.is_item_hovered():
+                imgui.set_tooltip(METADATA_TOOLTIPS[name])
+            imgui.same_line(spacing=16)
+            imgui.text_colored(
+                val_color,
+                f"<list len={len(val)} — hidden (too large to display)>",
+            )
+            return
         is_path_list = (
             len(val) > 0
             and all(isinstance(v, str) for v in val)
@@ -183,13 +270,15 @@ def _render_item(name, val, prefix="", depth=0, filter_text="", name_color=None,
             if filtered_paths:
                 label = f"{full_name} ({len(filtered_paths)}/{len(val)} paths)" if filter_text else f"{full_name} ({len(val)} paths)"
                 if _colored_tree_node(label):
-                    for i, path in filtered_paths:
+                    for i, path in filtered_paths[:_SEQ_PAGE]:
                         imgui.text_colored(_OTHER_COLOR if is_disabled else _NAME_COLORS[1], f"[{i}]")
                         imgui.same_line(spacing=8)
                         display_path = path if len(path) <= 60 else "..." + path[-57:]
                         imgui.text_colored(val_color, display_path)
                         if imgui.is_item_hovered() and len(path) > 60:
                             imgui.set_tooltip(path)
+                    if len(filtered_paths) > _SEQ_PAGE:
+                        imgui.text_disabled(f"... +{len(filtered_paths) - _SEQ_PAGE} more")
                     imgui.tree_pop()
         elif len(val) <= 8 and all(isinstance(v, (int, float, str, bool)) for v in val):
             imgui.text_colored(color, full_name)
@@ -201,8 +290,10 @@ def _render_item(name, val, prefix="", depth=0, filter_text="", name_color=None,
                 children = [(i, v) for i, v in children if _matches_filter_recursive(f"[{i}]", v, filter_text)]
             if children:
                 if _colored_tree_node(f"{full_name} ({len(val)} items)"):
-                    for i, v in children:
+                    for i, v in children[:_SEQ_PAGE]:
                         _render_item(f"[{i}]", v, prefix=full_name, depth=depth + 1, filter_text=filter_text, is_disabled=is_disabled)
+                    if len(children) > _SEQ_PAGE:
+                        imgui.text_disabled(f"... +{len(children) - _SEQ_PAGE} more")
                     imgui.tree_pop()
             else:
                 imgui.text_colored(color, full_name)
@@ -261,6 +352,7 @@ def draw_metadata_inspector(metadata: dict, data_array=None):
     """
     global _metadata_search_filter, _metadata_search_active, _metadata_search_focus_requested
     from mbo_utilities.metadata import METADATA_PARAMS, IMAGING_METADATA_KEYS, ALIAS_MAP
+    from mbo_utilities.metadata.params import get_param
 
     with imgui_ctx.begin_child("Metadata Viewer"):
         imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(8, 4))
@@ -365,10 +457,16 @@ def draw_metadata_inspector(metadata: dict, data_array=None):
                 # user-supplied field (like LBM's dz).
                 skip_alias = is_isoview and param.canonical == "fs"
                 if value is None and not skip_alias:
-                    for alias in param.aliases:
-                        if alias in metadata:
-                            value = metadata[alias]
-                            break
+                    if param.canonical == "fs":
+                        # get_param resolves aliases AND transform aliases
+                        # (finterval -> 1/fs); the plain alias walk would
+                        # display an interval verbatim as a rate.
+                        value = get_param(metadata, "fs")
+                    else:
+                        for alias in param.aliases:
+                            if alias in metadata:
+                                value = metadata[alias]
+                                break
 
                 shown_keys.add(param.canonical)
                 shown_keys.update(param.aliases)
