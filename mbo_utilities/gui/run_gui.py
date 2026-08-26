@@ -747,6 +747,16 @@ def _run_gui_impl(
 _PICKER_UNAVAILABLE = object()
 
 
+def _fmt_duration(seconds):
+    """Compact recording length: '' when unknown, seconds under a minute."""
+    if not seconds:
+        return ""
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    m, s = divmod(int(round(seconds)), 60)
+    return f"{m}m {s:02d}s"
+
+
 def _prompt_for_mesc_unit(path, units):
     """Pop a Qt dialog listing the measurement units in a ``.mesc`` file.
 
@@ -795,7 +805,10 @@ def _prompt_for_mesc_unit(path, units):
         )
     )
 
-    columns = ("Unit", "Type", "T", "C", "Z / ROI", "Y", "X", "Acquired", "Comment")
+    columns = (
+        "Unit", "Type", "T", "C", "Z / ROI", "Y", "X",
+        "Duration", "Acquired", "Comment",
+    )
     table = QTableWidget(len(units), len(columns))
     table.setHorizontalHeaderLabels(columns)
     table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -804,7 +817,15 @@ def _prompt_for_mesc_unit(path, units):
     table.verticalHeader().setVisible(False)
     for row, unit in enumerate(units):
         t, c, z, y, x = unit["shape"]
-        z_text = f"{z} ROI" if unit["nrois"] > 1 else str(z)
+        if unit["kind"] == "multicube":
+            # Z holds cubes x z-slices, not ROIs
+            z_text = (
+                f"{unit['nrois']}x{z // unit['nrois']}"
+                if unit["nrois"] > 1
+                else str(z)
+            )
+        else:
+            z_text = f"{z} ROI" if unit["nrois"] > 1 else str(z)
         cells = (
             unit["munit"],
             unit["modality_name"],
@@ -813,6 +834,7 @@ def _prompt_for_mesc_unit(path, units):
             z_text,
             str(y),
             str(x),
+            _fmt_duration(unit.get("duration_s")),
             (unit["start_time"] or "")[:19].replace("T", " "),
             unit["comment"],
         )

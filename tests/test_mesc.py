@@ -156,6 +156,36 @@ def mesc_path(tmp_path_factory):
                 + c * 1000,
             )
         _curve(u, 0, "DichroSw_AO1", [1, 2] * 5)
+
+        # MUnit_6 - MethodType 11 multicube: z-slices interleaved on axis 0
+        u = s.create_group("MUnit_6")
+        u.attrs.update(
+            {"MethodType": 11, "VecChannelsSize": 1, "TStepInMs": 60.0,
+             "Slices": 4, "MeasurementDatePosix": 1_700_000_600,
+             "Comment": "multicube"}
+        )
+        u.attrs["MultiROIProtocolJSON"] = _protocol(
+            {
+                "scanMode": 4,
+                "centerPoints": [10.0, 20.0, -9000.0],
+                "pixelSizeX": 0.5,
+                "pixelSizeY": 0.5,
+                "xySize": 3.0,
+                "zSize": 8.0,
+                "voxelSizeZ": 2.0,
+                "rotation": {"e": [0, 0, 0, 0]},
+            }
+        )
+        u.attrs["CoordinateMapJSON"] = json.dumps(
+            {"maps": [{"layerOffsetVectors":
+                       [[0] * 4, [0] * 4, [3.0, 1.0, -1.0, -3.0]]}]}
+        )
+        u.attrs["BreakViewJSON"] = json.dumps(
+            {"measurementROIMaps": _boxes([(0, 8, 0, 6)])}
+        )
+        u.create_dataset(
+            "Channel_0", data=np.arange(12 * 8 * 6, dtype=np.uint16).reshape(12, 8, 6)
+        )
     return path
 
 
@@ -172,9 +202,9 @@ def raw(mesc_path):
 
 def test_list_units_reports_every_layout(mesc_path):
     units = list_mesc_units(mesc_path)
-    assert [u["munit"] for u in units] == [f"MUnit_{i}" for i in range(6)]
+    assert [u["munit"] for u in units] == [f"MUnit_{i}" for i in range(7)]
     assert [u["kind"] for u in units] == [
-        "zstack", "tiled", "boxes", "packed", "frames", "packed",
+        "zstack", "tiled", "boxes", "packed", "frames", "packed", "multicube",
     ]
     assert [u["shape"] for u in units] == [
         (1, 2, 20, 64, 48),
@@ -183,7 +213,12 @@ def test_list_units_reports_every_layout(mesc_path):
         (8, 1, 2, 4, 18),
         (7, 1, 1, 16, 18),
         (5, 2, 1, 2, 10),
+        (3, 1, 4, 8, 6),
     ]
+    # per-unit timing: fs from TStepInMs, duration only when there is a series
+    assert units[6]["fs"] == pytest.approx(1000 / 60)
+    assert units[6]["duration_s"] == pytest.approx(3 * 60 / 1000)
+    assert units[0]["duration_s"] is None  # a z-stack has one timepoint
 
 
 def test_imread_dispatches_to_mesc_array(mesc_path):
@@ -286,6 +321,85 @@ def test_timeseries_indexes_like_a_plain_stack(mesc_path, raw):
     assert np.array_equal(arr[1:4, 0, 0, 2:5, ::2], src[1:4, 2:5, ::2])
     assert arr[3, 0, 0].shape == (16, 18)
     assert arr[3:4, :, :].shape == (1, 1, 1, 16, 18)
+
+
+def test_multicube_slices_interleave_on_axis0(mesc_path, raw):
+    arr = MescArray(mesc_path, unit=6)
+    src = raw["MSession_0/MUnit_6/Channel_0"][:]
+    assert arr.shape == (3, 1, 4, 8, 6)
+    for t in range(3):
+        for s in range(4):
+            assert np.array_equal(arr[t, 0, s], src[t * 4 + s]), (t, s)
+    assert np.array_equal(arr[1, 0, 1:3], src[[5, 6]])
+    # out-of-order timepoints must not be silently sorted
+    assert np.array_equal(arr[[2, 0], 0, 1], np.stack([src[9], src[1]]))
+
+    md = arr.metadata
+    assert md["mesc_z_axis_meaning"] == "depth"
+    assert md["dz"] == pytest.approx(2.0)
+    assert md["mesc_slices"] == 4
+    assert md["mesc_cubes"] == 1
+    assert md["mesc_slice_z_offsets_um"] == [3.0, 1.0, -1.0, -3.0]
+    assert md["dx"] == md["dy"] == pytest.approx(0.5)
+    assert md["fs"] == pytest.approx(1000 / 60)
+    assert md["num_zplanes"] == 4
+    assert arr.slider_dim_labels == ("Timepoint", "Z-plane")
+
+
+def test_multicube_out_of_range_z_raises(mesc_path, raw):
+    """Out-of-range Z must raise, not alias onto a wrong slice via divmod."""
+    arr = MescArray(mesc_path, unit=6)
+    src = raw["MSession_0/MUnit_6/Channel_0"][:]
+    nz = arr.shape[2]
+    for z in (nz, 10, -(nz + 1)):
+        with pytest.raises(IndexError, match="axis 2"):
+            arr[0, 0, z]
+    # in-range negatives still resolve from the end
+    assert np.array_equal(arr[0, 0, -1], src[nz - 1])
+
+
+def test_list_units_multicube_reports_cubes_not_rois(tmp_path):
+    """A 2-cube x 3-slice unit carries z-planes, not ROIs, on Z."""
+    path = tmp_path / "twocube.mesc"
+    with h5py.File(path, "w") as f:
+        u = f.create_group("MSession_0").create_group("MUnit_0")
+        u.attrs.update(
+            {"MethodType": 11, "VecChannelsSize": 1, "TStepInMs": 60.0,
+             "Slices": 3, "Comment": "two cubes"}
+        )
+        # two cube boxes side by side on an 8x12 page; multi-cube packing is
+        # inferred, not verified against reference data (see _resolve_layout)
+        u.attrs["BreakViewJSON"] = json.dumps(
+            {"measurementROIMaps": _boxes([(0, 8, 0, 6), (0, 8, 6, 12)])}
+        )
+        u.create_dataset(
+            "Channel_0",
+            data=np.zeros((12, 8, 12), dtype=np.uint16),
+        )
+    (unit,) = list_mesc_units(path)
+    assert unit["kind"] == "multicube"
+    assert unit["shape"] == (4, 1, 6, 8, 6)  # T, C, cubes*slices, Y, X
+    assert unit["nrois"] == 2  # cubes -- the picker renders "2x3", not "6 ROI"
+
+
+def test_multicube_without_slices_attr_falls_back_to_frames(
+    tmp_path, caplog, monkeypatch
+):
+    import logging
+
+    path = tmp_path / "noslices.mesc"
+    with h5py.File(path, "w") as f:
+        u = f.create_group("MSession_0").create_group("MUnit_0")
+        u.attrs.update({"MethodType": 11, "VecChannelsSize": 1, "TStepInMs": 60.0})
+        u.create_dataset("Channel_0", data=np.zeros((6, 4, 4), dtype=np.uint16))
+
+    mesc_logger = logging.getLogger("mbo.arrays.mesc")
+    monkeypatch.setattr(mesc_logger, "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="mbo.arrays.mesc"):
+        arr = MescArray(path)
+    assert arr.metadata["mesc_layout"] == "frames"
+    assert arr.shape == (6, 1, 1, 4, 4)
+    assert any("Slices" in r.message for r in caplog.records)
 
 
 # ============================================================
@@ -631,7 +745,7 @@ class TestViewerFit:
         assert arr.shape == (6, 2, 4, 32, 24)
         assert arr.slider_dim_labels == ("Timepoint", "Channel", "ROI")
 
-    @pytest.mark.parametrize("unit", [0, 2, 3, 4, 5])
+    @pytest.mark.parametrize("unit", [0, 2, 3, 4, 5, 6])
     def test_every_unit_reports_one_label_per_scrollable_axis(self, mesc_path, unit):
         from mbo_utilities.gui.widgets.mesc_units import display_wrap
 

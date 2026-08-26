@@ -28,6 +28,7 @@ MethodType                   raw ``Channel_N``           unpacking
 8  chessboard                ``(T, Y, R*X)``             ROIs tiled along X
 9  ribbon transverse         ``(T, Y, X)``               ROI boxes on the page
 10 ribbon longitudinal       ``(T, Y, X)``               ROI boxes, or tiled
+11 multicube                 ``(T*Slices, Y, X)``        de-interleave axis 0
 ===========================  ==========================  =====================
 
 The AOD ROI index ``R`` is not a depth series: the ROIs are arbitrarily placed
@@ -38,6 +39,12 @@ the canonical ``Z`` axis, with the real geometry kept in metadata
 (``mesc_centroids``, ``mesc_rotations``) and ``mesc_z_axis_meaning`` set to
 ``"roi_index"`` so downstream code never has to guess. ``dz`` stays ``None``
 for AOD multi-ROI: there is no uniform step and writing one would be a lie.
+
+MethodType 11 (multicube) is the exception: its ``Z`` is real depth. Axis 0 of
+the raw channel interleaves z-slices within each timepoint (source frame ``i``
+holds timepoint ``i // Slices``, slice ``i % Slices``), slice 0 is the topmost
+plane (MEScan scans top to bottom), and the slices are a uniform depth series
+with ``dz`` equal to the protocol's ``voxelSizeZ``.
 
 `MescArray` reports the canonical mbo 5D shape ``(T, C, Z, Y, X)``. Note this
 is the mbo axis order, not the ``(T, Z, C, Y, X)`` used by ``lab4.convert``'s
@@ -110,11 +117,16 @@ _BOX_MODALITIES = frozenset({9, 10})
 _TILED_MODALITIES = frozenset({8})
 # Modalities whose temporal frames are packed into the Y axis of a 1-frame page.
 _PACKED_MODALITIES = frozenset({6, 7})
+# Modalities where axis 0 interleaves z-slices within each timepoint
+# (frame i = timepoint i//Slices, slice i%Slices).
+_VOLUME_MODALITIES = frozenset({11})
 
 # Y is flipped on read for these, matching lab4.convert. The flip corrects
 # MEScan's save orientation; whether it also belongs on linescan/multiline is
 # unsettled upstream (see `flip_y` in the class docstring), so the default
-# reproduces the reference converter rather than guessing.
+# reproduces the reference converter rather than guessing. Multicube (11) is
+# left out: lab4.convert never handled it, so there is no reference behaviour
+# to reproduce.
 _FLIP_Y_BY_MODALITY: dict[int, bool] = {8: True, 9: True, 10: True}
 
 # Timing curves worth keeping; the rest are scanner internals.
@@ -232,6 +244,35 @@ def _coordmap_boxes(unit) -> list[dict]:
         return []
 
 
+def _multicube_geometry(unit) -> dict:
+    """Cube geometry of a MethodType 11 unit; each value None when undeclared."""
+    out = {
+        "voxel_size_z_um": None,
+        "slice_z_offsets_um": None,
+        "xy_size_um": None,
+        "z_size_um": None,
+    }
+    pattern = _scan_pattern(unit) or {}
+    for src, dst in (
+        ("voxelSizeZ", "voxel_size_z_um"),
+        ("xySize", "xy_size_um"),
+        ("zSize", "z_size_um"),
+    ):
+        try:
+            out[dst] = float(pattern[src])
+        except (KeyError, TypeError, ValueError):
+            pass
+    doc = _json_attr(unit, "CoordinateMapJSON")
+    if doc:
+        try:
+            out["slice_z_offsets_um"] = [
+                float(v) for v in doc["maps"][0]["layerOffsetVectors"][2]
+            ]
+        except (KeyError, IndexError, TypeError, ValueError):
+            pass
+    return out
+
+
 def _extend_to_rois(value, n_rois):
     """Broadcast a scalar / single list to one entry per ROI."""
     if not isinstance(value, list):
@@ -329,7 +370,7 @@ def _spatial_info(unit, modality: int) -> dict:
                     pattern["pixelSize"], len(centroids)
                 )[0],
             }
-        if modality == 8:  # chessboard
+        if modality in (8, 11):  # chessboard, multicube
             centroids = _as_points(np.asarray(pattern["centerPoints"]).T.tolist())
             n = len(centroids)
             return {
@@ -415,6 +456,7 @@ class _Layout:
         "z_meaning",
         "frame_maps",
         "raw_shape",
+        "slices",
     )
 
     def __init__(self, **kw):
@@ -432,10 +474,11 @@ class _Layout:
         return len(self.frame_maps) if self.frame_maps else 1
 
     def describe(self) -> str:
+        slices = f" slices={self.slices}" if self.slices else ""
         return (
             f"kind={self.kind} raw={self.raw_shape} -> "
             f"(T={self.nt}, C={self.nc}, Z={self.nz}, Y={self.ny}, X={self.nx}) "
-            f"z={self.z_meaning} flip_y={self.flip_y}"
+            f"z={self.z_meaning} flip_y={self.flip_y}{slices}"
         )
 
 
@@ -472,6 +515,50 @@ def _resolve_layout(unit, modality: int, curves: dict, flip_y=None) -> _Layout:
         )
 
     boxes = _breakview_boxes(unit) or _coordmap_boxes(unit)
+
+    if modality in _VOLUME_MODALITIES:
+        slices = int(_attr(unit, "Slices", 0) or 0)
+        if slices > 1 and n0 >= slices:
+            if n0 % slices:
+                logger.warning(
+                    f"{unit.name}: {n0} raw frames is not a multiple of "
+                    f"Slices={slices}; dropping the trailing partial volume."
+                )
+            cubes = [
+                b for b in boxes if b["row1"] > b["row0"] and b["col1"] > b["col0"]
+            ]
+            if len(cubes) <= 1:
+                # single cube: the page is one z-slice of the volume
+                return _Layout(
+                    kind="multicube",
+                    nt=n0 // slices,
+                    nz=slices,
+                    ny=page_y,
+                    nx=page_x,
+                    rois=[],
+                    z_meaning="depth",
+                    slices=slices,
+                    **common,
+                )
+            logger.info(
+                f"{unit.name}: {len(cubes)} cube boxes on the page; multi-cube "
+                f"packing is inferred, not verified against reference data."
+            )
+            return _Layout(
+                kind="multicube",
+                nt=n0 // slices,
+                nz=len(cubes) * slices,
+                ny=max(b["row1"] - b["row0"] for b in cubes),
+                nx=max(b["col1"] - b["col0"] for b in cubes),
+                rois=cubes,
+                z_meaning="cube_slice",
+                slices=slices,
+                **common,
+            )
+        logger.warning(
+            f"{unit.name}: MethodType 11 without a usable Slices attr; "
+            f"reading axis 0 as time."
+        )
 
     # Frames packed into Y: one raw "frame" holding T*n_lines rows. Detected
     # from the shape rather than the modality table, which disagrees.
@@ -566,8 +653,8 @@ def _resolve_layout(unit, modality: int, curves: dict, flip_y=None) -> _Layout:
                 f"single FOV."
             )
 
-    # timeseries, multicube, and every unrecognised modality: axis 0 is time,
-    # the page is one FOV.
+    # timeseries and every unrecognised modality: axis 0 is time, the page is
+    # one FOV.
     if modality not in MODALITY_NAMES:
         logger.warning(
             f"{unit.name}: unknown MethodType {modality}; reading axis 0 as time."
@@ -609,8 +696,13 @@ def list_mesc_units(path: Path | str) -> list[dict]:
     list of dict
         One entry per ``MSession_N/MUnit_M`` holding a ``Channel_0``, in file
         order, with keys ``session``, ``munit``, ``key``, ``index``,
-        ``modality``, ``modality_name``, ``kind``, ``shape`` (canonical TCZYX),
-        ``nframes``, ``nchannels``, ``nrois``, ``comment`` and ``start_time``.
+        ``modality``, ``modality_name``, ``kind`` (``"multicube"`` units carry
+        z-slices, not ROIs, on Z), ``shape`` (canonical TCZYX), ``nframes``,
+        ``nchannels``, ``nrois``, ``fs`` (timepoint rate in Hz, from
+        ``TStepInMs``), ``duration_s`` (``nframes / fs``; None for
+        single-timepoint units, and an underestimate for dichroic multiline
+        units, whose ``nframes`` counts channel pairs), ``comment`` and
+        ``start_time``.
 
     Examples
     --------
@@ -637,6 +729,11 @@ def list_mesc_units(path: Path | str) -> list[dict]:
                 except (ValueError, KeyError) as e:
                     logger.warning(f"skipping {session_key}/{munit_key}: {e}")
                     continue
+                try:
+                    step_ms = float(_attr(unit, "TStepInMs") or 0)
+                except (TypeError, ValueError):
+                    step_ms = 0.0
+                fs = 1000.0 / step_ms if step_ms > 0 else None
                 units.append(
                     {
                         "session": session_key,
@@ -657,7 +754,11 @@ def list_mesc_units(path: Path | str) -> list[dict]:
                         ),
                         "nframes": layout.nt,
                         "nchannels": layout.nc,
-                        "nrois": layout.nz if layout.z_meaning == "roi_index" else 1,
+                        "nrois": len(layout.rois) or 1,
+                        "fs": fs,
+                        "duration_s": (
+                            layout.nt / fs if fs and layout.nt > 1 else None
+                        ),
                         "comment": _attr(unit, "Comment", "") or "",
                         "start_time": _iso_time(_attr(unit, "MeasurementDatePosix")),
                     }
@@ -681,7 +782,7 @@ def _take_axis0(dataset, indices) -> np.ndarray:
         return dataset[int(idx[0]) : int(idx[-1]) + 1]
     uniq, inverse = np.unique(idx, return_inverse=True)
     block = dataset[uniq.tolist()]
-    if uniq.size == idx.size:
+    if np.array_equal(uniq, idx):
         return block
     return block[inverse]
 
@@ -760,12 +861,12 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
         "Ly": "Height of one ROI (padded to the largest ROI for ribbon scans).",
         "Lx": "Width of one ROI after unpacking from the raw MESc page.",
         "num_zplanes": (
-            "ROI count for AOD multi-ROI scans, depth for MethodType 2 z-stacks. "
-            "See mesc_z_axis_meaning."
+            "ROI count for AOD multi-ROI scans, depth for MethodType 2 z-stacks "
+            "and MethodType 11 multicube volumes. See mesc_z_axis_meaning."
         ),
         "dz": (
-            "Z-step. None for AOD multi-ROI -- those ROIs are not a uniform "
-            "depth series."
+            "Z-step. voxelSizeZ for multicube, whose slices are a real uniform "
+            "depth series; None for AOD multi-ROI -- those ROIs are not."
         ),
         "fs": (
             "Rate of the timepoints this array reports. Halved (per light path) "
@@ -953,6 +1054,8 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
         # `num_timepoints / fs` claim half the duration actually recorded.
         raw_fs = 1000.0 / self._frame_period_ms if self._frame_period_ms else None
         fs = raw_fs / layout.light_paths if raw_fs else None
+        geo = _multicube_geometry(self._unit) if self.modality == 11 else None
+        dz = geo["voxel_size_z_um"] if geo else None
 
         if layout.frame_maps is not None:
             channel_names = ["Green", "Red"]
@@ -970,9 +1073,10 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
             "frame_rate": fs,
             "dx": float(pixel_size) if pixel_size else None,
             "dy": float(pixel_size) if pixel_size else None,
-            # AOD ROIs are not a uniform depth series, and MESc records no z-step
-            # we can trust for a real stack either, so dz stays user-supplied.
-            "dz": None,
+            # AOD ROIs are not a uniform depth series and dz stays None there;
+            # multicube slices are a real uniform depth series, so dz carries
+            # the protocol's voxelSizeZ.
+            "dz": dz,
             "num_timepoints": self._nt,
             "num_zplanes": layout.nz,
             "nchannels": layout.nc,
@@ -1014,6 +1118,12 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
             "start_time": _iso_time(_attr(self._unit, "MeasurementDatePosix")),
             "start_time_tz": "UTC-05:00",
         }
+        if geo is not None:
+            md["mesc_slices"] = layout.slices
+            md["mesc_cubes"] = len(layout.rois) or 1
+            md["mesc_slice_z_offsets_um"] = geo["slice_z_offsets_um"]
+            md["mesc_cube_xy_size_um"] = geo["xy_size_um"]
+            md["mesc_cube_z_size_um"] = geo["z_size_um"]
         # raw unit attrs, minus the large embedded JSON documents
         md["mesc_attrs"] = {
             k: _attr(self._unit, k) for k in self._unit.attrs if k not in _JSON_ATTRS
@@ -1088,9 +1198,11 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
         nt, nc, nz, _, _ = self._shape5d()
         if self.roi is not None:
             nz = 1  # every rendered subplot carries a single ROI
-        z_label = {"roi_index": "ROI", "depth": "Z-plane"}.get(
-            self._layout.z_meaning, "Z"
-        )
+        z_label = {
+            "roi_index": "ROI",
+            "depth": "Z-plane",
+            "cube_slice": "Cube-slice",
+        }.get(self._layout.z_meaning, "Z")
         labels = []
         if nt > 1:
             labels.append("Timepoint")
@@ -1160,6 +1272,8 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
             block = plane if len(frames) == 1 else np.repeat(plane, len(frames), axis=0)
         elif kind == "packed":
             block = self._read_packed(dataset, c, z, frames)
+        elif kind == "multicube":
+            block = self._read_multicube(dataset, c, z, frames)
         else:
             raw = _take_axis0(dataset, self._source_frames(c, frames))
             if kind == "frames":
@@ -1193,6 +1307,31 @@ class MescArray(RoiFeatureMixin, ReductionMixin, PhaseCorrectionMixin, Shape5DMi
         for i, f in enumerate(src):
             out[i] = dataset[0, int(f) * n_lines : (int(f) + 1) * n_lines, col0:col1]
         return out
+
+    def _read_multicube(self, dataset, c, z, frames) -> np.ndarray:
+        """De-interleave one z-slice of a volume series from axis 0.
+
+        Source frame ``t * Slices + s`` holds timepoint ``t``, slice ``s``.
+        With multiple cubes the requested Z picks both the cube and the slice
+        within it, and the cube's box is cropped off the page.
+        """
+        layout = self._layout
+        z = int(z)
+        # The 5D layer already mapped in-range negatives to 0..nz-1
+        # (``listify_index`` adds ``nz`` once), so anything still negative --
+        # like anything >= nz -- is out of bounds. Without this check divmod
+        # would silently wrap it onto a wrong (cube, slice) pair.
+        if not 0 <= z < layout.nz:
+            raise IndexError(
+                f"index {z} is out of bounds for axis 2 (Z) with size {layout.nz}"
+            )
+        cube, s = divmod(z, layout.slices)
+        src = self._source_frames(c, frames) * layout.slices + s
+        raw = _take_axis0(dataset, src)
+        if layout.rois:
+            box = layout.rois[cube]
+            raw = raw[:, box["row0"] : box["row1"], box["col0"] : box["col1"]]
+        return raw
 
     def _pad_to_frame(self, block: np.ndarray) -> np.ndarray:
         """Zero-pad a ROI smaller than the array's frame to the common size.

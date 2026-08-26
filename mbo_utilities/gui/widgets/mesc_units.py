@@ -187,7 +187,11 @@ class MescUnitsWidget(Widget):
             imgui.text_disabled("Reopen without --roi to switch units.")
             return
 
-        labels = [f"{u['munit']} · {u['modality_name']}" for u in units]
+        labels = [
+            f"{u['munit']} · {u['modality_name']}"
+            + (f" · {u['start_time'][:10]}" if u.get("start_time") else "")
+            for u in units
+        ]
         current = next(
             (i for i, u in enumerate(units) if u["key"] == mesc.unit_key), 0
         )
@@ -216,6 +220,9 @@ class MescUnitsWidget(Widget):
         fs = mesc.metadata.get("fs")
         if fs:
             detail += f"  ·  {fs:.1f} Hz"
+        dur = info.get("duration_s")
+        if dur:
+            detail += f"  ·  {dur:.0f} s"
         if info["start_time"]:
             detail += f"  ·  {info['start_time'][:16].replace('T', ' ')}"
         imgui.text_disabled(detail)
