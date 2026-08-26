@@ -163,7 +163,18 @@ def get_slider_dims(arr_or_dims) -> tuple[str, ...] | None:
 _SLIDER_NAME_ALIASES: dict[str, tuple[str, ...]] = {
     "t": ("t", "tile", "timepoint", "timepoints", "tp"),
     "c": ("c", "cam", "view", "channel", "channels", "cm"),
-    "z": ("z", "zplane", "zplanes", "plane", "planes", "depth"),
+    # "z-plane"/"cube-slice" are what MescArray.slider_dim_labels emits for
+    # depth/cube datasets ("Z-plane"/"Cube-slice"; matching is lowercased)
+    "z": (
+        "z",
+        "zplane",
+        "z-plane",
+        "zplanes",
+        "plane",
+        "planes",
+        "depth",
+        "cube-slice",
+    ),
 }
 
 

@@ -9,8 +9,17 @@ Usage:
     KEEP_TEST_OUTPUT=1 pytest tests/    # Keep output files for inspection
 """
 
+import os
 import shutil
 from pathlib import Path
+
+# Force the offscreen rendercanvas backend for the whole test process.
+# rendercanvas.auto picks its backend the moment it is imported (any
+# fastplotlib import at collection time pulls it in), so the env var must
+# be set here — before any test module imports fastplotlib — for the
+# offscreen viewer tests (tests/test_ndviewer.py) to work. No test opens
+# a real window; `setdefault` still lets a caller override explicitly.
+os.environ.setdefault("RENDERCANVAS_FORCE_OFFSCREEN", "1")
 
 import numpy as np
 import pytest

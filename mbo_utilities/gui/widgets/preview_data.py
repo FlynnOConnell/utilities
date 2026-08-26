@@ -655,6 +655,7 @@ class PreviewDataWidget(EdgeWindow):
         self.set_context_info()
         self._update_window_funcs()
         rebind_space_to_playback(self)
+        self._seed_playback_fps()
         try:
             from mbo_utilities.gui.widgets.pipelines.isoview import (
                 maybe_spawn_raw_projections,
@@ -662,6 +663,25 @@ class PreviewDataWidget(EdgeWindow):
             maybe_spawn_raw_projections(self)
         except Exception:
             self.logger.debug("raw projection prefetch skipped", exc_info=True)
+
+    def _seed_playback_fps(self):
+        """Seed the t playback rate from the loaded array's frame rate.
+
+        Uses the vendored slider widget's `seed_fps`, which clamps to the
+        slider's [1, 50] range and never overrides a user-typed fps.
+        """
+        try:
+            arr = self.image_widget.data[0]
+            fs = getattr(arr, "fs", None)
+            if fs is None:
+                from mbo_utilities.metadata import get_param
+                fs = get_param(getattr(arr, "metadata", None), "fs")
+            from mbo_utilities.gui._keyboard import _get_sliders_ui
+            sliders = _get_sliders_ui(self)
+            if sliders is not None and hasattr(sliders, "seed_fps"):
+                sliders.seed_fps("t", fs)
+        except Exception:
+            self.logger.debug("playback fps seed skipped", exc_info=True)
 
     def set_context_info(self):
         """Update app title with dataset name."""

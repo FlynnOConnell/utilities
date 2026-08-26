@@ -1,13 +1,19 @@
 """
-Contrast-reset and slider-count contracts for the vendored ImageWidget.
+Contrast-reset and slider-count contracts for the viewer.
 
-Both reset paths (the playback bar's two buttons, the ``v`` shortcut, and
-auto-contrast-on-z) used to look for a ``histogram_lut`` in the subplot's
-right dock. This build renders the LUT with `ImguiColorbar` instead, so that
-dock never exists and every one of those controls silently did nothing. These
-tests pin the replacement: the reset must actually move vmin/vmax onto the
-data, and the value sample it derives them from must stay bounded on a movie
-too large to read whole.
+Both reset paths (the playback bar's buttons, the ``v`` shortcut, and
+auto-contrast-on-z) must actually move vmin/vmax onto the data, and the
+value sample they derive them from must stay bounded on a movie too large
+to read whole.
+
+The default viewer is now the NDWidget-backed ``MboNDViewer`` adapter
+(mbo_utilities/gui/_ndviewer.py), so these tests pin ITS ``_sample_array``
+/ ``_set_contrast`` / slider-dim derivation. The vendored legacy
+ImageWidget (selected with ``MBO_LEGACY_IMAGE_WIDGET=1``) keeps its own
+copies of the same logic; the assertions that only exist on that stack
+live in ``TestLegacyVendoredInternals`` and set the env flag to make their
+scope explicit. The full rendering-level contract battery for the adapter
+is in tests/test_ndviewer.py.
 """
 
 from __future__ import annotations
@@ -15,11 +21,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from mbo_utilities.gui._vendor._widget import (
-    ALLOWED_SLIDER_DIMS,
-    SCROLLABLE_DIMS_ORDER,
-    SLIDER_UI_SIZES,
-    ImageWidget,
+from mbo_utilities.gui._ndviewer import (
+    MboNDViewer,
+    VMINMAX_SAMPLE_COUNTS,
     _sample_array,
 )
 
@@ -81,6 +85,12 @@ class TestSampleArray:
     def test_empty_axis_yields_an_empty_sample(self):
         assert _sample_array(np.zeros((0, 8, 8))).size == 0
 
+    def test_sample_counts_cover_one_to_three_scroll_axes(self):
+        for n in (1, 2, 3):
+            counts = VMINMAX_SAMPLE_COUNTS[n]
+            assert len(counts) == n
+            assert int(np.prod(counts)) <= 72
+
 
 # ============================================================
 # contrast application
@@ -118,93 +128,221 @@ class FakeColorbar:
         self._graphic.vmax = float(value)
 
 
-class FakeWidget:
-    """Just enough ImageWidget surface for `_set_contrast`."""
+class FakeNDG:
+    """Just enough NDImage surface for ``MboNDViewer._set_contrast``."""
 
     def __init__(self, histogram_widget=True):
         self.graphic = FakeGraphic()
-        self._histogram_widget = histogram_widget
-        self._colorbars = [FakeColorbar(self.graphic)] if histogram_widget else []
-        self.subplot = {"image_widget_managed": self.graphic}
+        self.histogram_widget = (
+            FakeColorbar(self.graphic) if histogram_widget else None
+        )
 
     def apply(self, block):
-        ImageWidget._set_contrast(self, 0, self.subplot, block)
+        # _set_contrast only touches the ndg passed in, never self/viewer
+        MboNDViewer._set_contrast(object.__new__(MboNDViewer), self, block)
 
 
 class TestSetContrast:
     def test_limits_move_onto_the_data(self):
-        w = FakeWidget()
-        w.apply(np.array([[10, 20], [30, 900]], dtype=np.uint16))
-        assert (w.graphic.vmin, w.graphic.vmax) == (10.0, 900.0)
+        ndg = FakeNDG()
+        ndg.apply(np.array([[10, 20], [30, 900]], dtype=np.uint16))
+        assert (ndg.graphic.vmin, ndg.graphic.vmax) == (10.0, 900.0)
 
     def test_colorbar_histogram_tracks_the_reset(self):
-        w = FakeWidget()
-        w.apply(np.array([[10, 900]], dtype=np.uint16))
-        counts, edges = w._colorbars[0].histogram
+        ndg = FakeNDG()
+        ndg.apply(np.array([[10, 900]], dtype=np.uint16))
+        counts, edges = ndg.histogram_widget.histogram
         # the histogram setter re-derives the value axis the bar spans
         assert (float(edges[0]), float(edges[-1])) == (10.0, 900.0)
         assert len(edges) == len(counts) + 1
-        assert (w._colorbars[0].vmin, w._colorbars[0].vmax) == (10.0, 900.0)
+        assert (ndg.histogram_widget.vmin, ndg.histogram_widget.vmax) == (
+            10.0,
+            900.0,
+        )
 
     def test_works_without_a_colorbar(self):
-        w = FakeWidget(histogram_widget=False)
-        w.apply(np.array([[5, 50]], dtype=np.uint16))
-        assert (w.graphic.vmin, w.graphic.vmax) == (5.0, 50.0)
+        ndg = FakeNDG(histogram_widget=False)
+        ndg.apply(np.array([[5, 50]], dtype=np.uint16))
+        assert (ndg.graphic.vmin, ndg.graphic.vmax) == (5.0, 50.0)
 
     def test_flat_data_keeps_a_non_degenerate_range(self):
-        w = FakeWidget()
-        w.apply(np.full((4, 4), 7, dtype=np.uint16))
-        assert w.graphic.vmin == 7.0
-        assert w.graphic.vmax > w.graphic.vmin
+        ndg = FakeNDG()
+        ndg.apply(np.full((4, 4), 7, dtype=np.uint16))
+        assert ndg.graphic.vmin == 7.0
+        assert ndg.graphic.vmax > ndg.graphic.vmin
 
     def test_all_nan_data_is_left_alone(self):
-        w = FakeWidget()
-        before = (w.graphic.vmin, w.graphic.vmax)
-        w.apply(np.full((4, 4), np.nan))
-        assert (w.graphic.vmin, w.graphic.vmax) == before
+        ndg = FakeNDG()
+        before = (ndg.graphic.vmin, ndg.graphic.vmax)
+        ndg.apply(np.full((4, 4), np.nan))
+        assert (ndg.graphic.vmin, ndg.graphic.vmax) == before
 
     def test_non_finite_values_do_not_poison_the_range(self):
-        w = FakeWidget()
-        w.apply(np.array([[1.0, np.inf], [np.nan, 40.0]]))
-        assert (w.graphic.vmin, w.graphic.vmax) == (1.0, 40.0)
+        ndg = FakeNDG()
+        ndg.apply(np.array([[1.0, np.inf], [np.nan, 40.0]]))
+        assert (ndg.graphic.vmin, ndg.graphic.vmax) == (1.0, 40.0)
 
 
 # ============================================================
-# third slider
+# slider-dim derivation (adapter)
 # ============================================================
 
-class TestThreeScrollableDims:
+class _ShapeOnly:
+    def __init__(self, ndim):
+        self.ndim = ndim
+
+
+class TestSliderDims:
+    """Scrollable-axis counting on the adapter. NDWidget has no hard cap on
+    slider dims, so the vendored "six axes refused" ValueError is gone —
+    a 6D array simply gets a fourth slider with a generated name."""
+
     def test_a_third_axis_is_scrollable(self):
+        assert MboNDViewer._n_slider_dims(_ShapeOnly(5), rgb=False) == 3
+
+    @pytest.mark.parametrize("rgb", [False, True])
+    def test_five_dimensional_arrays_are_accepted(self, rgb):
+        ndim = 5 + (1 if rgb else 0)
+        assert MboNDViewer._n_slider_dims(_ShapeOnly(ndim), rgb) == 3
+
+    def test_two_dimensional_arrays_have_no_sliders(self):
+        assert MboNDViewer._n_slider_dims(_ShapeOnly(2), rgb=False) == 0
+
+    def test_six_scrollable_axes_get_a_generated_name(self):
+        # concept change vs the vendored widget, which raised ValueError:
+        # NDWidget supports arbitrary dims, so a 6D array is accepted.
+        # Unnamed letters follow the canonical mbo axis order — 5D data is
+        # (T, C, Z, Y, X), so axis 1 is 'c' and axis 2 is 'z' (the vendored
+        # positional order t/z/c put the 'z' slider on the C axis)
+        assert MboNDViewer._n_slider_dims(_ShapeOnly(6), rgb=False) == 4
+        names = MboNDViewer._make_dim_names(None, 4, None)
+        assert names == ("t", "c", "z", "dim3")
+
+
+class TestSliderLabels:
+    """The playback bar shows the array's own axis names. On the adapter
+    the ReferenceIndex dims ARE the display names, so NDWidgetUI labels
+    sliders directly; these pin the name derivation + resolution rules."""
+
+    @staticmethod
+    def _viewer(dim_names, labels=None):
+        v = object.__new__(MboNDViewer)
+        v._dim_names = list(dim_names)
+        v._slider_dim_names = tuple(labels) if labels else None
+        return v
+
+    def test_display_names_used_when_count_matches(self):
+        names = MboNDViewer._make_dim_names(
+            None, 3, ("Timepoint", "Channel", "ROI")
+        )
+        assert names == ("Timepoint", "Channel", "ROI")
+
+    def test_falls_back_to_letters_on_count_mismatch(self):
+        assert MboNDViewer._make_dim_names(None, 2, ("Timepoint",)) is not None
+        assert MboNDViewer._make_dim_names(None, 2, None) == ("t", "z")
+
+    def test_duplicate_names_are_deduped(self):
+        assert MboNDViewer._make_dim_names(None, 2, ("a", "a")) == ("a", "a_")
+
+    def test_reserved_spatial_names_are_mangled(self):
+        (name,) = MboNDViewer._make_dim_names(None, 1, ("__row__",))
+        assert name != "__row__"
+
+    def test_resolution_order_ref_dim_then_label_then_letter(self):
+        v = self._viewer(
+            ["Timepoint", "Channel", "Z-plane"],
+            labels=("Timepoint", "Channel", "Z-plane"),
+        )
+        assert v._resolve_dim("Timepoint") == "Timepoint"  # ref dim
+        assert v._resolve_dim("Channel") == "Channel"  # label, positional
+        assert v._resolve_dim("t") == "Timepoint"  # letter, positional
+        assert v._resolve_dim("z") == "Channel"
+        assert v._resolve_dim("c") == "Z-plane"
+        with pytest.raises(KeyError):
+            v._resolve_dim("nope")
+
+    def test_stale_labels_resolve_positionally(self):
+        # after a swap the ref dims may be letters while _slider_dim_names
+        # still carries the previous display labels — those must keep
+        # resolving by position rather than KeyError
+        v = self._viewer(["t", "z"], labels=("Timepoint", "Z-plane"))
+        assert v._resolve_dim("Z-plane") == "z"
+
+
+# ============================================================
+# vendored legacy stack (MBO_LEGACY_IMAGE_WIDGET=1)
+# ============================================================
+
+class TestLegacyVendoredInternals:
+    """Assertions that only exist on the vendored legacy ImageWidget stack.
+
+    The vendored copy stays in-tree as the ``MBO_LEGACY_IMAGE_WIDGET=1``
+    escape hatch; these run with the flag set to make their scope explicit
+    (the internals they pin are only reachable on that path).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _legacy_env(self, monkeypatch):
+        monkeypatch.setenv("MBO_LEGACY_IMAGE_WIDGET", "1")
+
+    def test_vendored_sample_array_matches_the_ported_one(self):
+        from mbo_utilities.gui._vendor._widget import (
+            _sample_array as vendored_sample,
+        )
+
+        data = np.zeros((40, 3, 8, 8), dtype=np.uint16)
+        data[:, 2] = 5000
+        assert vendored_sample(data).max() == 5000
+        assert np.array_equal(
+            vendored_sample(np.arange(24).reshape(4, 6)),
+            _sample_array(np.arange(24).reshape(4, 6)),
+        )
+
+    def test_a_third_axis_is_scrollable(self):
+        from mbo_utilities.gui._vendor._widget import (
+            ALLOWED_SLIDER_DIMS,
+            SCROLLABLE_DIMS_ORDER,
+        )
+
         assert SCROLLABLE_DIMS_ORDER[3] == "tzc"
         assert ALLOWED_SLIDER_DIMS[2] == "c"
 
     @pytest.mark.parametrize("rgb", [False, True])
     def test_five_dimensional_arrays_are_accepted(self, rgb):
+        from mbo_utilities.gui._vendor._widget import ImageWidget
+
         shape = (6, 2, 4, 32, 24) + ((3,) if rgb else ())
         n = ImageWidget._get_n_scrollable_dims(None, np.zeros(shape), rgb)
         assert n == 3
 
-    def test_six_scrollable_axes_are_still_refused(self):
+    def test_six_scrollable_axes_are_refused(self):
+        # legacy-only: the adapter accepts these (see TestSliderDims)
+        from mbo_utilities.gui._vendor._widget import ImageWidget
+
         with pytest.raises(ValueError, match="not supported"):
-            ImageWidget._get_n_scrollable_dims(None, np.zeros((2, 2, 2, 2, 8, 8)), False)
+            ImageWidget._get_n_scrollable_dims(
+                None, np.zeros((2, 2, 2, 2, 8, 8)), False
+            )
 
     def test_playback_bar_has_a_height_for_every_slider_count(self):
+        from mbo_utilities.gui._vendor._widget import (
+            ALLOWED_SLIDER_DIMS,
+            SLIDER_UI_SIZES,
+        )
+
         for n in range(len(ALLOWED_SLIDER_DIMS) + 1):
             assert SLIDER_UI_SIZES[n] > 0
         assert SLIDER_UI_SIZES[3] > SLIDER_UI_SIZES[2]
 
     def test_slider_dim_order_covers_every_allowed_dim(self):
         from mbo_utilities.gui._fpl_compat import _SLIDER_DIM_ORDER
+        from mbo_utilities.gui._vendor._widget import ALLOWED_SLIDER_DIMS
 
         assert set(_SLIDER_DIM_ORDER) == set(ALLOWED_SLIDER_DIMS.values())
         # order must match the axis positions, not just the membership
         assert _SLIDER_DIM_ORDER == tuple(
             ALLOWED_SLIDER_DIMS[i] for i in sorted(ALLOWED_SLIDER_DIMS)
         )
-
-
-class TestSliderLabels:
-    """The playback bar shows the array's own axis names, not t/z/c."""
 
     @staticmethod
     def _bar(names, dims):

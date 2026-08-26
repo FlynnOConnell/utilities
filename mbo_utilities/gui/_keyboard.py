@@ -140,17 +140,40 @@ def _get_sliders_ui(parent: Any):
 
 
 def toggle_playback(parent: Any, dim_index: int = 0) -> None:
-    """Toggle play/pause on the given slider dim (default T=0) via fpl's sliders widget."""
+    """Toggle play/pause on the given slider dim (default 0 = T).
+
+    Playback state is keyed by dim NAME on both slider UIs — the NDWidget
+    adapter's per-dim views and the vendored ImageWidgetSliders' str-keyed
+    defaultdicts. The old positional-int indexing toggled a phantom integer
+    key on the vendored stack (a silent no-op), so ``dim_index`` is resolved
+    to a name first: iterating the playing mapping yields the dim names in
+    slider order on both stacks, with ``iw.slider_dims`` (positional
+    letters) as the fallback when that mapping is still unpopulated (the
+    vendored defaultdicts only fill in on the first drawn frame).
+    """
     sliders = _get_sliders_ui(parent)
     if sliders is None or not hasattr(sliders, "_playing"):
         return
     playing = sliders._playing
-    if dim_index >= len(playing):
+    try:
+        dims = list(playing)
+    except TypeError:
+        dims = []
+    if dim_index >= len(dims):
+        iw = getattr(parent, "image_widget", None)
+        dims = list(getattr(iw, "slider_dims", None) or ())
+    if not 0 <= dim_index < len(dims):
         return
-    playing[dim_index] = not playing[dim_index]
-    if hasattr(sliders, "_last_frame_time") and dim_index < len(sliders._last_frame_time):
-        sliders._last_frame_time[dim_index] = 0
-    state = "PLAY" if playing[dim_index] else "PAUSE"
+    dim = dims[dim_index]
+    try:
+        playing[dim] = not playing[dim]
+    except (KeyError, IndexError):
+        return
+    last = getattr(sliders, "_last_frame_time", None)
+    if last is not None:
+        with contextlib.suppress(Exception):
+            last[dim] = 0
+    state = "PLAY" if playing[dim] else "PAUSE"
     parent.logger.info(f"Shortcut: 'Space' ({state})")
 
 

@@ -41,11 +41,13 @@ dependencies = [
 	"pygfx>=0.15.2",
 	"llvmlite>=0.43.0",
 	"numba>=0.60.0",
-	# exact branches this demo is developed against: fastplotlib's ndwidget
-	# branch (NDWidget, required at import time by masknmf) and masknmf's
-	# xarray-compatability branch. mbo-fastplotlib must NOT be installed
-	# alongside — both dists own the `fastplotlib` import package.
-	"fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@ndwidget",
+	# exact commits/branches this demo is developed against: fastplotlib's
+	# ndwidget branch pinned to the exact commit the MboNDViewer adapter was
+	# built against (the branch moves monthly with breaking refactors;
+	# masknmf requires this NDWidget API surface at import time) and
+	# masknmf's xarray-compatability branch. mbo-fastplotlib must NOT be
+	# installed alongside — both dists own the `fastplotlib` import package.
+	"fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@ff32546722af09081833640c4e7957f7d3e648aa",
 	# [multisession] is required: the branch imports roicat at module load
 	"masknmf[multisession] @ git+https://github.com/apasarkar/masknmf-toolbox.git@xarray-compatability",
 	# torch/torchvision deliberately unpinned: the right CUDA build is

@@ -1,3 +1,4 @@
+import math
 import os
 from collections import defaultdict
 from time import perf_counter
@@ -22,6 +23,10 @@ class ImageWidgetSliders(EdgeWindow):
         # framerate converted to frame time
         self._frame_time: dict[str, float] = defaultdict(lambda: 1 / 20)
 
+        # dims whose fps the user typed explicitly — metadata seeding
+        # (seed_fps) never overrides these
+        self._user_fps: set[str] = set()
+
         # last timepoint that a frame was displayed from a given dimension
         self._last_frame_time: dict[str, float] = defaultdict(float)
 
@@ -31,6 +36,26 @@ class ImageWidgetSliders(EdgeWindow):
             if os.environ["RTD_BUILD"] == "1":
                 self._playing["t"] = True
                 self._loop = True
+
+    def seed_fps(self, dim: str, fps) -> None:
+        """seed the playback rate for a dim from data metadata.
+
+        ignores None/non-numeric/non-finite/<=0 values, clamps to the
+        slider's [1, 50] range, and never overrides an fps the user typed
+        themselves.
+        """
+        if fps is None or dim in self._user_fps:
+            return
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            return
+        # nan slips past `<= 0` and int(round(nan)) raises; inf overflows
+        if fps <= 0 or not math.isfinite(fps):
+            return
+        value = min(max(int(round(fps)), 1), 50)
+        self._fps[dim] = value
+        self._frame_time[dim] = 1 / value
 
     def set_index(self, dim: str, index: int):
         """set the current_index of the ImageWidget"""
@@ -152,6 +177,7 @@ class ImageWidgetSliders(EdgeWindow):
                     value = 50
                 self._fps[dim] = value
                 self._frame_time[dim] = 1 / value
+                self._user_fps.add(dim)
 
             val = self._image_widget.current_index[dim]
             vmax = self._image_widget._dims_max_bounds[dim] - 1
