@@ -68,9 +68,9 @@ def source_reader_kwargs(arr) -> dict:
 
     Most arrays are fully determined by their path and return ``{}``. Formats
     whose file holds several independent datasets (``.mesc``, one array per
-    measurement unit) return the selector, so a task that re-opens the path in
-    a worker process gets the same data the user is looking at rather than the
-    file's default.
+    measurement unit; ``.h5``, one array per HDF5 dataset) return the
+    selector, so a task that re-opens the path in a worker process gets the
+    same data the user is looking at rather than the file's default.
     """
     return dict(getattr(arr, "reader_kwargs", None) or {})
 
@@ -158,6 +158,13 @@ def imread(
         feeding multi-channel sources into pipelines that expect TZYX
         input. Subprocess workers can re-create the same view by passing
         ``reader_kwargs={"channel": N}`` to ``imread``.
+    dataset : str, optional
+        HDF5 dataset to open (``.h5`` inputs only), nested paths accepted
+        (e.g. ``"imaging/data"``). When omitted, common names are probed
+        and the largest >=3D dataset is the fallback. Like the ``.mesc``
+        ``unit`` selector, it round-trips through
+        ``source_reader_kwargs(arr)`` so a worker process re-opens the
+        same dataset the user picked.
     **kwargs
         Extra keyword arguments passed to specific array readers.
 

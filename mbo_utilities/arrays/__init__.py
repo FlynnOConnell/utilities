@@ -85,7 +85,10 @@ if TYPE_CHECKING:
         with_axial_shifts as with_axial_shifts,
     )
     from mbo_utilities.arrays.bin import BinArray as BinArray
-    from mbo_utilities.arrays.h5 import H5Array as H5Array
+    from mbo_utilities.arrays.h5 import (
+        H5Array as H5Array,
+        list_h5_datasets as list_h5_datasets,
+    )
     from mbo_utilities.arrays.mesc import (
         MescArray as MescArray,
         list_mesc_units as list_mesc_units,
@@ -121,6 +124,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     # array classes
     "Suite2pArray": (".suite2p", "Suite2pArray"),
     "H5Array": (".h5", "H5Array"),
+    "list_h5_datasets": (".h5", "list_h5_datasets"),
     "MescArray": (".mesc", "MescArray"),
     "list_mesc_units": (".mesc", "list_mesc_units"),
     "MP4Array": (".mp4", "MP4Array"),
@@ -221,6 +225,7 @@ __all__ = [
     # Features subpackage
     "features",
     "isoview_to_ome_zarr",
+    "list_h5_datasets",
     "list_mesc_units",
     "iter_rois",
     "normalize_roi",

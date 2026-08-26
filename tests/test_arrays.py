@@ -199,6 +199,211 @@ class TestH5Array:
         assert sliced.shape == expected_data[1:4].shape
         assert np.array_equal(sliced, expected_data[1:4])
 
+    def test_nested_autodetect(self, tmp_path):
+        """A file whose only dataset is nested ('imaging/data') opens without
+        an explicit dataset kwarg and maps (T,Z,Y,X,C) onto TCZYX."""
+        import h5py
+
+        p = tmp_path / "nested.h5"
+        data = np.random.randint(0, 100, (10, 1, 8, 6, 1)).astype(np.int16)
+        with h5py.File(p, "w") as f:
+            f.create_dataset("imaging/data", data=data)
+
+        arr = H5Array(p)
+        assert arr.dataset_name == "imaging/data"
+        assert arr.shape == (10, 1, 1, 8, 6)
+        assert np.array_equal(arr[0, 0, 0], data[0, 0, :, :, 0])
+
+    def test_group_named_data_not_selected(self, tmp_path):
+        """A GROUP named 'data' must not satisfy the preferred-key probe."""
+        import h5py
+
+        p = tmp_path / "groupdata.h5"
+        with h5py.File(p, "w") as f:
+            f.create_dataset("data/x", data=np.zeros((4, 4)))
+            f.create_dataset("other", data=np.random.rand(5, 6, 7))
+
+        arr = H5Array(p)
+        assert arr.dataset_name == "other"
+        assert arr.shape == (5, 1, 1, 6, 7)
+
+    def test_group_sorting_first_regression(self, tmp_path):
+        """A group that sorts before the real dataset previously crashed the
+        old first-key fallback with an AttributeError."""
+        import h5py
+
+        p = tmp_path / "groupfirst.h5"
+        with h5py.File(p, "w") as f:
+            f.create_dataset("aaa/member", data=np.zeros((2, 2)))
+            f.create_dataset("zzz", data=np.random.rand(5, 4, 4))
+
+        arr = H5Array(p)
+        assert arr.dataset_name == "zzz"
+        assert arr.shape == (5, 1, 1, 4, 4)
+
+    def test_channels_last_line_scan(self, tmp_path):
+        """(T,Y,X,C) dataset with scan_mode + matching n_channel attrs maps
+        the last axis to C, not Z."""
+        import h5py
+
+        p = tmp_path / "line.h5"
+        raw = np.random.randint(0, 1000, (50, 1, 20, 2)).astype(np.uint16)
+        with h5py.File(p, "w") as f:
+            d = f.create_dataset("raw", data=raw)
+            d.attrs["scan_mode"] = "multiROILineScan"
+            d.attrs["n_channel"] = 2
+
+        arr = H5Array(p)
+        assert arr.dataset_name == "raw"
+        assert arr.shape == (50, 2, 1, 1, 20)
+
+        frame = arr[0, 0, 0]
+        assert frame.shape == (1, 20)
+        assert np.array_equal(frame, raw[0, :, :, 0])
+
+        chan1 = arr[:, 1, 0]
+        assert np.array_equal(chan1, raw[..., 1])
+
+    def test_largest_3d_fallback_warns(self, tmp_path, caplog):
+        """No preferred names -> largest >=3D dataset wins, with a warning
+        that names the choice and the dataset= override."""
+        import h5py
+        import logging
+        from mbo_utilities import log as mbo_log
+
+        p = tmp_path / "fallback.h5"
+        with h5py.File(p, "w") as f:
+            f.create_dataset("small", data=np.random.rand(5, 4, 4))
+            f.create_dataset("big", data=np.random.rand(10, 8, 8))
+
+        h5_logger = mbo_log.get("arrays.h5")
+        h5_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.WARNING, logger="mbo.arrays.h5"):
+                arr = H5Array(p)
+        finally:
+            h5_logger.removeHandler(caplog.handler)
+
+        assert arr.dataset_name == "big"
+        warning = "\n".join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert "big" in warning
+        assert "small" in warning
+        assert "dataset=" in warning
+
+    def test_explicit_miss_lists_nested_paths(self, tmp_path):
+        """Explicit dataset miss reports full nested dataset paths."""
+        import h5py
+
+        p = tmp_path / "miss.h5"
+        with h5py.File(p, "w") as f:
+            f.create_dataset("grp/inner", data=np.zeros((3, 4, 4)))
+
+        with pytest.raises(KeyError, match="grp/inner"):
+            H5Array(p, dataset="nope")
+
+    def test_reader_kwargs_roundtrip(self, tmp_path):
+        """dataset selection survives source_reader_kwargs -> imread."""
+        import h5py
+        from mbo_utilities.reader import imread, source_reader_kwargs
+
+        p = tmp_path / "roundtrip.h5"
+        with h5py.File(p, "w") as f:
+            f.create_dataset("small", data=np.random.rand(5, 4, 4))
+            f.create_dataset("big", data=np.random.rand(10, 8, 8))
+
+        a = imread(p, dataset="small")
+        assert source_reader_kwargs(a) == {"dataset": "small"}
+
+        b = imread(p, **source_reader_kwargs(a))
+        assert b.dataset_name == "small"
+
+    def test_metadata_group_and_dataset_attrs(self, tmp_path):
+        """Parent group attrs and dataset attrs feed metadata; canonical
+        params resolve through registered aliases."""
+        import h5py
+        from mbo_utilities.metadata import get_param
+
+        p = tmp_path / "md.h5"
+        with h5py.File(p, "w") as f:
+            f.create_dataset(
+                "imaging/data", data=np.zeros((5, 1, 4, 4, 1), dtype=np.int16)
+            )
+            f["imaging"].attrs["frame_rate_hz"] = 19.6568
+
+        arr = H5Array(p)
+        md = arr.metadata
+        assert get_param(md, "fs") == pytest.approx(19.6568)
+        assert md["h5_dataset"] == "imaging/data"
+        assert md["h5_raw_dims"] == "TZYXC"
+        assert any(d["key"] == "imaging/data" for d in md["h5_datasets"])
+
+        p2 = tmp_path / "md2.h5"
+        with h5py.File(p2, "w") as f:
+            d = f.create_dataset("raw", data=np.zeros((5, 1, 4, 2), dtype=np.uint16))
+            d.attrs["scan_mode"] = "multiROILineScan"
+            d.attrs["n_channel"] = 2
+            d.attrs["frame_period"] = 0.0006
+
+        md2 = H5Array(p2).metadata
+        assert get_param(md2, "fs") == pytest.approx(1666.667, rel=1e-4)
+        assert md2["h5_raw_dims"] == "TYXC"
+
+    def test_empty_dataset_skipped(self, tmp_path):
+        """An h5py.Empty (null dataspace) dataset must not break opening the
+        file or enumerating its datasets."""
+        import h5py
+        from mbo_utilities.arrays.h5 import list_h5_datasets
+
+        p = tmp_path / "with_empty.h5"
+        data = np.random.randint(0, 100, (5, 4, 4)).astype(np.int16)
+        with h5py.File(p, "w") as f:
+            f.create_dataset("empty", data=h5py.Empty("f4"))
+            f.create_dataset("mov", data=data)
+
+        arr = H5Array(p)
+        assert arr.dataset_name == "mov"
+        assert arr.shape == (5, 1, 1, 4, 4)
+        assert np.array_equal(arr[0, 0, 0], data[0])
+
+        keys = [d["key"] for d in list_h5_datasets(p)]
+        assert "empty" not in keys
+        assert "mov" in keys
+
+    def test_permuted_too_many_indices_raises(self, tmp_path):
+        """The permuted (T,Y,X,C) path rejects keys with more than 5 entries
+        instead of silently ignoring the extras."""
+        import h5py
+
+        p = tmp_path / "permuted.h5"
+        raw = np.random.randint(0, 1000, (5, 3, 4, 2)).astype(np.uint16)
+        with h5py.File(p, "w") as f:
+            d = f.create_dataset("raw", data=raw)
+            d.attrs["scan_mode"] = "multiROILineScan"
+            d.attrs["n_channel"] = 2
+
+        arr = H5Array(p)
+        assert arr.metadata["h5_raw_dims"] == "TYXC"
+        with pytest.raises(IndexError, match="too many indices"):
+            arr[0, 0, 0, 0, 0, 0]
+
+    def test_more_than_5d_raises_at_open(self, tmp_path):
+        """A >5D dataset fails fast at open with a clear error, and the file
+        handle is released on the raise."""
+        import h5py
+
+        p = tmp_path / "sixd.h5"
+        with h5py.File(p, "w") as f:
+            f.create_dataset("mov", data=np.zeros((2, 2, 2, 2, 2, 2), dtype=np.int16))
+
+        with pytest.raises(ValueError, match="6 dimensions.*up to 5"):
+            H5Array(p)
+
+        # handle must be closed: re-opening writable would fail if it leaked
+        with h5py.File(p, "a"):
+            pass
+
 
 class TestZarrArray:
     """Test ZarrArray class."""
