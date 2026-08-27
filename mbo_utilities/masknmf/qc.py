@@ -42,12 +42,6 @@ _LSP_RENAMES = {
     "02_max_projection.png": "03_registered_max_projection.png",
     "02_max_projection_segmentation.png": "03_registered_max_projection_footprints.png",
     "05_quality_diagnostics.png": "07_roi_quality_metrics.png",
-    "07a_traces_raw_20.png": "08a_demixed_traces_20.png",
-    "07b_traces_raw_50.png": "08b_demixed_traces_50.png",
-    "07c_traces_raw_100.png": "08c_demixed_traces_100.png",
-    "08a_traces_norm_20.png": "09a_demixed_traces_zscore_20.png",
-    "08b_traces_norm_50.png": "09b_demixed_traces_zscore_50.png",
-    "08c_traces_norm_100.png": "09c_demixed_traces_zscore_100.png",
     "13_regional_zoom.png": "12_footprints_regional_zoom.png",
 }
 
@@ -63,6 +57,16 @@ _LSP_DROP = (
     "09_traces_rejected.png",
     "10_shot_noise_accepted.png",
     "11_shot_noise_rejected.png",
+    # lsp's own trace stacks. Its "raw" panel labels the y-axis "a.u." and its
+    # "norm" panel is a z-score or a rolling-percentile dF/F — none of which
+    # is masknmf's format. `plot_demixed_traces` redraws them with the same
+    # `lsp.plot_traces` styling but calibrated dF/F on the axis.
+    "07a_traces_raw_20.png",
+    "07b_traces_raw_50.png",
+    "07c_traces_raw_100.png",
+    "08a_traces_norm_20.png",
+    "08b_traces_norm_50.png",
+    "08c_traces_norm_100.png",
 )
 
 _NATIVE_FIGURES = (
@@ -72,6 +76,9 @@ _NATIVE_FIGURES = (
     "04_registration_shifts.png",
     "05_pmd_basis_diagnostics.png",
     "06_footprint_coverage.png",
+    "08a_demixed_traces_dff_20.png",
+    "08b_demixed_traces_dff_50.png",
+    "08c_demixed_traces_dff_100.png",
     "10_demixed_traces_dff.png",
     "11_roi_signal_decomposition.png",
 )
@@ -99,6 +106,13 @@ _LEGACY_FIGURES = (
     "13_demixed_traces_dff.png",
     "14_roi_signal_decomposition.png",
     "15_footprints_regional_zoom.png",
+    # the raw-"a.u." / z-score trace stacks, before calibration
+    "08a_demixed_traces_20.png",
+    "08b_demixed_traces_50.png",
+    "08c_demixed_traces_100.png",
+    "09a_demixed_traces_zscore_20.png",
+    "09b_demixed_traces_zscore_50.png",
+    "09c_demixed_traces_zscore_100.png",
 )
 
 
@@ -434,6 +448,99 @@ def plot_roi_signal_decomposition(
 # --------------------------------------------------------------------------
 
 
+def _calibrated_dff(results, pmd):
+    """``(dff, peak, gain, f0)`` — dF/F in percent, shape (K, T).
+
+    Shares :func:`mbo_utilities.masknmf.outputs.roi_calibration` with the
+    sidecar writer, so these figures and ``norm_traces.npy`` are the same
+    numbers. Demixed ``c`` has no physical unit of its own: masknmf runs on
+    ``(movie - mean_img) / var_img`` and HALS never renormalises ``a`` or
+    ``c``, so only the product is identified. The calibration moves the
+    amplitude into ``a``'s units and takes F0 from masknmf's static ``b``.
+    """
+    from mbo_utilities.masknmf import outputs as _outputs
+
+    pix, roi, lam = _sparse_footprints(results)
+    c = _np(results.c)  # (T, K)
+    n_rois = c.shape[1]
+    footprints = _outputs.split_sparse_footprints(
+        np.stack([pix, roi]), lam, n_rois
+    )
+    gain, f0 = _outputs.roi_calibration(
+        footprints,
+        var_img=_np(pmd.var_img),
+        mean_img=_np(pmd.mean_img),
+        baseline=_np(getattr(results, "b", None)),
+    )
+    _, dff = _outputs.calibrated_traces(c, gain, f0)
+    return dff, dff.max(axis=1), gain, f0
+
+
+def _dff_footer(gain, f0, fs):
+    n_bad = int((f0 <= 0).sum())
+    txt = (
+        "dF/F = c * gain / F0    "
+        "gain = mean_support(a * var_img)    "
+        "F0 = mean_support(b * var_img + mean_img)"
+    )
+    if fs:
+        txt += f"    fs={fs:.2f}Hz"
+    if n_bad:
+        txt += f"    [{n_bad} ROI(s) with F0<=0 shown as flat]"
+    return txt
+
+
+def plot_demixed_traces(
+    plane_dir: Path,
+    results,
+    pmd,
+    fs: float | None = None,
+    counts=(20, 50, 100),
+):
+    """Stacked trace panels in lsp's ``plot_traces`` style, on calibrated dF/F.
+
+    The styling, layout, colour permutation and scale bars are lsp's — this
+    calls straight into ``lbm_suite2p_python.zplane.plot_traces``. Only the
+    array and the unit label change: percent dF/F instead of the "a.u." raw
+    panel and the z-score norm panel lsp draws by default, neither of which
+    means anything for a nonnegative NMF component whose baseline already
+    lives in a separate term.
+
+    Sorted by peak dF/F rather than lsp's ``compute_trace_quality_score``,
+    whose shot-noise term assumes a raw pixel average.
+    """
+    from lbm_suite2p_python.zplane import plot_traces
+
+    dff, peak, gain, f0 = _calibrated_dff(results, pmd)
+    n_rois = dff.shape[0]
+    if n_rois == 0:
+        return
+    dff_sorted = dff[np.argsort(-peak)]
+    footer = _dff_footer(gain, f0, fs)
+    names = (
+        "08a_demixed_traces_dff_20.png",
+        "08b_demixed_traces_dff_50.png",
+        "08c_demixed_traces_dff_100.png",
+    )
+    for n_cells, name in zip(counts, names):
+        # smallest count always renders, even with fewer ROIs than requested
+        if n_rois < n_cells and n_cells != counts[0]:
+            continue
+        shown = min(n_cells, n_rois)
+        plot_traces(
+            dff_sorted,
+            save_path=Path(plane_dir) / name,
+            num_neurons=shown,
+            fps=fs or 1.0,
+            scale_bar_unit=r"% $\Delta$F/F$_0$",
+            title=(
+                rf"Top {shown} Demixed Signals by Peak $\Delta$F/F "
+                f"(n={n_rois} total)"
+            ),
+            fig_text=footer,
+        )
+
+
 def plot_calibrated_dff(
     plane_dir: Path,
     results,
@@ -442,37 +549,16 @@ def plot_calibrated_dff(
     n_traces: int = 20,
     save_name="10_demixed_traces_dff.png",
 ):
-    """dF/F with a real F0, recovered from the PMD standardisation.
+    """dF/F overview: the top traces beside the amplitude distribution.
 
-    The demixer runs on ``(movie - mean_img) / var_img``, so ``c`` is in
-    standardised units and ``F.npy`` carries no F0 — a percentile baseline of
-    a nonnegative component is ~0, which is why a generic percentile-dF/F path
-    ends up dividing by its epsilon guard. Undoing the standardisation per ROI
-    with the lam-weighted PMD images restores movie units::
-
-        gain_k = sum(lam * var_img) / sum(lam)      # amplitude scale
-        F0_k   = sum(lam * mean_img) / sum(lam)     # baseline
-        dF/F   = c_k * gain_k / F0_k
+    Companion to :func:`plot_demixed_traces` — same numbers, but the paired
+    histogram shows whether the population is a few bright sources or a broad
+    spread, which the stacked panels cannot.
     """
     plt = _agg_plt()
-    pix, roi, lam = _sparse_footprints(results)
-    mean_img = _np(pmd.mean_img).ravel()
-    var_img = _np(pmd.var_img).ravel()
-    c = _np(results.c)  # (T, K)
-    n_rois = c.shape[1]
-
-    lam_sum = np.zeros(n_rois)
-    gain = np.zeros(n_rois)
-    f0 = np.zeros(n_rois)
-    np.add.at(lam_sum, roi, lam)
-    np.add.at(gain, roi, lam * var_img[pix])
-    np.add.at(f0, roi, lam * mean_img[pix])
-    ok = lam_sum > 0
-    gain[ok] /= lam_sum[ok]
-    f0[ok] /= lam_sum[ok]
-
-    dff = (c.T * gain[:, None]) / np.maximum(f0, 1e-6)[:, None] * 100.0
-    peak = dff.max(axis=1)
+    dff, peak, gain, f0 = _calibrated_dff(results, pmd)
+    if dff.shape[0] == 0:
+        return
     order = np.argsort(-peak)[:n_traces]
 
     n_t = dff.shape[1]
@@ -516,9 +602,9 @@ def plot_calibrated_dff(
     _dark(ax)
 
     fig.suptitle(
-        f"Calibrated dF/F — median peak {np.median(peak):.0f}%, "
+        f"Calibrated dF/F - median peak {np.median(peak):.0f}%, "
         f"p90 {np.percentile(peak, 90):.0f}%   "
-        "(F0 and gain from lam-weighted PMD mean / noise images)",
+        "(gain and F0 from the PMD standardisation and masknmf's static b)",
         color=_FIG_FG,
         fontsize=12,
         fontweight="bold",
@@ -693,7 +779,10 @@ def plot_plane_figures(
         def _zplane_figs():
             from lbm_suite2p_python.zplane import plot_zplane_figures
 
-            plot_zplane_figures(plane_dir, norm_method="zscore", correct_neuropil=False)
+            # norm_method only drives lsp's own trace panels, which _LSP_DROP
+            # removes in favour of plot_demixed_traces. Kept at "dff" so the
+            # label lsp bakes into anything else it draws is the honest one.
+            plot_zplane_figures(plane_dir, norm_method="dff", correct_neuropil=False)
 
         _try(logger, "roi stats", _roi_stats)
         _try(logger, "zplane figures", _zplane_figs)
@@ -754,6 +843,16 @@ def plot_plane_figures(
             fs,
         )
         if pmd is not None:
+            if _has_lsp():
+                _try(
+                    logger,
+                    "demixed trace panels",
+                    plot_demixed_traces,
+                    plane_dir,
+                    results,
+                    pmd,
+                    fs,
+                )
             _try(logger, "calibrated dff", plot_calibrated_dff, plane_dir, results, pmd, fs)
 
     if pmd is not None:

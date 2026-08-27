@@ -109,31 +109,85 @@ def test_roi_stat_coordinates():
     assert stat["med"] == (2.0, 3.0)
 
 
-def test_roi_baselines_weighted():
+def test_roi_calibration_unweighted_over_support():
+    """masknmf's convention: mean over the support, not a lam-weighted mean."""
     indices, values, shape = _toy_footprints()
     per_roi = outputs.split_sparse_footprints(indices, values, 2)
-    baseline = np.arange(20, dtype=np.float32)  # flat (pixels,)
-    b = outputs.roi_baselines(per_roi, baseline)
-    # roi0: (0*0.5 + 1*1.0) / 1.5
-    np.testing.assert_allclose(b[0], 1.0 / 1.5, rtol=1e-6)
-    np.testing.assert_allclose(b[1], 13.0)
+    n_pix = shape[0] * shape[1]
+    var_img = np.full(n_pix, 2.0, dtype=np.float32)
+    mean_img = np.arange(n_pix, dtype=np.float32)
+    baseline = np.ones(n_pix, dtype=np.float32)
+
+    gain, f0 = outputs.roi_calibration(
+        per_roi, var_img=var_img, mean_img=mean_img, baseline=baseline
+    )
+    # roi0 lam = [0.5, 1.0] on pixels [0, 1]; gain = mean(lam * 2) = 1.5
+    np.testing.assert_allclose(gain[0], 1.5, rtol=1e-6)
+    # roi1 lam = [2.0] on pixel 13; gain = 2.0 * 2 = 4.0
+    np.testing.assert_allclose(gain[1], 4.0, rtol=1e-6)
+    # F0 = mean_support(b * var_img + mean_img); roi0 -> mean([2+0, 2+1]) = 2.5
+    np.testing.assert_allclose(f0[0], 2.5, rtol=1e-6)
+    np.testing.assert_allclose(f0[1], 2.0 + 13.0, rtol=1e-6)
+
+
+def test_roi_calibration_defaults_are_inert():
+    """No PMD images -> gain is the mean lam and F0 is 0 (uncalibrated)."""
+    indices, values, shape = _toy_footprints()
+    per_roi = outputs.split_sparse_footprints(indices, values, 2)
+    gain, f0 = outputs.roi_calibration(per_roi)
+    np.testing.assert_allclose(gain[0], 0.75, rtol=1e-6)  # mean([0.5, 1.0])
+    np.testing.assert_allclose(gain[1], 2.0, rtol=1e-6)
+    assert (f0 == 0).all()
+
+
+def test_calibrated_traces_zeroes_uncalibrated_rois():
+    c = np.ones((10, 2), dtype=np.float32)
+    gain = np.array([2.0, 3.0], dtype=np.float32)
+    f0 = np.array([50.0, 0.0], dtype=np.float32)  # roi1 has no usable F0
+    F, dff = outputs.calibrated_traces(c, gain, f0)
+    np.testing.assert_allclose(F[0], 52.0, rtol=1e-6)
+    np.testing.assert_allclose(F[1], 3.0, rtol=1e-6)
+    np.testing.assert_allclose(dff[0], 4.0, rtol=1e-6)  # 2/50 -> 4%
+    assert (dff[1] == 0).all()
 
 
 def test_write_plane_outputs(tmp_path):
     indices, values, shape = _toy_footprints()
-    c = np.vstack([np.sin(np.linspace(0, 6, 50)), np.ones(50)]).T.astype(np.float32)
+    n_pix = shape[0] * shape[1]
+    # real demixed c is nonnegative (c_nonneg=True) with the baseline already
+    # factored out into b, which is what makes dF/F well posed here
+    c = np.vstack(
+        [np.abs(np.sin(np.linspace(0, 6, 50))), np.ones(50)]
+    ).T.astype(np.float32)
     info = outputs.write_plane_outputs(
-        tmp_path, indices=indices, values=values, c=c, shape=shape, baseline=None
+        tmp_path,
+        indices=indices,
+        values=values,
+        c=c,
+        shape=shape,
+        baseline=np.ones(n_pix, dtype=np.float32),
+        var_img=np.full(n_pix, 2.0, dtype=np.float32),
+        mean_img=np.full(n_pix, 100.0, dtype=np.float32),
     )
     assert info["n_rois"] == 2
+    assert info["n_calibrated"] == 2
     stat = np.load(tmp_path / "stat.npy", allow_pickle=True)
     iscell = np.load(tmp_path / "iscell.npy")
     F = np.load(tmp_path / "F.npy")
+    norm = np.load(tmp_path / "norm_traces.npy")
     assert len(stat) == 2
     assert iscell.shape == (2, 2)
     assert (iscell[:, 0] == 1).all()
     assert F.shape == (2, 50)
-    for name in ("Fneu.npy", "spks.npy", "norm_traces.npy"):
+    # F is calibrated into movie units, so it sits on the F0 = 102 baseline
+    # rather than hovering around 0 the way standardised c does.
+    assert F.min() > 90.0
+    # norm_traces is dF/F in percent against that F0, not a z-score: a
+    # nonnegative trace stays nonnegative and is not centred on 0.
+    assert norm.shape == (2, 50)
+    assert norm.min() >= 0.0
+    np.testing.assert_allclose(norm, (F - 102.0) / 102.0 * 100.0, atol=1e-4)
+    for name in ("Fneu.npy", "spks.npy"):
         assert (tmp_path / name).exists()
 
 

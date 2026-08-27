@@ -280,7 +280,7 @@ def main(
     if first_run:
         _mark_initialized()
 
-    run_gui(data_in=None, roi=None, widget=True, metadata_only=False)
+    run_gui(data_in=None, roi=None, widget="preview", metadata_only=False)
 
 
 @main.command()
@@ -292,9 +292,16 @@ def main(
     help="ROI index (can pass multiple: --roi 0 --roi 2).",
 )
 @click.option(
-    "--widget/--no-widget",
-    default=True,
-    help="Enable/disable PreviewDataWidget for Raw ScanImage tiffs.",
+    "--widget",
+    is_flag=False,
+    flag_value="preview",
+    default="preview",
+    help="Side widget to attach: 'preview' (default) or 'manualroi'.",
+)
+@click.option(
+    "--no-widget",
+    is_flag=True,
+    help="Open the viewer with no side widget.",
 )
 @click.option(
     "--metadata",
@@ -321,7 +328,8 @@ def main(
     is_flag=True,
     help="List available GPU adapters and exit.",
 )
-def view(data_in=None, roi=None, widget=True, metadata=False, unit=None, gpu_index=None, list_gpus=False):
+def view(data_in=None, roi=None, widget="preview", no_widget=False, metadata=False,
+         unit=None, gpu_index=None, list_gpus=False):
     r"""
     Open imaging data in the GUI viewer.
 
@@ -331,6 +339,7 @@ def view(data_in=None, roi=None, widget=True, metadata=False, unit=None, gpu_ind
       mbo view /data/raw.tiff        Open specific file
       mbo view /data/raw --metadata  Show only metadata
       mbo view /data --roi 0 --roi 2 View specific ROIs
+      mbo view /data --widget manualroi  Draw ROIs by hand
       mbo view /data/scan.mesc --unit 2   Open one MESc measurement unit
       mbo view --list-gpus           Show available GPU adapters
       mbo view /data/raw --gpu 0     Force GPU index 0
@@ -383,7 +392,7 @@ def view(data_in=None, roi=None, widget=True, metadata=False, unit=None, gpu_ind
     run_gui(
         data_in=data_in,
         roi=roi if roi else None,
-        widget=widget,
+        widget="none" if no_widget else widget,
         metadata_only=metadata,
         unit=_parse_unit(unit),
     )

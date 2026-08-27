@@ -8,6 +8,13 @@ detection are all filename-coupled, not class-coupled.
 
 Everything here is numpy-only; the runner extracts tensors from masknmf
 objects before calling in.
+
+The suite2p *filenames* are matched; the suite2p *semantics* are not, and
+where they conflict masknmf wins. ``F.npy`` is calibrated back to movie
+units from the PMD standardisation rather than being a raw pixel average,
+``norm_traces.npy`` is dF/F against masknmf's static baseline rather than a
+z-score or a rolling percentile, and ``Fneu``/``spks`` are zeros because
+there is no neuropil trace and no deconvolution. See ``roi_calibration``.
 """
 
 from pathlib import Path
@@ -73,27 +80,85 @@ def roi_stat(
     }
 
 
-def roi_baselines(
-    footprints: list[tuple[np.ndarray, np.ndarray]], baseline: np.ndarray | None
-) -> np.ndarray:
-    """Per-ROI static-background level: lam-weighted mean of ``baseline``.
+def roi_calibration(
+    footprints: list[tuple[np.ndarray, np.ndarray]],
+    *,
+    var_img: np.ndarray | None = None,
+    mean_img: np.ndarray | None = None,
+    baseline: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-ROI ``(gain, F0)`` that undo the PMD standardisation.
 
-    Demixed temporal components are baseline-subtracted; adding this back
-    gives F traces with a realistic F0 so percentile dF/F stays finite.
+    masknmf demixes ``(movie - mean_img) / var_img`` — and ``var_img`` is the
+    per-pixel noise *std*, not a variance — so ``c`` is in noise-SD units.
+    Worse, HALS never renormalises ``a`` or ``c``, so only the product
+    ``a_k c_k`` is identified: the amplitude split between the two factors is
+    whatever initialisation handed the solver. Raw ``c`` amplitudes are
+    therefore not comparable across ROIs and carry no physical unit.
+
+    Calibration fixes that gauge by moving the amplitude into ``a``'s physical
+    units and reading F0 off masknmf's own static baseline ``b`` (the term the
+    demixer already factored out of the traces)::
+
+        gain_k = mean_support(a_k * var_img)
+        F0_k   = mean_support(b * var_img + mean_img)
+        F_k    = c_k * gain_k + F0_k              # movie units
+        dFF_k  = c_k * gain_k / F0_k              # unitless
+
+    This is masknmf's own ``produce_baseline_corrected_outputs`` convention:
+    an *unweighted* mean over each footprint's support, not a lam-weighted
+    one. Keeping it identical means traces here and traces from a direct
+    masknmf script agree numerically.
+
+    Missing inputs degrade gracefully: no ``var_img`` leaves ``gain`` as the
+    mean lam (standardised units), and no ``mean_img``/``baseline`` leaves
+    ``F0`` at 0, which callers must treat as "not calibrated".
     """
     n = len(footprints)
-    out = np.zeros(n, dtype=np.float32)
-    if baseline is None:
-        return out
-    flat = np.asarray(baseline, dtype=np.float32).ravel()
+    gain = np.ones(n, dtype=np.float32)
+    f0 = np.zeros(n, dtype=np.float32)
+
+    var = None if var_img is None else np.asarray(var_img, dtype=np.float64).ravel()
+    mean = None if mean_img is None else np.asarray(mean_img, dtype=np.float64).ravel()
+    base = None if baseline is None else np.asarray(baseline, dtype=np.float64).ravel()
+
     for k, (pix, lam) in enumerate(footprints):
         if pix.size == 0:
             continue
-        w = lam.astype(np.float64)
-        s = w.sum()
-        if s > 0:
-            out[k] = float((flat[pix.astype(np.int64)] * w).sum() / s)
-    return out
+        idx = pix.astype(np.int64)
+        scale = lam.astype(np.float64)
+        if var is not None:
+            scale = scale * var[idx]
+        gain[k] = float(scale.mean())
+
+        level = np.zeros(idx.size, dtype=np.float64)
+        if base is not None:
+            level += base[idx] * (var[idx] if var is not None else 1.0)
+        if mean is not None:
+            level += mean[idx]
+        f0[k] = float(level.mean())
+
+    return gain, f0
+
+
+def calibrated_traces(
+    c: np.ndarray,
+    gain: np.ndarray,
+    f0: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(F, dff)`` from demixed ``c`` (T, K) and a :func:`roi_calibration`.
+
+    ``F`` is (K, T) in movie units; ``dff`` is (K, T) in percent, zeroed for
+    any ROI whose F0 is non-positive (uncalibrated, or a footprint sitting on
+    dead pixels) so a bogus baseline never manufactures a huge transient.
+    """
+    amp = np.ascontiguousarray(c.T, dtype=np.float32) * gain[:, None]
+    F = amp + f0[:, None]
+    dff = np.zeros_like(amp)
+    ok = f0 > 0
+    if ok.any():
+        dff[ok] = amp[ok] / f0[ok, None] * 100.0
+    return F.astype(np.float32), dff.astype(np.float32)
 
 
 def write_plane_outputs(
@@ -104,18 +169,35 @@ def write_plane_outputs(
     c: np.ndarray,
     shape: tuple[int, int],
     baseline: np.ndarray | None = None,
+    var_img: np.ndarray | None = None,
+    mean_img: np.ndarray | None = None,
 ) -> dict:
     """Write stat/iscell/F/Fneu/spks/norm_traces for one plane.
 
     ``c`` is (T, K) demixed traces; ``indices``/``values`` the COO spatial
-    footprints. Returns summary counts for logging/ops.
+    footprints; ``baseline`` masknmf's static ``b``; ``var_img``/``mean_img``
+    the PMD standardisation images.
+
+    ``F.npy`` is calibrated back to movie units and ``norm_traces.npy`` is
+    percent dF/F against masknmf's own F0 — *not* a z-score. A z-score would
+    subtract ``mean(c)``, but masknmf already factored the baseline out into
+    ``b``, so ``mean(c)`` is a function of how often the source was active,
+    not of resting fluorescence; and ``std(c)`` of a nonnegative, mostly-zero
+    trace measures its transients, not its noise (HALS pushed the noise into
+    the residual movie). Both would make cross-ROI and cross-channel
+    amplitudes depend on event rate. See :func:`roi_calibration`.
+
+    Returns summary counts for logging/ops.
     """
     plane_dir = Path(plane_dir)
     n_rois = int(c.shape[1]) if c.ndim == 2 else 0
     footprints = split_sparse_footprints(indices, values, n_rois)
 
-    F = np.ascontiguousarray(c.T, dtype=np.float32)
-    F += roi_baselines(footprints, baseline)[:, None]
+    gain, f0 = roi_calibration(
+        footprints, var_img=var_img, mean_img=mean_img, baseline=baseline
+    )
+    F, dff = calibrated_traces(c, gain, f0)
+    n_calibrated = int((f0 > 0).sum())
 
     stat = np.array(
         [
@@ -127,17 +209,13 @@ def write_plane_outputs(
     # masknmf has no accept/reject classifier: everything demixed is accepted
     iscell = np.ones((n_rois, 2), dtype=np.float32)
 
-    mu = F.mean(axis=1, keepdims=True)
-    sd = F.std(axis=1, keepdims=True)
-    norm = (F - mu) / np.maximum(sd, 1e-6)
-
     np.save(plane_dir / "stat.npy", stat)
     np.save(plane_dir / "iscell.npy", iscell)
     np.save(plane_dir / "F.npy", F)
     np.save(plane_dir / "Fneu.npy", np.zeros_like(F))
     np.save(plane_dir / "spks.npy", np.zeros_like(F))
-    np.save(plane_dir / "norm_traces.npy", norm.astype(np.float32))
-    return {"n_rois": n_rois}
+    np.save(plane_dir / "norm_traces.npy", dff)
+    return {"n_rois": n_rois, "n_calibrated": n_calibrated}
 
 
 def merge_ops(plane_dir: str | Path, updates: dict) -> dict:

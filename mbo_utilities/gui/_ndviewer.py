@@ -161,7 +161,35 @@ class MboNDImageProcessor(NDImageProcessor):
     lazy readers either reject or service pathologically (whole-file reads).
     This override reads ~64 whole 2D frames via fully scalar keys instead
     (see :func:`_sample_array`).
+
+    It also repairs the window indexer's stop bound (see
+    ``_get_slider_dims_indexer``).
     """
+
+    def _get_slider_dims_indexer(self, indices):
+        """Fix the exclusive stop bound of every windowed dim.
+
+        Upstream clamps a window's stop with ``min(shape[dim] - 1, stop)``.
+        A slice stop is exclusive, so at the last position of a windowed dim
+        the slice collapses to ``slice(n - 1, n - 1)`` — empty. A numpy array
+        then renders an all-NaN frame ("Mean of empty slice"); a lazy reader
+        returns something ``np.asarray`` folds to a 0-d object array, and the
+        fetch dies with "windowed_slice.ndim != len(spatial_dims): 0 != 2".
+
+        Recompute the stop against the correct bound. Calling super() first
+        keeps this a no-op once upstream clamps with ``shape[dim]``.
+        """
+        indexer = super()._get_slider_dims_indexer(indices)
+        for dim in set(self.slider_dims) - set(self.spatial_dims):
+            func, size = self.window_funcs.get(dim, (None, None))
+            if func is None or size is None or dim not in self.window_order:
+                continue
+            stop = self.slider_dim_transforms[dim](indices[dim] + size / 2)
+            start = indexer[dim].start
+            indexer[dim] = slice(
+                start, min(self.shape[dim], max(stop, start + 1)), 1
+            )
+        return indexer
 
     def _recompute_histogram(self):
         if not self._compute_histogram or self.data is None:

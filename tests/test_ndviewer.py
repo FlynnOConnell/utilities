@@ -804,6 +804,40 @@ class TestWindowSpanContract:
         finally:
             iw.close()
 
+    @pytest.mark.parametrize("size", [1, 3, 5])
+    def test_no_position_windows_to_an_empty_slice(self, size):
+        """Upstream clamps a window's *exclusive* stop to ``shape - 1``, so the
+        last position of a windowed dim collapsed to ``slice(n-1, n-1)``.
+        Every reference position must select at least one in-bounds frame.
+        """
+        base = self._ramp(n_t=12)
+        iw = _make_viewer(LazyStandIn(base), slider_dim_names=("Timepoint",))
+        try:
+            iw.window_funcs = {"t": (np.mean, size)}
+            proc = iw.ndgraphics[0].processor
+            for ref in range(1, 13):
+                sel = proc._get_slider_dims_indexer({"Timepoint": ref})["Timepoint"]
+                assert 0 <= sel.start < sel.stop <= 12, (ref, sel)
+        finally:
+            iw.close()
+
+    def test_last_frame_is_not_all_nan(self):
+        """The empty end-of-range slice rendered a NaN frame from a numpy array
+        and killed the fetch outright on a lazy reader
+        ("windowed_slice.ndim != len(spatial_dims): 0 != 2").
+        """
+        base = self._ramp(n_t=12)
+        iw = _make_viewer(LazyStandIn(base), slider_dim_names=("Timepoint",))
+        try:
+            iw.window_funcs = {"t": (np.mean, 1)}
+            iw.indices = [11]
+            drain()
+            got = np.asarray(iw.ndgraphics[0].graphic.data.value)
+            assert np.isfinite(got).all()
+            assert np.array_equal(got, base[11].astype(got.dtype))
+        finally:
+            iw.close()
+
     def test_t_mean_5_is_pixel_exact(self):
         base = self._ramp()
         iw = _make_viewer(LazyStandIn(base), slider_dim_names=("Timepoint",))

@@ -693,6 +693,8 @@ def run_plane(
     if results is not None:
         indices, values, baseline = _extract_footprints(results)
         c = np.asarray(results.ac_array.export_c(), dtype=np.float32)
+        # PMD standardisation images calibrate c back to movie units; without
+        # them F.npy stays in noise-SD units and dF/F cannot be formed.
         info = _outputs.write_plane_outputs(
             plane_dir,
             indices=indices,
@@ -700,9 +702,16 @@ def run_plane(
             c=c,
             shape=raw.shape[1:],
             baseline=baseline,
+            var_img=_to_np(getattr(pmd, "var_img", None)) if pmd is not None else None,
+            mean_img=_to_np(getattr(pmd, "mean_img", None)) if pmd is not None else None,
         )
         n_rois = info["n_rois"]
         logger.info(f"masknmf: plane {plane} -> {n_rois} ROIs")
+        if info["n_calibrated"] < n_rois:
+            logger.warning(
+                f"masknmf: plane {plane} - {n_rois - info['n_calibrated']}/{n_rois} "
+                "ROIs have no positive F0; their dF/F is written as zeros"
+            )
 
     vcorr = None
     if results is not None:

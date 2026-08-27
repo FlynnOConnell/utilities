@@ -487,7 +487,11 @@ class _ScrubTimingProxy:
 
 
 def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override=None):
-    """Create fastplotlib ImageWidget with optional PreviewDataWidget.
+    """Create fastplotlib ImageWidget with an optional side widget.
+
+    `widget` names which one to attach: "preview" (PreviewDataWidget),
+    "manualroi" (manual ROI drawing), or "none". True/False are the legacy
+    spellings of "preview"/"none".
 
     `figure_kwargs_override` replaces the auto-selected canvas/size dict (used by
     scripts/capture_docs.py to build an offscreen viewer for headless capture).
@@ -637,8 +641,10 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
         canvas.set_title(f"Miller Brain Studio v{__version__}")
     _set_qt_icon()
 
-    # Add PreviewDataWidget if requested
-    if widget:
+    # Attach the requested side widget
+    if isinstance(widget, bool) or widget is None:
+        widget = "preview" if widget else "none"
+    if widget == "preview":
         from mbo_utilities.gui.widgets.preview_data import PreviewDataWidget
 
         gui = PreviewDataWidget(
@@ -651,6 +657,14 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
         add_gui = getattr(iw.figure, "add_gui", None)
         if add_gui is not None:
             add_gui(gui)
+    elif widget == "manualroi":
+        from mbo_utilities.gui.manual_roi import ManualRoiWidget
+
+        ManualRoiWidget(iw, data_array.source_path)
+    elif widget != "none":
+        raise ValueError(
+            f"unknown widget {widget!r}, expected one of: preview, manualroi, none"
+        )
 
     return iw
 
@@ -669,7 +683,7 @@ def _is_jupyter() -> bool:
 def _run_gui_impl(
     data_in: str | Path | None = None,
     roi: int | tuple[int, ...] | None = None,
-    widget: bool = True,
+    widget: bool | str = True,
     metadata_only: bool = False,
     select_only: bool = False,
     show_splash: bool = False,
@@ -1402,7 +1416,7 @@ def _launch_napari(data_in, roi=None, unit=None):
 def run_gui(
     data_in: str | Path | None = None,
     roi: int | tuple[int, ...] | None = None,
-    widget: bool = True,
+    widget: bool | str = True,
     metadata_only: bool = False,
     select_only: bool = False,
     runner_params: Any | None = None,
@@ -1421,8 +1435,10 @@ def run_gui(
         Path to data file or directory. If None, shows file selection dialog.
     roi : int, tuple of int, optional
         ROI index(es) to display. None shows all ROIs for raw files.
-    widget : bool, default True
-        Enable PreviewDataWidget for raw ScanImage tiffs.
+    widget : bool or str, default True
+        Side widget to attach: ``"preview"`` (PreviewDataWidget, the default),
+        ``"manualroi"`` (manual ROI drawing) or ``"none"``. ``True``/``False``
+        are the legacy spellings of ``"preview"``/``"none"``.
     metadata_only : bool, default False
         If True, only show metadata inspector (no image viewer).
     select_only : bool, default False
@@ -1459,6 +1475,7 @@ def run_gui(
 
         mbo path/to/data.tif
         mbo path/to/data.tif --roi 1 --no-widget
+        mbo path/to/data.tif --widget manualroi
         mbo path/to/data.tif --metadata-only
         mbo --select-only
     """
