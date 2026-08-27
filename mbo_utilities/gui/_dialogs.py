@@ -354,13 +354,33 @@ def load_new_data(parent: Any, path: str):
     Uses iw.set_data() to swap data arrays, which handles shape changes.
     """
     from mbo_utilities.arrays import TiffArray
-    from mbo_utilities.gui.run_gui import _SqueezeSingletonDims, _ScrubTimingProxy
+    from mbo_utilities.gui.run_gui import (
+        _SqueezeSingletonDims,
+        _ScrubTimingProxy,
+        _find_demixing_results,
+        _open_curation_gui,
+    )
 
     path_obj = Path(path)
     if not path_obj.exists():
         parent.logger.error(f"Path does not exist: {path}")
         parent._load_status_msg = "Error: Path does not exist"
         parent._load_status_color = imgui.ImVec4(1.0, 0.3, 0.3, 1.0)
+        return
+
+    # masknmf demixing results open in masknmf's own curation GUI as a second
+    # window on the running loop, instead of being swapped into this viewer
+    demix_file = _find_demixing_results(path_obj)
+    if demix_file is not None:
+        try:
+            _open_curation_gui(demix_file)
+            parent.logger.info(f"Opened curation GUI for {demix_file}")
+            parent._load_status_msg = "Opened curation GUI"
+            parent._load_status_color = imgui.ImVec4(0.3, 1.0, 0.3, 1.0)
+        except Exception as e:
+            parent.logger.exception(f"Curation GUI failed: {e}")
+            parent._load_status_msg = f"Curation GUI failed: {e}"
+            parent._load_status_color = imgui.ImVec4(1.0, 0.3, 0.3, 1.0)
         return
 
     try:

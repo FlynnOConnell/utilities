@@ -7,8 +7,8 @@ against. These tests pin that contract end-to-end on a real offscreen
 figure: construction, the name/letter/positional ``indices`` semantics,
 data swaps (same-rank and rank-changing), window/spatial func routing
 through the per-graphic processors, both contrast resets, the playback-bar
-adapter (fps seeding, loop fan-out, the space-bar toggle), offscreen
-``close()``, and the ``MBO_LEGACY_IMAGE_WIDGET=1`` escape hatch.
+adapter (fps seeding, loop fan-out, the space-bar toggle), and offscreen
+``close()``.
 
 The offscreen backend renders headlessly but graphic data still updates
 asynchronously — index changes schedule fetches on the rendercanvas loop,
@@ -151,11 +151,10 @@ def viewer5d(base5d):
     Tests using it set whatever state they need and must not assume
     another test left indices/funcs untouched. Swap tests build their own.
     """
-    from mbo_utilities.gui._fpl_compat import create_image_widget
     from mbo_utilities.gui._ndviewer import MboNDViewer
 
     arr = LazyStandIn(base5d)
-    iw = create_image_widget(
+    iw = MboNDViewer(
         data=arr,
         slider_dim_names=NAMES,
         window_funcs=(np.mean, None, None),
@@ -206,12 +205,9 @@ class TestConstruction:
         assert hasattr(fig, "renderer") and hasattr(fig, "imgui_renderer")
         assert fig.canvas is not None
 
-    def test_colorbar_attached_and_patched(self, viewer5d):
+    def test_colorbar_attached(self, viewer5d):
         cb = viewer5d.ndgraphics[0].histogram_widget
         assert cb is not None
-        # the imgui-bundle 1.92.5 add_polyline arg-order patch must be live —
-        # without it the first histogram draw wedges all rendering
-        assert getattr(type(cb)._draw_histogram, "_mbo_polyline_patch", False)
 
     def test_construction_histogram_used_scalar_keys(self, viewer5d):
         # the initial histogram must be built from bounded scalar-key frame
@@ -287,7 +283,8 @@ class TestIndices:
         drain()
         shown = iw.ndgraphics[0].indices_displayed
         assert shown is not None
-        assert int(round(shown["Timepoint"])) == 10
+        # indices_displayed is in the 1-based reference space
+        assert int(round(shown["Timepoint"])) == 10 + 1
 
     def test_current_index_dict(self, viewer5d):
         iw = viewer5d
@@ -318,8 +315,9 @@ class TestWindowFuncs:
         drain()
         proc = iw.ndgraphics[0].processor
         got = np.asarray(iw.ndgraphics[0].graphic.data.value)
+        # the indexer takes 1-based reference values
         idx = proc._get_slider_dims_indexer(
-            {"Timepoint": 20, "Channel": 0, "Z-plane": 0}
+            {"Timepoint": 21, "Channel": 1, "Z-plane": 1}
         )
         tsel = idx["Timepoint"]
         # the window is real: more than one frame averaged
@@ -537,14 +535,14 @@ class TestTogglePlaybackVendoredShape:
 # ============================================================
 
 def _make_viewer(data, **kwargs):
-    from mbo_utilities.gui._fpl_compat import create_image_widget
+    from mbo_utilities.gui._ndviewer import MboNDViewer
 
     defaults = dict(
         histogram_widget=True,
         figure_kwargs={"size": (300, 300)},
     )
     defaults.update(kwargs)
-    iw = create_image_widget(data=data, **defaults)
+    iw = MboNDViewer(data=data, **defaults)
     iw.show()
     return iw
 
@@ -608,7 +606,7 @@ class TestDimsChangingSwap:
             assert list(iw.indices) == [0, 0]
             assert iw.slider_dims == ["t", "z"]
             ranges = iw.ndwidget.ranges
-            assert sorted(int(r.stop) for r in ranges.values()) == [3, 12]
+            assert sorted(int(r.stop - r.start) for r in ranges.values()) == [3, 12]
 
             # letters resolve positionally on the new dim space and the
             # right frame is displayed after the async fetch drains
@@ -799,7 +797,8 @@ class TestWindowSpanContract:
         try:
             iw.window_funcs = {"t": (np.mean, size)}
             proc = iw.ndgraphics[0].processor
-            sel = proc._get_slider_dims_indexer({"Timepoint": 10})["Timepoint"]
+            # ref value 11 = array frame 10
+            sel = proc._get_slider_dims_indexer({"Timepoint": 11})["Timepoint"]
             half = (size - 1) // 2
             assert (sel.start, sel.stop) == (10 - half, 10 + half + 1)
         finally:
@@ -1106,46 +1105,3 @@ class TestClose:
         assert all(ex._shutdown for ex in executors)
         iw.close()  # idempotent
 
-
-# ============================================================
-# legacy escape hatch
-# ============================================================
-
-class TestLegacyEnvFlag:
-    def test_legacy_flag_builds_vendored_widget(self, monkeypatch):
-        monkeypatch.setenv("MBO_LEGACY_IMAGE_WIDGET", "1")
-        from mbo_utilities.gui._fpl_compat import create_image_widget
-        from mbo_utilities.gui._vendor._widget import (
-            ImageWidget as VendoredImageWidget,
-        )
-
-        data = (
-            np.random.default_rng(0)
-            .normal(0, 1, (12, 3, 24, 24))
-            .astype(np.float32)
-        )
-        iw = create_image_widget(
-            data=data,
-            slider_dim_names=("Timepoint", "Z-plane"),
-            window_funcs=(np.mean, None),
-            window_sizes=(1, None),
-            cmap="gnuplot2",
-            histogram_widget=True,
-            figure_kwargs={"size": (300, 300)},
-            graphic_kwargs={"vmin": -3, "vmax": 3},
-        )
-        try:
-            assert isinstance(iw, VendoredImageWidget)
-            assert iw.n_sliders == 2
-            assert iw._slider_dim_names == ("Timepoint", "Z-plane")
-            assert list(iw.indices) == [0, 0]
-            iw.indices["Timepoint"] = 3
-            assert iw.indices["Timepoint"] == 3
-            assert iw._sliders_ui is not None
-            iw._sliders_ui.seed_fps("t", 17)
-            assert iw._sliders_ui._fps["t"] == 17
-            iw.reset_vmin_vmax_frame()
-        finally:
-            # the vendored widget's close path assumes an onscreen figure
-            with contextlib.suppress(Exception):
-                iw.close()

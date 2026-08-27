@@ -1,72 +1,21 @@
-"""NDWidget-backed viewer that preserves the mbo ImageWidget contract.
+"""MboNDViewer: fastplotlib NDWidget (ndwidget branch) behind the mbo
+ImageWidget contract.
 
-``MboNDViewer`` wraps :class:`fastplotlib.NDWidget` (ndwidget branch) behind
-the exact surface the Studio GUI was written against, so the ~45 consumer
-files keep working unchanged:
-
-* ``.data`` — list-like; ``data[i]`` returns the ORIGINAL mbo array object
-  (consumers probe ``fs``/``metadata``/``reader_kwargs``/``num_rois``/
-  ``_imwrite`` on it); ``data[i] = new_array`` performs a FULL swap that
-  re-derives dimensionality (2D..5D may differ), rebuilds the graphic and
-  colorbar, clears window/spatial funcs and resets indices to 0.
-* ``.indices`` — name-keyed get/set (``iw.indices["Timepoint"] = 5``),
-  iterates VALUES positionally (``list(iw.indices)`` snapshots positions),
-  setter accepts a positional list or a dict.
-* ``.n_sliders`` / ``.graphics`` / ``.figure`` (the real ``ImguiFigure``,
-  passthrough) / ``._slider_dim_names`` (plain writable attribute) /
-  ``.cmap`` / ``.window_funcs`` / ``.window_sizes`` / ``.frame_apply`` /
-  ``.spatial_func`` / ``reset_vmin_vmax()`` / ``reset_vmin_vmax_frame()``.
-* ``._sliders_ui`` — adapter over ``NDWidgetUI`` with the vendored
-  ``ImageWidgetSliders`` members the GUI touches (``seed_fps``/``_user_fps``/
-  ``_loop``/``_playing``/``_last_frame_time``). Playback-state views accept
-  BOTH int positions (``_keyboard.toggle_playback`` indexes positionally)
-  and dim names, so the space-bar rebind actually works here (it was a
-  silent no-op against the vendored str-keyed defaultdicts).
-
-Dim-name model
---------------
-The ``ReferenceIndex`` dims are mbo's *display* names — the
-``slider_dim_names`` the call sites pass (``"Timepoint"``, ``"Z-plane"``,
-``"ROI"``, ...) — so ``NDWidgetUI`` labels its sliders with the real
-names. When no names are given, they come from the array's own
-``slider_dim_labels`` when those cover every slider axis, else from the
-canonical per-rank letters: mbo 5D data is ``(T, C, Z, Y, X)`` so a 5D
-array gets ``('t', 'c', 'z')`` (NOT the vendored positional order
-``t/z/c`` — that mapped the ``z`` slider onto the C axis), 4D ``(T, Z, Y,
-X)`` gets ``('t', 'z')``, 3D gets ``('t',)``. Name resolution for
-``indices``/``window_funcs``/``seed_fps`` accepts, in order: a current
-reference dim name, a ``_slider_dim_names`` label (positional), or a
-positional letter ``t``/``z``/``c`` (the vendored axis order, kept for the
-legacy call sites that index displayed names positionally). Spatial dims
-use the reserved names ``__row__``/``__col__``/``__rgb__``.
-
-UI ownership / collisions
--------------------------
-NDWidget installs its own bottom ``NDWidgetUI`` playback bar (this replaces
-the vendored ``ImageWidgetSliders``, exposed through ``._sliders_ui``) and
-its own ``RightClickMenu`` (a ``StandardRightClickMenu`` subclass — the
-vendored path installed the standard menu too, so nothing to remove).
-``PreviewDataWidget`` self-registers on the figure's *right* edge via the
-vendored EdgeWindow shim, which does not collide with either. The figure
-deliberately does NOT expose ``_right_click_menu``: ``tile_grid``'s
-suppression helper `getattr`s it and degrades to a no-op, exactly as it
-does on the vendored path (the new menu has no ``get_subplot`` to wrap).
-
-Async model
------------
-Index changes schedule per-graphic fetches on the rendercanvas loop —
-graphic data is NOT updated synchronously after ``iw.indices = ...``.
-Property setters (window funcs, spatial funcs, data swaps) force a
-synchronous render via ``run_sync``.
-
-Offscreen canvases are the exception: they never register with the
-rendercanvas loop, so the StubLoop's no-canvases self-stop cancels
-scheduled fetch tasks — one cancelled before its first step skips
-``_fetch_request``'s finally block and permanently pins
-``ReferenceIndex._fetch_request_active`` True, after which no serial
-fetch ever runs again. The index setters therefore detect an offscreen
-canvas and force a synchronous fetch+render (``_flush_index_fetches``),
-so scrubbing works offscreen without any loop drains.
+- ``.data`` — list-like of the ORIGINAL mbo arrays; ``data[i] = arr`` is a
+  full swap (re-derives dims, rebuilds graphic/colorbar, resets funcs and
+  indices).
+- ``.indices`` — name-keyed, 0-based; iteration yields values in slider
+  order. The reference space (what sliders display) is 1-based;
+  ``_ref_to_index`` maps ref values to array indices.
+- ``.graphics``/``.figure``/``.n_sliders``/``._sliders_ui``/
+  ``._slider_dim_names``, window/spatial func routing, contrast resets.
+- Dim names: caller ``slider_dim_names``, else the array's
+  ``slider_dim_labels`` when they cover every slider axis, else canonical
+  per-rank letters (5D TCZYX -> 't','c','z'). Spatial dims use reserved
+  ``__row__``/``__col__``/``__rgb__``.
+- Index changes fetch async on the rendercanvas loop. Offscreen canvases
+  never register with the loop (cancelled fetches would wedge the serial
+  path), so index setters fetch+render synchronously there.
 """
 
 from __future__ import annotations
@@ -74,14 +23,17 @@ from __future__ import annotations
 import contextlib
 import math
 from itertools import product
+from time import perf_counter
 from typing import Callable, Sequence
 
 import numpy as np
+from imgui_bundle import imgui, icons_fontawesome_6 as fa
 
 from fastplotlib.utils import calculate_figure_shape
 from fastplotlib.widgets.nd_widget import NDWidget, NDImage, NDImageProcessor
 from fastplotlib.widgets.nd_widget._index import RangeContinuous
 from fastplotlib.widgets.nd_widget._async import run_sync
+from fastplotlib.widgets.nd_widget._ui import NDWidgetUI
 
 __all__ = ["MboNDViewer", "MboNDImageProcessor", "_sample_array"]
 
@@ -113,7 +65,7 @@ _ROW, _COL, _RGB = "__row__", "__col__", "__rgb__"
 # not an option — a MESc unit runs to 45k frames — so the range comes from an
 # even sample. The counts multiply out to ~64 frames whatever the rank, and
 # every read is a single 2D frame, so cost tracks frame size, not movie
-# length. (Ported from gui/_vendor/_widget.py.)
+# length.
 VMINMAX_SAMPLE_COUNTS = {1: (64,), 2: (24, 3), 3: (12, 3, 2)}
 
 
@@ -165,6 +117,11 @@ def _round_half_up(x) -> int:
     contract) — while still mapping integer indices to themselves.
     """
     return int(math.floor(float(x) + 0.5))
+
+
+def _ref_to_index(x) -> int:
+    """1-based reference value -> 0-based array index (half-up)."""
+    return _round_half_up(x) - 1
 
 
 def _with_float32_cast(func):
@@ -249,26 +206,26 @@ class _MboIndicesView:
 
     Name-keyed get/set, iteration yields index VALUES in slider order
     (consumers snapshot positions with ``list(iw.indices)``), ``len`` is the
-    slider count. Values are returned as ints (ranges are integer frame
-    positions; the imgui slider stores floats)."""
+    slider count. Values are 0-based ints; the reference space (sliders) is
+    1-based."""
 
     def __init__(self, viewer: "MboNDViewer"):
         self._viewer = viewer
 
     def __getitem__(self, name):
         dim = self._viewer._resolve_dim(name)
-        return int(round(float(self._viewer._ndw.indices[dim])))
+        return int(round(float(self._viewer._ndw.indices[dim]))) - 1
 
     def __setitem__(self, name, value):
         dim = self._viewer._resolve_dim(name)
         value = self._viewer._check_index(dim, value)
-        self._viewer._ndw.indices.set_dim_index(dim, value)
+        self._viewer._ndw.indices.set_dim_index(dim, value + 1)
         self._viewer._flush_index_fetches()
 
     def __iter__(self):
         ri = self._viewer._ndw.indices
         return iter(
-            [int(round(float(ri[d]))) for d in self._viewer._dim_names]
+            [int(round(float(ri[d]))) - 1 for d in self._viewer._dim_names]
         )
 
     def __len__(self):
@@ -277,7 +234,7 @@ class _MboIndicesView:
     def __repr__(self):
         ri = self._viewer._ndw.indices
         return repr(
-            {d: int(round(float(ri[d]))) for d in self._viewer._dim_names}
+            {d: int(round(float(ri[d]))) - 1 for d in self._viewer._dim_names}
         )
 
 
@@ -436,6 +393,110 @@ class _MboSlidersUI:
                 self._ndui._loop[d] = self._loop_all
 
 
+class _MboNDWidgetUI(NDWidgetUI):
+    """NDWidgetUI drawing integer sliders for integer ranges."""
+
+    def update(self):
+        now = perf_counter()
+
+        for dim, current_index in self._ndwidget.indices:
+            imgui.push_id(f"{self._id_counter}_{dim}")
+            rr = self._ndwidget.ranges[dim]
+
+            if self._playing[dim]:
+                if imgui.button(label=fa.ICON_FA_PAUSE):
+                    self._playing[dim] = False
+                if now - self._last_frame_time[dim] >= self._frame_time[dim]:
+                    self._set_index(dim, current_index + rr.step)
+                    self._last_frame_time[dim] = now
+            else:
+                if imgui.button(label=fa.ICON_FA_PLAY):
+                    self._last_frame_time[dim] = 0
+                    self._playing[dim] = True
+
+            imgui.same_line()
+            if imgui.button(label=fa.ICON_FA_BACKWARD_STEP) and not self._playing[dim]:
+                self._set_index(dim, current_index - rr.step)
+
+            imgui.same_line()
+            if imgui.button(label=fa.ICON_FA_FORWARD_STEP) and not self._playing[dim]:
+                self._set_index(dim, current_index + rr.step)
+
+            imgui.same_line()
+            if imgui.button(label=fa.ICON_FA_STOP):
+                self._playing[dim] = False
+                self._last_frame_time[dim] = 0
+                self._ndwidget.indices.set_dim_index(dim, rr.start)
+
+            imgui.same_line()
+            _, self._loop[dim] = imgui.checkbox(
+                label=fa.ICON_FA_ROTATE, v=self._loop[dim]
+            )
+            if imgui.is_item_hovered(0):
+                imgui.set_tooltip("loop playback")
+
+            imgui.same_line()
+            imgui.text("framerate :")
+            imgui.same_line()
+            imgui.set_next_item_width(100)
+            fps_changed, value = imgui.input_int(
+                label="fps", v=self._fps[dim], step_fast=5
+            )
+            if imgui.is_item_hovered(0):
+                imgui.set_tooltip(
+                    "framerate is approximate and less reliable as it approaches your monitor refresh rate"
+                )
+            if fps_changed:
+                value = min(max(value, 1), 100)
+                self._fps[dim] = value
+                self._frame_time[dim] = 1 / value
+
+            imgui.text(str(dim))
+            imgui.same_line()
+            imgui.set_next_item_width(self.width * 0.85)
+
+            if isinstance(rr, RangeContinuous):
+                if all(
+                    float(v).is_integer() for v in (rr.start, rr.stop, rr.step)
+                ):
+                    changed, new_index = imgui.slider_int(
+                        v=int(round(current_index)),
+                        v_min=int(rr.start),
+                        v_max=int(rr.stop - rr.step),
+                        label=f"##{dim}",
+                    )
+                else:
+                    changed, new_index = imgui.slider_float(
+                        v=current_index,
+                        v_min=rr.start,
+                        v_max=rr.stop - rr.step,
+                        label=f"##{dim}",
+                    )
+
+                if changed:
+                    if now - self._last_slider_movement[dim] > rr.throttle:
+                        self._ndwidget.indices.set_dim_index(
+                            dim, new_index, cancel_awaiting=True
+                        )
+                        self._last_slider_movement[dim] = now
+                elif imgui.is_item_hovered():
+                    if imgui.is_key_pressed(imgui.Key.right_arrow):
+                        self._set_index(dim, current_index + rr.step)
+                    elif imgui.is_key_pressed(imgui.Key.left_arrow):
+                        self._set_index(dim, current_index - rr.step)
+
+            imgui.pop_id()
+
+        if not self._collapsed:
+            height = round(
+                imgui.get_cursor_screen_pos().y
+                - self.y
+                + imgui.get_style().window_padding.y
+            )
+            if height != self.size:
+                self.size = height
+
+
 class MboNDViewer:
     """NDWidget wrapped in the mbo ImageWidget contract (see module docs)."""
 
@@ -454,13 +515,6 @@ class MboNDViewer:
         cmap: str = "plasma",
         graphic_kwargs: dict | None = None,
     ):
-        # the ImguiColorbar histogram draw is broken with imgui_bundle
-        # 1.92.5 and wedges ALL rendering on first draw — patch before any
-        # NDImage can construct a colorbar
-        from mbo_utilities.gui._fpl_compat import ensure_colorbar_patch
-
-        ensure_colorbar_patch()
-
         if isinstance(data, (list, tuple)):
             arrays = list(data)
         else:
@@ -510,8 +564,10 @@ class MboNDViewer:
             self._make_dim_names(n_dims, requested)
         )
 
+        # 1-based reference space (sliders show 1..n); _ref_to_index maps to
+        # 0-based array indices
         ref_ranges = {
-            name: RangeContinuous(0, self._dim_size(j), 1)
+            name: RangeContinuous(1, self._dim_size(j) + 1, 1)
             for j, name in enumerate(self._dim_names)
         }
 
@@ -524,6 +580,16 @@ class MboNDViewer:
         )
 
         self._ndw = NDWidget(ref_ranges=ref_ranges, **fig_kwargs)
+
+        # int-slider UI; add_imgui_window replaces the existing bottom window
+        ui = _MboNDWidgetUI(self._ndw)
+        self._ndw.figure.add_imgui_window(
+            ui,
+            location="bottom",
+            size=57 + 50 * len(self._ndw.indices),
+            title="NDWidget controls",
+        )
+        self._ndw._sliders_ui = ui
 
         # offscreen canvases never register with the rendercanvas loop, so
         # scheduled fetch tasks can be cancelled by the loop's no-canvases
@@ -659,10 +725,8 @@ class MboNDViewer:
             rgb_dim=_RGB if rgb else None,
             compute_histogram=self._histogram_widget,
             processor_type=MboNDImageProcessor,
-            # half-up rounding so an odd window size s covers exactly s
-            # frames centered on t (the identity transform's banker's
-            # rounding covered s-1 or s+1); fresh dict — the setter mutates
-            slider_dim_transforms={d: _round_half_up for d in dims[:k]} or None,
+            # fresh dict — the setter mutates
+            slider_dim_transforms={d: _ref_to_index for d in dims[:k]} or None,
             name=name or "mbo_image",
         )
 
@@ -728,7 +792,7 @@ class MboNDViewer:
             )
         rr = self._ndw.indices.ref_ranges.get(dim)
         if isinstance(rr, RangeContinuous):
-            size = int(rr.stop)
+            size = int(rr.stop - rr.start)
             if value >= size:
                 raise IndexError(
                     f"index {value} out of bounds for dim {dim!r} with size "
@@ -790,13 +854,13 @@ class MboNDViewer:
         items = {d: self._check_index(d, v) for d, v in items.items()}
         # cancel_awaiting=False -> queued serial path, every frame renders;
         # `iw.indices = list(iw.indices)` is the GUI's force-refresh idiom
-        self._ndw.indices.set(items)
+        self._ndw.indices.set({d: v + 1 for d, v in items.items()})
         self._flush_index_fetches()
 
     @property
     def current_index(self) -> dict[str, int]:
         ri = self._ndw.indices
-        return {d: int(round(float(ri[d]))) for d in self._dim_names}
+        return {d: int(round(float(ri[d]))) - 1 for d in self._dim_names}
 
     @current_index.setter
     def current_index(self, value: dict):
@@ -853,7 +917,7 @@ class MboNDViewer:
         Routed to per-graphic ``NDProcessor.window_funcs`` AND
         ``window_order`` — funcs for dims absent from ``window_order`` are
         silently ignored by fastplotlib. Sizes are in reference units, which
-        with our ``RangeContinuous(0, n, 1)`` ranges equal frame counts.
+        with our step-1 ranges equal frame counts.
         """
         self._window_funcs_state = value
         if value is None:
@@ -1242,7 +1306,7 @@ class MboNDViewer:
             self._dim_names = list(new_names)
             ri.push_dims(
                 {
-                    dim: RangeContinuous(0, self._dim_size(j), 1)
+                    dim: RangeContinuous(1, self._dim_size(j) + 1, 1)
                     for j, dim in enumerate(self._dim_names)
                 }
             )
@@ -1253,15 +1317,15 @@ class MboNDViewer:
                 self._pop_ref_dim(self._dim_names.pop())
             for j, dim in enumerate(self._dim_names):
                 # refresh the range in place; UI state survives
-                ri._ref_ranges[dim] = RangeContinuous(0, self._dim_size(j), 1)
-                ri._indices[dim] = 0
+                ri._ref_ranges[dim] = RangeContinuous(1, self._dim_size(j) + 1, 1)
+                ri._indices[dim] = 1
             while len(self._dim_names) < need:
                 j = len(self._dim_names)
                 dim = self._make_dim_names(j + 1, None)[j]
                 while dim in self._dim_names or dim in ri.dims:
                     dim = dim + "_"
                 self._dim_names.append(dim)
-                ri.push_dims({dim: RangeContinuous(0, self._dim_size(j), 1)})
+                ri.push_dims({dim: RangeContinuous(1, self._dim_size(j) + 1, 1)})
 
         # the display labels must track the (possibly re-keyed) dim space;
         # still a plain writable attr — consumer restamps keep working
@@ -1284,9 +1348,9 @@ class MboNDViewer:
             ndg.processor.window_order = None
             ndg.processor.spatial_func = None
 
-        # start the new graphic at index 0 in every dim
+        # start the new graphic at index 0 (ref 1) in every dim
         for dim in self._dim_names:
-            ri._indices[dim] = 0
+            ri._indices[dim] = 1
 
         # ---- rebuild the graphic + colorbar for the new array ----
         new_ndg = self._add_image(nd_subplot, new_array, self._rgb[i], name=name)

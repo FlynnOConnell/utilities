@@ -26,8 +26,6 @@ _LAZY = {
     "stage_action": ("mbo_utilities.masknmf.params", "stage_action"),
     "run_plane": ("mbo_utilities.masknmf.runner", "run_plane"),
     "run_volume": ("mbo_utilities.masknmf.runner", "run_volume"),
-    "load_results": ("mbo_utilities.masknmf.views", "load_results"),
-    "run_summary": ("mbo_utilities.masknmf.views", "run_summary"),
 }
 
 __all__ = list(_LAZY)

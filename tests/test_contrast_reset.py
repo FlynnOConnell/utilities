@@ -6,14 +6,10 @@ auto-contrast-on-z) must actually move vmin/vmax onto the data, and the
 value sample they derive them from must stay bounded on a movie too large
 to read whole.
 
-The default viewer is now the NDWidget-backed ``MboNDViewer`` adapter
-(mbo_utilities/gui/_ndviewer.py), so these tests pin ITS ``_sample_array``
-/ ``_set_contrast`` / slider-dim derivation. The vendored legacy
-ImageWidget (selected with ``MBO_LEGACY_IMAGE_WIDGET=1``) keeps its own
-copies of the same logic; the assertions that only exist on that stack
-live in ``TestLegacyVendoredInternals`` and set the env flag to make their
-scope explicit. The full rendering-level contract battery for the adapter
-is in tests/test_ndviewer.py.
+The viewer is the NDWidget-backed ``MboNDViewer``
+(mbo_utilities/gui/_ndviewer.py); these tests pin its ``_sample_array`` /
+``_set_contrast`` / slider-dim derivation. The full rendering-level
+contract battery is in tests/test_ndviewer.py.
 """
 
 from __future__ import annotations
@@ -267,110 +263,3 @@ class TestSliderLabels:
         # resolving by position rather than KeyError
         v = self._viewer(["t", "z"], labels=("Timepoint", "Z-plane"))
         assert v._resolve_dim("Z-plane") == "z"
-
-
-# ============================================================
-# vendored legacy stack (MBO_LEGACY_IMAGE_WIDGET=1)
-# ============================================================
-
-class TestLegacyVendoredInternals:
-    """Assertions that only exist on the vendored legacy ImageWidget stack.
-
-    The vendored copy stays in-tree as the ``MBO_LEGACY_IMAGE_WIDGET=1``
-    escape hatch; these run with the flag set to make their scope explicit
-    (the internals they pin are only reachable on that path).
-    """
-
-    @pytest.fixture(autouse=True)
-    def _legacy_env(self, monkeypatch):
-        monkeypatch.setenv("MBO_LEGACY_IMAGE_WIDGET", "1")
-
-    def test_vendored_sample_array_matches_the_ported_one(self):
-        from mbo_utilities.gui._vendor._widget import (
-            _sample_array as vendored_sample,
-        )
-
-        data = np.zeros((40, 3, 8, 8), dtype=np.uint16)
-        data[:, 2] = 5000
-        assert vendored_sample(data).max() == 5000
-        assert np.array_equal(
-            vendored_sample(np.arange(24).reshape(4, 6)),
-            _sample_array(np.arange(24).reshape(4, 6)),
-        )
-
-    def test_a_third_axis_is_scrollable(self):
-        from mbo_utilities.gui._vendor._widget import (
-            ALLOWED_SLIDER_DIMS,
-            SCROLLABLE_DIMS_ORDER,
-        )
-
-        assert SCROLLABLE_DIMS_ORDER[3] == "tzc"
-        assert ALLOWED_SLIDER_DIMS[2] == "c"
-
-    @pytest.mark.parametrize("rgb", [False, True])
-    def test_five_dimensional_arrays_are_accepted(self, rgb):
-        from mbo_utilities.gui._vendor._widget import ImageWidget
-
-        shape = (6, 2, 4, 32, 24) + ((3,) if rgb else ())
-        n = ImageWidget._get_n_scrollable_dims(None, np.zeros(shape), rgb)
-        assert n == 3
-
-    def test_six_scrollable_axes_are_refused(self):
-        # legacy-only: the adapter accepts these (see TestSliderDims)
-        from mbo_utilities.gui._vendor._widget import ImageWidget
-
-        with pytest.raises(ValueError, match="not supported"):
-            ImageWidget._get_n_scrollable_dims(
-                None, np.zeros((2, 2, 2, 2, 8, 8)), False
-            )
-
-    def test_playback_bar_has_a_height_for_every_slider_count(self):
-        from mbo_utilities.gui._vendor._widget import (
-            ALLOWED_SLIDER_DIMS,
-            SLIDER_UI_SIZES,
-        )
-
-        for n in range(len(ALLOWED_SLIDER_DIMS) + 1):
-            assert SLIDER_UI_SIZES[n] > 0
-        assert SLIDER_UI_SIZES[3] > SLIDER_UI_SIZES[2]
-
-    def test_slider_dim_order_covers_every_allowed_dim(self):
-        from mbo_utilities.gui._fpl_compat import _SLIDER_DIM_ORDER
-        from mbo_utilities.gui._vendor._widget import ALLOWED_SLIDER_DIMS
-
-        assert set(_SLIDER_DIM_ORDER) == set(ALLOWED_SLIDER_DIMS.values())
-        # order must match the axis positions, not just the membership
-        assert _SLIDER_DIM_ORDER == tuple(
-            ALLOWED_SLIDER_DIMS[i] for i in sorted(ALLOWED_SLIDER_DIMS)
-        )
-
-    @staticmethod
-    def _bar(names, dims):
-        from mbo_utilities.gui._vendor._sliders import ImageWidgetSliders
-
-        bar = ImageWidgetSliders.__new__(ImageWidgetSliders)
-        bar._image_widget = type(
-            "IW", (), {"_slider_dim_names": names, "slider_dims": dims}
-        )()
-        return bar
-
-    def test_named_axes_are_shown(self):
-        bar = self._bar(("Timepoint", "Channel", "ROI"), ["t", "z", "c"])
-        assert [bar._dim_label(d) for d in ("t", "z", "c")] == [
-            "Timepoint", "Channel", "ROI",
-        ]
-
-    def test_falls_back_to_the_internal_letter(self):
-        assert self._bar(None, ["t", "z"])._dim_label("z") == "z"
-        assert self._bar(("Timepoint",), ["t", "z"])._dim_label("z") == "z"
-
-    def test_playback_state_accepts_any_dim(self):
-        """Fixed {"t", "z"} dicts KeyError'd on a third dim or a data swap."""
-        import inspect
-
-        from mbo_utilities.gui._vendor import _sliders
-
-        src = inspect.getsource(_sliders.ImageWidgetSliders.__init__)
-        for attr in ("_playing", "_fps", "_frame_time", "_last_frame_time"):
-            line = next(ln for ln in src.splitlines() if f"self.{attr}" in ln)
-            assert "defaultdict" in line, line

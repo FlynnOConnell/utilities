@@ -72,11 +72,7 @@ from mbo_utilities.gui._options_popup import draw_options_popup
 
 
 import fastplotlib as fpl
-try:
-    from fastplotlib.ui import EdgeWindow
-except ImportError:
-    # ndwidget branch: EdgeWindow replaced by ImguiWindow + add_imgui_window
-    from mbo_utilities.gui._vendor._edge_window import EdgeWindow
+from mbo_utilities.gui._edge_window import EdgeWindow
 import contextlib
 
 __all__ = ["PreviewDataWidget"]

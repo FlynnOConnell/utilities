@@ -150,7 +150,6 @@ def draw_boxed_label(
             ImVec2(origin.x + box_w, origin.y + box_h),
             col,
             rounding,
-            0,
             thickness,
         )
         draw_list.add_text(
@@ -377,21 +376,26 @@ def style_seaborn_dark():
     _set("title_text", ImVec4(1.0, 1.0, 1.0, 1.00))
     _set("inlay_text", ImVec4(0.9, 0.9, 0.9, 1.00))
 
-    # Misc
-    style.set_color_(implot.Col_.error_bar.value, ImVec4(0.9, 0.9, 0.9, 1.00))
-    style.set_color_(implot.Col_.selection.value, ImVec4(1.00, 0.65, 0.00, 1.00))
-    style.set_color_(implot.Col_.crosshairs.value, ImVec4(0.8, 0.8, 0.8, 0.5))
+    # Misc (error_bar dropped from Col_ in imgui-bundle 1.92.8xx)
+    _set("error_bar", ImVec4(0.9, 0.9, 0.9, 1.00))
+    _set("selection", ImVec4(1.00, 0.65, 0.00, 1.00))
+    _set("crosshairs", ImVec4(0.8, 0.8, 0.8, 0.5))
 
-    # Sizes
-    style.line_weight = 1.5
-    style.marker = implot.Marker_.none.value
-    style.marker_size = 4
-    style.marker_weight = 1
-    style.fill_alpha = 1.0
-    style.error_bar_size = 5
-    style.error_bar_weight = 1.5
-    style.digital_bit_height = 8
-    style.digital_bit_gap = 4
+    # Sizes; per-item attrs (line/marker/fill/error_bar/digital) left the
+    # Style struct in imgui-bundle 1.92.8xx, so set only what exists
+    def _set_size(attr_name, value):
+        if hasattr(style, attr_name):
+            setattr(style, attr_name, value)
+
+    _set_size("line_weight", 1.5)
+    _set_size("marker", implot.Marker_.none.value)
+    _set_size("marker_size", 4)
+    _set_size("marker_weight", 1)
+    _set_size("fill_alpha", 1.0)
+    _set_size("error_bar_size", 5)
+    _set_size("error_bar_weight", 1.5)
+    _set_size("digital_bit_height", 8)
+    _set_size("digital_bit_gap", 4)
     style.plot_border_size = 0
     style.minor_alpha = 0.3
     style.major_tick_len = ImVec2(0, 0)

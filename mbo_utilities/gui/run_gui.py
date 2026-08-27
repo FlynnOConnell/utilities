@@ -601,9 +601,9 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
             arrays.append(_squeeze_for_viewer(arr))
             names.append(f"ROI {r}" if r else (base_name or "Full Image"))
 
-        from mbo_utilities.gui._fpl_compat import create_image_widget
+        from mbo_utilities.gui._ndviewer import MboNDViewer
 
-        iw = create_image_widget(
+        iw = MboNDViewer(
             data=arrays,
             names=names,
             slider_dim_names=slider_dim_names,
@@ -615,9 +615,9 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
             graphic_kwargs=graphic_kwargs,
         )
     else:
-        from mbo_utilities.gui._fpl_compat import create_image_widget
+        from mbo_utilities.gui._ndviewer import MboNDViewer
 
-        iw = create_image_widget(
+        iw = MboNDViewer(
             data=_squeeze_for_viewer(data_array),
             slider_dim_names=slider_dim_names,
             window_funcs=window_funcs,
@@ -727,6 +727,11 @@ def _run_gui_impl(
         if select_only:
             return data_in
 
+        # masknmf demixing results open in masknmf's own curation GUI
+        # (accept/reject + class labeling) instead of the standard viewer
+        demix_file = _find_demixing_results(data_in)
+        if demix_file is not None:
+            return _launch_curation_gui(demix_file)
 
         # Dispatch based on Mode
         # pollen calibration is auto-detected in the fastplotlib viewer via get_viewer_class()
@@ -906,6 +911,62 @@ def _resolve_mesc_unit(data_in, unit):
         return {}, False
     logger.info(f"MESc unit selected: {chosen}")
     return {"unit": chosen}, True
+
+
+def _find_demixing_results(path) -> Path | None:
+    """Resolve a masknmf demixing results file for an opened path.
+
+    Matches the file itself (an hdf5 with a DemixingResults group) or a
+    selected folder directly containing ``demixing_results.hdf5``.
+    """
+    try:
+        p = Path(path)
+    except TypeError:
+        return None
+    if p.is_dir():
+        from mbo_utilities.masknmf.params import DEMIX_FILE
+
+        p = p / DEMIX_FILE
+    if not (p.is_file() and p.suffix.lower() in (".h5", ".hdf5")):
+        return None
+    try:
+        import h5py
+
+        with h5py.File(p, "r") as f:
+            return p if "DemixingResults" in f else None
+    except Exception:
+        return None
+
+
+# curation windows opened onto an already-running loop; referenced here so
+# they aren't garbage collected when the opener returns
+_curation_windows: list = []
+
+
+def _open_curation_gui(path):
+    """Show masknmf's curation GUI (accept/reject + class labels) for the file.
+
+    CurationVis.from_hdf5 restores any saved iscell/class labels and autosaves
+    edits back into the hdf5. Does not run the event loop — a caller on an
+    already-running loop (File -> Open) just gets the extra window.
+    """
+    from masknmf.visualization.curation_vis import CurationVis
+
+    vis = CurationVis.from_hdf5(str(path))
+    vis.show()
+    _curation_windows.append(vis)
+    return vis
+
+
+def _launch_curation_gui(path):
+    """Open the curation GUI from a cold start and run the event loop."""
+    import fastplotlib as fpl
+
+    vis = _open_curation_gui(path)
+    if _is_jupyter():
+        return vis
+    fpl.loop.run()
+    return None
 
 
 def _launch_standard_viewer(data_in, roi, widget, metadata_only, unit=None):

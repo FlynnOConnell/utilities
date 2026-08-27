@@ -182,6 +182,16 @@ def _imagej_layout(meta: dict, path: Path) -> tuple[int, ...] | None:
     return (frames, slices, channels) if frames * slices * channels > 1 else None
 
 
+def _ome_layout(meta: dict) -> tuple[int, int, int] | None:
+    """(frames, slices, channels) from OME-XML SizeT/SizeZ/SizeC counts
+    deposited by ``get_metadata_single``, else None."""
+    counts = tuple(meta.get(k) for k in ("SizeT", "SizeZ", "SizeC"))
+    if all(c is None for c in counts):
+        return None
+    frames, slices, channels = (int(c or 1) for c in counts)
+    return (frames, slices, channels) if frames * slices * channels > 1 else None
+
+
 def _shape_layout(meta: dict) -> tuple[int, ...] | None:
     """(frames, planes[, channels]) from a TZCYX ``shape`` for shaped/legacy
     metadata that predates the ImageJ count keys, else None."""
@@ -196,13 +206,32 @@ def _shape_layout(meta: dict) -> tuple[int, ...] | None:
 class _InterleavedTiffReader:
     """Internal reader for ImageJ-style interleaved TZCYX hyperstacks."""
 
-    def __init__(self, path: Path, n_frames: int, n_planes: int, n_channels: int = 1):
+    def __init__(
+        self,
+        path: Path,
+        n_frames: int,
+        n_planes: int,
+        n_channels: int = 1,
+        dim_order: str = "XYCZT",
+    ):
         self._path = path
         self._tiff = TiffFile(path)
         self._lock = threading.Lock()
         self._n_frames = n_frames
         self._n_planes = n_planes
         self._n_channels = n_channels
+
+        # page order beyond XY: first letter varies fastest across pages
+        # (OME DimensionOrder semantics; ImageJ hyperstacks are XYCZT).
+        order = (dim_order or "XYCZT").upper()[2:]
+        if set(order) != {"C", "Z", "T"}:
+            order = "CZT"
+        sizes = {"T": n_frames, "Z": n_planes, "C": n_channels}
+        self._page_strides = {}
+        stride = 1
+        for d in order:
+            self._page_strides[d] = stride
+            stride *= sizes[d]
 
         page0 = self._tiff.pages.first
         self._page_shape = page0.shape
@@ -270,10 +299,12 @@ class _InterleavedTiffReader:
     def read_tzyx(self, t_indices: list[int], z_indices: list[int], c_indices: list[int] | None = None) -> np.ndarray:
         """Read frames for given T, Z, and optional C indices.
 
-        Pages are stored in TZCYX order: page = t*(Z*C) + z*C + c.
+        Page index follows ``dim_order`` strides (XYCZT default:
+        page = t*(Z*C) + z*C + c).
         When c_indices is provided (multi-channel), returns (T, C, Z, Y, X).
         Otherwise returns (T, Z, Y, X) for backward compatibility.
         """
+        st, sz, sc = (self._page_strides[d] for d in "TZC")
         if c_indices is not None and self._n_channels > 1:
             # 5D: return TCZYX
             buf = np.empty(
@@ -284,7 +315,7 @@ class _InterleavedTiffReader:
                 for ti, t_idx in enumerate(t_indices):
                     for ci, c_idx in enumerate(c_indices):
                         for zi, z_idx in enumerate(z_indices):
-                            page_idx = t_idx * (self._n_planes * self._n_channels) + z_idx * self._n_channels + c_idx
+                            page_idx = t_idx * st + z_idx * sz + c_idx * sc
                             buf[ti, ci, zi] = self._frame(page_idx)
             return buf
         else:
@@ -296,7 +327,7 @@ class _InterleavedTiffReader:
             with self._lock:
                 for ti, t_idx in enumerate(t_indices):
                     for zi, z_idx in enumerate(z_indices):
-                        page_idx = t_idx * self._n_planes + z_idx
+                        page_idx = t_idx * st + z_idx * sz
                         buf[ti, zi] = self._frame(page_idx)
             return buf
 
@@ -549,8 +580,10 @@ class TiffArray(TiffReaderMixin, ReductionMixin, Shape5DMixin):
         # interleaved file; multi-file / plane-per-file inputs fall to the
         # structure heuristics. ImageJ counts win over a legacy TZCYX shape.
         if len(file_list) == 1:
-            layout = _imagej_layout(self._metadata, file_list[0]) or _shape_layout(
-                self._metadata
+            layout = (
+                _imagej_layout(self._metadata, file_list[0])
+                or _ome_layout(self._metadata)
+                or _shape_layout(self._metadata)
             )
             if layout:
                 self._init_interleaved(file_list[0], *layout)
@@ -640,7 +673,13 @@ class TiffArray(TiffReaderMixin, ReductionMixin, Shape5DMixin):
     def _init_interleaved(self, path: Path, n_frames: int, n_planes: int, n_channels: int = 1):
         """initialize as interleaved TZCYX from single file."""
         self._is_volumetric = True
-        self._interleaved_reader = _InterleavedTiffReader(path, n_frames, n_planes, n_channels)
+        self._interleaved_reader = _InterleavedTiffReader(
+            path,
+            n_frames,
+            n_planes,
+            n_channels,
+            dim_order=self._metadata.get("DimensionOrder") or "XYCZT",
+        )
         self._planes = []  # not used for interleaved
 
         self._nframes = n_frames
@@ -1500,8 +1539,8 @@ class ScanImageArray(TiffReaderMixin, RoiFeatureMixin, ReductionMixin, PhaseCorr
         sample_frame = arrays[0][0]
         vmin, vmax = float(sample_frame.min()), float(sample_frame.max())
 
-        from mbo_utilities.gui._fpl_compat import create_image_widget
-        return create_image_widget(
+        from mbo_utilities.gui._ndviewer import MboNDViewer
+        return MboNDViewer(
             data=arrays,
             names=names,
             histogram_widget=histogram_widget,
