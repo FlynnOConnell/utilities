@@ -66,7 +66,17 @@ def _register_pipelines_sync() -> None:
         except Exception:
             pass
 
-        # future: add more pipelines here
+        # third-party pipelines from the "mbo_utilities.pipelines"
+        # entry-point group. Loaded last so a plugin never shadows a
+        # built-in in the selector order.
+        try:
+            from mbo_utilities.pipeline_registry import load_entry_point_pipelines
+
+            for cls in load_entry_point_pipelines():
+                if issubclass(cls, PipelineWidget) and cls not in _PIPELINE_CLASSES:
+                    _PIPELINE_CLASSES.append(cls)
+        except Exception:
+            pass
 
         _REGISTRATION_COMPLETE = True
 
