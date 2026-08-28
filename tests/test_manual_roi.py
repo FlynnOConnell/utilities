@@ -259,10 +259,12 @@ class TestDrawMode:
 
 
 class TestImguiWindows:
-    def test_both_edge_windows_registered(self, widget):
-        windows = widget.iw.figure.imgui_windows
-        assert windows["top"] is not None
-        assert windows["right"] is not None
+    def test_renders_as_a_tab_not_edge_windows(self, widget):
+        # the ROI ui is a tab inside PreviewDataWidget so the Preview /
+        # Signal Quality / Run tabs and the windowing controls stay available
+        assert hasattr(widget, "draw_tab")
+        assert widget.iw.figure.imgui_windows.get("top") is None
+        assert widget.iw.figure.imgui_windows.get("right") is None
 
     def test_windows_draw_without_raising(self, widget):
         for i in range(4):
