@@ -644,7 +644,7 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
     # Attach the requested side widget
     if isinstance(widget, bool) or widget is None:
         widget = "preview" if widget else "none"
-    if widget == "preview":
+    if widget in ("preview", "manualroi"):
         from mbo_utilities.gui.widgets.preview_data import PreviewDataWidget
 
         gui = PreviewDataWidget(
@@ -652,22 +652,14 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
             fpath=data_array.source_path,
             size=300,
         )
+        if widget == "manualroi":
+            # drawing needs the windowing controls to see anything, so the ROI
+            # ui is an extra tab on the preview widget, not a replacement
+            from mbo_utilities.gui.manual_roi import ManualRoiWidget
+
+            gui.manual_roi = ManualRoiWidget(iw, data_array.source_path)
         # the EdgeWindow shim registers itself with the figure during
         # __init__; add_gui exists only on mbo-fastplotlib
-        add_gui = getattr(iw.figure, "add_gui", None)
-        if add_gui is not None:
-            add_gui(gui)
-    elif widget == "manualroi":
-        # the full preview widget, plus an ROI tab: manual drawing still needs
-        # the windowing controls to see anything
-        from mbo_utilities.gui.manual_roi import ManualRoiWidget
-
-        gui = PreviewDataWidget(
-            iw=iw,
-            fpath=data_array.source_path,
-            size=300,
-        )
-        gui.manual_roi = ManualRoiWidget(iw, data_array.source_path)
         add_gui = getattr(iw.figure, "add_gui", None)
         if add_gui is not None:
             add_gui(gui)
