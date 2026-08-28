@@ -5,7 +5,12 @@ Each array type and pipeline declares what files it reads/writes
 """
 
 from dataclasses import dataclass, field
+import logging
 from collections.abc import Callable
+
+logger = logging.getLogger(__name__)
+
+ENTRY_POINT_GROUP = "mbo_utilities.pipelines"
 
 
 @dataclass
@@ -109,3 +114,57 @@ def pipeline(
         cls._pipeline_info = info
         return cls
     return decorator
+
+
+_ENTRY_POINT_CLASSES: list[type] | None = None
+
+
+def load_entry_point_pipelines() -> list[type]:
+    """
+    Load pipeline widget classes from the ``mbo_utilities.pipelines`` group.
+
+    Mirrors ``lazy_array._load_entry_point_arrays``: a third-party package
+    ships a ``PipelineWidget`` subclass and declares it as an entry point, so
+    it reaches the Run-tab selector without any edit to mbo_utilities. Any
+    entry point that fails to import is skipped -- a broken plugin must not
+    take the GUI down with it.
+
+    Entry points are resolved once; every call returns the same classes, so
+    independent consumers (the widget registry and the worker task table) can
+    each ask without one starving the other.
+
+    Returns
+    -------
+    list of type
+        Widget classes, empty when none are installed.
+    """
+    global _ENTRY_POINT_CLASSES
+    if _ENTRY_POINT_CLASSES is not None:
+        return list(_ENTRY_POINT_CLASSES)
+
+    from importlib.metadata import entry_points
+
+    try:
+        eps = entry_points(group=ENTRY_POINT_GROUP)
+    except TypeError:
+        eps = entry_points().get(ENTRY_POINT_GROUP, [])
+
+    loaded = []
+    for ep in eps:
+        try:
+            obj = ep.load()
+        except Exception:
+            logger.exception("Could not load pipeline entry point %r", ep.name)
+            continue
+        if not isinstance(obj, type):
+            logger.warning(
+                "Pipeline entry point %r is not a class, skipping", ep.name
+            )
+            continue
+        info = getattr(obj, "info", None)
+        if isinstance(info, PipelineInfo):
+            register_pipeline(info)
+        loaded.append(obj)
+
+    _ENTRY_POINT_CLASSES = loaded
+    return list(loaded)
