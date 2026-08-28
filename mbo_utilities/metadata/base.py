@@ -306,6 +306,34 @@ METADATA_PARAMS: dict[str, MetadataParameter] = {
     ),
     # frame/plane/channel counts
     # note: in suite2p ops.npy, "nframes" means timepoints (post-registration), not per-slice frames
+    "frames_per_file": MetadataParameter(
+        canonical="frames_per_file",
+        aliases=(
+            "frames_per_folder",   # suite2p ops.npy
+            "nframes_per_file",
+            "frames_per_tiff",
+        ),
+        dtype=list,
+        default=None,
+        description=(
+            "Timepoints contributed by each source file, in the order of "
+            "file_paths. Marks trial/acquisition boundaries along T for "
+            "pipelines that treat each file as a separate trial."
+        ),
+        label="Frames per file",
+    ),
+    "file_paths": MetadataParameter(
+        canonical="file_paths",
+        aliases=(
+            "filenames",
+            "filelist",
+            "tiff_list",
+        ),
+        dtype=list,
+        default=None,
+        description="Source files backing the array, ordered along T",
+        label="Source files",
+    ),
     "num_timepoints": MetadataParameter(
         canonical="num_timepoints",
         aliases=(
