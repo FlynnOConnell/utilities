@@ -485,7 +485,16 @@ def main():
     # sample system + process-tree memory to a csv sidecar
     _start_mem_monitor(uuid, logger)
 
-    # get task function
+    # plugin pipelines contribute their worker via entry points; the
+    # built-in TASKS table alone would not know about them.
+    if task_type not in TASKS:
+        try:
+            from mbo_utilities.gui.tasks import load_plugin_tasks
+
+            load_plugin_tasks()
+        except Exception:
+            logger.exception("Could not load plugin tasks")
+
     if task_type not in TASKS:
         logger.error(f"Unknown task type: {task_type}")
         print(f"Unknown task type: {task_type}", file=sys.stderr)
