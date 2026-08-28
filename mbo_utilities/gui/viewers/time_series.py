@@ -101,6 +101,19 @@ class TimeSeriesViewer(BaseViewer):
                             "Install with: uv pip install mbo_utilities"
                         )
 
+            roi = getattr(self.parent, "manual_roi", None)
+            if roi is not None and imgui.begin_tab_item("ROI")[0]:
+                imgui.push_style_var(imgui.StyleVar_.window_padding, imgui.ImVec2(8, 8))
+                imgui.push_style_var(imgui.StyleVar_.frame_padding, imgui.ImVec2(4, 3))
+                try:
+                    with imgui_ctx.begin_child(
+                        "##RoiContent", imgui.ImVec2(0, 0), imgui.ChildFlags_.none
+                    ):
+                        roi.draw_tab()
+                finally:
+                    imgui.pop_style_var(2)
+                imgui.end_tab_item()
+
             if imgui.begin_tab_item("BioHPC")[0]:
                 imgui.push_style_var(imgui.StyleVar_.window_padding, imgui.ImVec2(8, 8))
                 imgui.push_style_var(imgui.StyleVar_.frame_padding, imgui.ImVec2(4, 3))
