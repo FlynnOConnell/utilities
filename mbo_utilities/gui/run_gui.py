@@ -658,9 +658,19 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
         if add_gui is not None:
             add_gui(gui)
     elif widget == "manualroi":
+        # the full preview widget, plus an ROI tab: manual drawing still needs
+        # the windowing controls to see anything
         from mbo_utilities.gui.manual_roi import ManualRoiWidget
 
-        ManualRoiWidget(iw, data_array.source_path)
+        gui = PreviewDataWidget(
+            iw=iw,
+            fpath=data_array.source_path,
+            size=300,
+        )
+        gui.manual_roi = ManualRoiWidget(iw, data_array.source_path)
+        add_gui = getattr(iw.figure, "add_gui", None)
+        if add_gui is not None:
+            add_gui(gui)
     elif widget != "none":
         raise ValueError(
             f"unknown widget {widget!r}, expected one of: preview, manualroi, none"
