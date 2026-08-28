@@ -641,6 +641,7 @@ class PreviewDataWidget(EdgeWindow):
         self._saveas_video_mean_subtract = False
         self._saveas_video_time_overlay = False
         self._saveas_video_scalebar = False
+        self._saveas_video_upscale = 0  # 0 = auto
 
     def _init_viewer(self):
         """Initialize the viewer based on data type."""

@@ -147,25 +147,57 @@ def _draw_time_overlay(frame_rgb: np.ndarray, t_seconds: float) -> None:
         (255, 255, 255), thickness, cv2.LINE_AA,
     )
 
-# yuv420p is left to imageio's default — adding -pix_fmt here collides with
-# imageio's own injected -pix_fmt and triggers a "Multiple -pix_fmt" ffmpeg
-# warning. yuv420p is mathematically lossless for grayscale input since R=G=B
-# means chroma is identically zero (subsampling zero is still zero) and is the
-# only browser-compatible chroma layout.
-# veryslow + yuv444p was tried and crashed the bundled imageio-ffmpeg binary
-# mid-stream (broken pipe). slow gives ~95% of the compression efficiency at a
-# fraction of the memory/time and is rock-solid.
-# "lossless" intentionally uses crf=8, not crf=0: -crf 0 enables libx264's
-# lossless mode which produces a non-standard High Profile stream that Windows
-# Photos / Chrome / native QuickTime refuse to display (file is created but
-# won't open). crf=8 stays inside standard High Profile so every player works,
-# and for 8-bit output it is mathematically lossless within the LSB.
-_X264_PRESET_TABLE = {
-    "preview":           {"crf": 23, "preset": "medium", "tune": None},
-    "high":              {"crf": 18, "preset": "slow",   "tune": None},
-    "visually lossless": {"crf": 14, "preset": "slow",   "tune": None},
-    "lossless":          {"crf":  8, "preset": "slow",   "tune": "psnr"},
+# Encoder tiers, ordered fast/small -> slow/exact. Three things set fidelity,
+# and only one of them is the crf:
+#
+#   rate     -crf N, or -qp 0 which enables libx264's true lossless mode.
+#   preset   x264's speed/efficiency dial. This is the "Quick -> Slow" axis;
+#            it does not change fidelity at a fixed rate, only encode time and
+#            file size, so it has to move together with the rate to make the
+#            tier ordering mean what the names promise.
+#   pix_fmt  the yuvj* variants are FULL RANGE (luma 0-255). The plain yuv*
+#            variants make ffmpeg squeeze the incoming 0-255 RGB into limited
+#            "TV" range (16-235) and stretch it back on decode. That round trip
+#            alone costs ~2 dB PSNR at every crf and is pure loss for
+#            scientific data -- it was the dominant error source here, not the
+#            crf. Passed to imageio as `pixelformat=`, never as a bare
+#            -pix_fmt in output_params (that collides with imageio's own).
+#
+# Chroma layout is the other axis. For grayscale frames R=G=B, so chroma is
+# constant and 4:2:0 subsampling is free. For colormapped frames (cmap=...)
+# 4:2:0 halves the chroma resolution and costs real accuracy, which is why the
+# lossless tier is 4:4:4.
+#
+# Measured round-trip error vs. the exact uint8 frames handed to the encoder
+# (512x512, 60 frames, sharp structure + scalebar + time overlay):
+#
+#   preview            PSNR 36.2 dB   max err 74/255
+#   high               PSNR 38.5 dB   max err 64/255
+#   visually lossless  PSNR 54.7 dB   max err  8/255
+#   lossless           bit-exact      max err  0
+#
+# "lossless" is exact for grayscale frames, where R=G=B survives the RGB->YUV
+# matrix untouched. With a colormap it lands within 1/255 per channel: that
+# residue is the 8-bit RGB<->YUV matrix rounding, and it is the floor for
+# H.264 here. gbrp (planar RGB, no matrix at all) would remove it, but this
+# libx264 build rejects it and silently falls back to *limited-range* yuv444p,
+# which is worse than what we ask for -- so yuvj444p is the best available.
+#
+# Player support: the first three are standard High profile and play
+# everywhere (Chrome, Windows Photos, PowerPoint, QuickTime). "lossless" is
+# High 4:4:4 Predictive, which only ffmpeg-based players decode -- see the
+# warning emitted by `_build_video_output_params`. Use "visually lossless"
+# when the file has to open in a browser or a slide deck.
+_X264_TIERS = {
+    "preview":           {"rate": ["-crf", "23"], "preset": "veryfast", "pix_fmt": "yuvj420p"},
+    "high":              {"rate": ["-crf", "17"], "preset": "medium",   "pix_fmt": "yuvj420p"},
+    "visually lossless": {"rate": ["-crf",  "1"], "preset": "slow",     "pix_fmt": "yuvj420p"},
+    "lossless":          {"rate": ["-qp",   "0"], "preset": "veryslow", "pix_fmt": "yuvj444p"},
 }
+
+# x264's lossless mode forces the High 4:4:4 Predictive profile regardless of
+# chroma layout, and that profile is what browsers and Windows Photos refuse.
+_LIMITED_PLAYBACK_TIERS = ("lossless",)
 
 _MPEG4_QSCALE_TABLE = {
     "preview": 8,
@@ -179,7 +211,7 @@ def _resolve_quality_preset(quality: str | int) -> str:
     """Normalize quality (string preset name or legacy 1-10 int) to a preset key."""
     if isinstance(quality, str):
         key = quality.strip().lower().replace("_", " ")
-        if key not in _X264_PRESET_TABLE:
+        if key not in _X264_TIERS:
             raise ValueError(
                 f"Unknown quality preset {quality!r}. "
                 f"Expected one of {VIDEO_QUALITY_PRESETS}."
@@ -195,20 +227,61 @@ def _resolve_quality_preset(quality: str | int) -> str:
     return "lossless"
 
 
-def _build_video_output_params(codec: str, quality: str | int) -> list[str]:
-    """Build ffmpeg output_params for (codec, quality preset)."""
+def _build_video_output_params(codec: str, quality: str | int) -> tuple[list[str], str | None]:
+    """ffmpeg output_params and pixel format for (codec, quality preset).
+
+    The pixel format is returned separately because it goes to imageio as
+    `pixelformat=`; putting a bare -pix_fmt in output_params duplicates
+    imageio's own and ffmpeg then warns about it.
+    """
     preset = _resolve_quality_preset(quality)
     if codec in ("libx264", "libx265"):
-        cfg = _X264_PRESET_TABLE[preset]
-        params = ["-crf", str(cfg["crf"]), "-preset", cfg["preset"]]
-        if cfg.get("tune"):
-            params.extend(["-tune", cfg["tune"]])
-        return params
+        cfg = _X264_TIERS[preset]
+        if preset in _LIMITED_PLAYBACK_TIERS:
+            logger.warning(
+                f"quality={preset!r} encodes bit-exact H.264 in the "
+                f"High 4:4:4 Predictive profile. VLC, mpv, ImageJ and ffmpeg "
+                f"play it; Chrome, Windows Photos and PowerPoint do not. Use "
+                f"quality='visually lossless' for a file that opens anywhere."
+            )
+        return [*cfg["rate"], "-preset", cfg["preset"]], cfg["pix_fmt"]
     if codec == "mpeg4":
-        return ["-qscale:v", str(_MPEG4_QSCALE_TABLE[preset])]
+        return ["-qscale:v", str(_MPEG4_QSCALE_TABLE[preset])], None
     if codec == "rawvideo":
-        return []
-    return ["-q:v", str(_MPEG4_QSCALE_TABLE[preset])]
+        return [], None
+    return ["-q:v", str(_MPEG4_QSCALE_TABLE[preset])], None
+
+
+# Small sensor FOVs (spine imaging, line scans) come off the scope only a few
+# hundred pixels wide. A 128x50 movie is pixelated because it holds 6400
+# pixels, not because the codec failed it, and the scalebar label lands at
+# ~8px tall where the glyph and its outline smear into one blob. Replicating
+# every source pixel into an NxN block fixes both: nearest-neighbour at an
+# integer factor is exact (no interpolation, no invented detail, so
+# quality="lossless" stays honest) and it gives the overlays a real pixel
+# budget to draw into.
+_UPSCALE_TARGET_SHORT_SIDE = 480
+_UPSCALE_MAX_LONG_SIDE = 2048
+
+
+def _resolve_upscale(height: int, width: int, upscale: int | None) -> int:
+    """Integer nearest-neighbour factor for a (height, width) frame.
+
+    `upscale=None` auto-picks the smallest factor that lifts the short side to
+    `_UPSCALE_TARGET_SHORT_SIDE`, capped so the long side stays under
+    `_UPSCALE_MAX_LONG_SIDE`. Frames that are already big get 1, so ordinary
+    512x512 data is untouched.
+    """
+    if upscale is not None:
+        f = int(upscale)
+        if f < 1:
+            raise ValueError(f"upscale must be >= 1, got {upscale!r}")
+        return f
+    short, long = min(height, width), max(height, width)
+    f = -(-_UPSCALE_TARGET_SHORT_SIDE // short)          # ceil division
+    while f > 1 and long * f > _UPSCALE_MAX_LONG_SIDE:
+        f -= 1
+    return max(1, f)
 
 
 def to_video(
@@ -233,6 +306,7 @@ def to_video(
     time_overlay: bool = False,
     scalebar: bool = False,
     pixel_size_um: float | None = None,
+    upscale: int | None = None,
     channel: int = 0,
     frame_indices: list | None = None,
 ):
@@ -293,6 +367,15 @@ def to_video(
         Pixel size in micrometers (X). Read from `data.dx` if not provided.
         If neither source has a positive value, scalebar is silently skipped
         with a warning.
+    upscale : int, optional
+        Integer nearest-neighbour magnification applied to each rendered
+        frame before the overlays are drawn. Each source pixel becomes an
+        `upscale` x `upscale` block, so no interpolation happens and no
+        detail is invented — but the scalebar and clock get drawn at the
+        larger size and come out crisp instead of smeared. Default None
+        auto-picks the smallest factor that lifts the short side to
+        480px (long side capped at 2048px); frames already that big
+        get 1, so ordinary 512x512 data is unchanged. Pass 1 to disable.
     spatial_smooth : float, default 0
         Gaussian blur sigma (pixels). Reduces pixel noise.
         0 = disabled, 0.5-1.0 = subtle, 2+ = heavy blur.
@@ -303,12 +386,17 @@ def to_video(
         Matplotlib colormap name (e.g., "viridis", "gray", "hot").
         If None, outputs grayscale.
     quality : str or int, default "visually lossless"
-        Quality preset. One of:
-          - "preview"           crf 23, preset medium, yuv420p (small/fast)
-          - "high"              crf 18, preset slow,    yuv420p
-          - "visually lossless" crf 14, preset veryslow, yuv444p
-          - "lossless"          crf 0,  preset veryslow, yuv444p (math-lossless)
-        Ints 1-10 are mapped to presets for backwards compatibility
+        Quality preset, ordered fast/small -> slow/exact:
+          - "preview"           crf 23, veryfast, yuvj420p  (rough check)
+          - "high"              crf 17, medium,   yuvj420p  (slides, talks)
+          - "visually lossless" crf  1, slow,     yuvj420p  (max err 8/255)
+          - "lossless"          qp   0, veryslow, yuvj444p  (bit-exact
+                                  for grayscale, within 1/255 with a cmap)
+        The first three are standard High profile and play everywhere.
+        "lossless" is High 4:4:4 Predictive: VLC, mpv, ImageJ and ffmpeg
+        decode it, but Chrome, Windows Photos and PowerPoint do not — pick
+        "visually lossless" when the file has to open in a browser or a
+        slide deck. Ints 1-10 map onto these for backwards compatibility.
         (1-3 -> preview, 4-7 -> high, 8-9 -> visually lossless, 10 -> lossless).
     codec : str, default "libx264"
         Video codec. "libx264" for mp4 (best compatibility). For mpeg4 the
@@ -444,8 +532,42 @@ def to_video(
     else:
         colormap = None
 
-    output_params = _build_video_output_params(codec, quality)
-    logger.info(f"ffmpeg output params: {' '.join(output_params)}")
+    output_params, pix_fmt = _build_video_output_params(codec, quality)
+    logger.info(
+        f"ffmpeg output params: {' '.join(output_params)} "
+        f"(pixelformat={pix_fmt or 'imageio default'})"
+    )
+    if cmap is not None and pix_fmt is not None and pix_fmt.endswith("420p"):
+        logger.info(
+            f"cmap={cmap!r} at quality={_resolve_quality_preset(quality)!r} uses "
+            f"4:2:0 chroma, which halves color resolution. quality='lossless' "
+            f"keeps colormapped frames exact."
+        )
+
+    factor = _resolve_upscale(height, width, upscale)
+    out_h, out_w = height * factor, width * factor
+    if factor > 1:
+        logger.info(
+            f"upscaling {height}x{width} -> {out_h}x{out_w} "
+            f"(nearest-neighbour x{factor}, exact); overlays drawn at output size"
+        )
+    # the scalebar sizes itself off the frame it is handed, so it needs the
+    # per-*output*-pixel size or the bar would claim `factor`x its real length
+    overlay_dx = pixel_size_um / factor if pixel_size_um else pixel_size_um
+
+    # 4:2:0 needs even dimensions. Left alone, imageio bicubic-*rescales* the
+    # whole frame to reach them (macro_block_size), softening every pixel
+    # including the scalebar and clock. Replicate the edge row/column instead
+    # so the real data is bit-for-bit untouched, and switch the block
+    # alignment off now that the size is already valid.
+    needs_even = pix_fmt is None or pix_fmt.endswith("420p")
+    pad_y = out_h % 2 if needs_even else 0
+    pad_x = out_w % 2 if needs_even else 0
+    if pad_y or pad_x:
+        logger.info(
+            f"padding {out_h}x{out_w} -> {out_h + pad_y}x{out_w + pad_x} "
+            f"(edge replication) for {pix_fmt} chroma alignment"
+        )
 
     _temporal_aggregators = {
         "mean": lambda buf: np.mean(buf, axis=0),
@@ -467,12 +589,16 @@ def to_video(
                 f"mean_subtract shape {mean_sub_2d.shape} != frame ({height}, {width})"
             )
 
+    writer_kwargs = {}
+    if pix_fmt is not None:
+        writer_kwargs["pixelformat"] = pix_fmt
     writer = imageio.get_writer(
         str(output_path),
         fps=output_fps,
         codec=codec,
-        macro_block_size=2,
+        macro_block_size=1,
         output_params=output_params,
+        **writer_kwargs,
     )
 
     try:
@@ -507,13 +633,24 @@ def to_video(
                 frame_uint8 = (frame * 255).astype(np.uint8)
                 frame_rgb = np.stack([frame_uint8] * 3, axis=-1)
 
+            # magnify before the overlays so the text is rasterised at the
+            # output resolution. np.repeat on both axes is plain pixel
+            # replication -- the source values survive exactly.
+            if factor > 1:
+                frame_rgb = np.repeat(np.repeat(frame_rgb, factor, axis=0), factor, axis=1)
+
             if time_overlay or scalebar:
                 # cv2 draws in-place; ensure the array is contiguous and writable
                 frame_rgb = np.ascontiguousarray(frame_rgb)
                 if time_overlay:
                     _draw_time_overlay(frame_rgb, i / fps)
                 if scalebar:
-                    _draw_scalebar(frame_rgb, pixel_size_um)
+                    _draw_scalebar(frame_rgb, overlay_dx)
+
+            if pad_y or pad_x:
+                frame_rgb = np.pad(
+                    frame_rgb, ((0, pad_y), (0, pad_x), (0, 0)), mode="edge"
+                )
 
             writer.append_data(frame_rgb)
     finally:
@@ -714,6 +851,7 @@ class MP4Array(ReductionMixin, Shape5DMixin):
         temporal_mode: str = "mean",
         time_overlay: bool = False,
         scalebar: bool = False,
+        upscale: int | None = None,
     ) -> Path:
         """
         Write one video file per (z-plane, channel) from a source array.
@@ -808,6 +946,7 @@ class MP4Array(ReductionMixin, Shape5DMixin):
                     time_overlay=time_overlay,
                     scalebar=scalebar,
                     pixel_size_um=pixel_size_um,
+                    upscale=upscale,
                 )
 
                 file_idx += 1
