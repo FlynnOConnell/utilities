@@ -310,6 +310,100 @@ def drag(widget, size=60):
     send(widget, "pointer_up", cx - size, cy - size)
 
 
+class TestWidgetAttach:
+    """The dispatch in _create_image_widget, which the CLI test mocks past."""
+
+    @pytest.mark.parametrize("widget", ["preview", "manualroi", "none"])
+    def test_widget_attaches_without_raising(self, widget):
+        from mbo_utilities.arrays.numpy import NumpyArray
+        from mbo_utilities.gui.run_gui import _create_image_widget
+
+        data = np.random.default_rng(0).random((4, 1, 1, 32, 32)).astype(np.float32)
+        arr = NumpyArray(data, dims="TCZYX")
+
+        iw = _create_image_widget(
+            arr, widget=widget, figure_kwargs_override={"size": FIGURE_SIZE}
+        )
+        try:
+            assert iw is not None
+        finally:
+            iw.close()
+
+    def test_manualroi_keeps_the_preview_widget(self):
+        from mbo_utilities.arrays.numpy import NumpyArray
+        from mbo_utilities.gui.run_gui import _create_image_widget
+        from mbo_utilities.gui.widgets.preview_data import PreviewDataWidget
+
+        data = np.random.default_rng(0).random((4, 1, 1, 32, 32)).astype(np.float32)
+        arr = NumpyArray(data, dims="TCZYX")
+
+        iw = _create_image_widget(
+            arr, widget="manualroi", figure_kwargs_override={"size": FIGURE_SIZE}
+        )
+        try:
+            windows = iw.figure.imgui_windows.values()
+            preview = [w for w in windows if isinstance(w, PreviewDataWidget)]
+            assert preview, "manualroi must keep PreviewDataWidget for the windowing tabs"
+            assert getattr(preview[0], "manual_roi", None) is not None
+        finally:
+            iw.close()
+
+
+    def test_roi_tab_is_in_the_tab_bar_and_renders(self):
+        from imgui_bundle import imgui
+
+        import mbo_utilities.gui.viewers.time_series as ts
+        from mbo_utilities.arrays.numpy import NumpyArray
+        from mbo_utilities.gui.run_gui import _create_image_widget
+        from mbo_utilities.gui.widgets.preview_data import PreviewDataWidget
+
+        data = np.random.default_rng(0).random((8, 1, 1, 64, 64)).astype(np.float32)
+        iw = _create_image_widget(
+            NumpyArray(data, dims="TCZYX"),
+            widget="manualroi",
+            figure_kwargs_override={"size": FIGURE_SIZE},
+        )
+        gui = next(
+            w for w in iw.figure.imgui_windows.values()
+            if isinstance(w, PreviewDataWidget)
+        )
+        gui.manual_roi.add_roi(square(10, 10, 20))
+
+        # imgui only runs the body of the selected tab, so force ROI once
+        seen, errors = [], []
+        real = imgui.begin_tab_item
+        force = [True]
+
+        def spy(label, *args, **kwargs):
+            seen.append(label)
+            if label == "ROI" and force[0]:
+                force[0] = False
+                return real(label, None, imgui.TabItemFlags_.set_selected)
+            return real(label, *args, **kwargs)
+
+        original_draw_tab = gui.manual_roi.draw_tab
+
+        def guarded():
+            try:
+                original_draw_tab()
+            except Exception as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+                raise
+
+        ts.imgui.begin_tab_item = spy
+        gui.manual_roi.draw_tab = guarded
+        try:
+            for _ in range(4):
+                iw.figure.canvas.draw()
+        finally:
+            ts.imgui.begin_tab_item = real
+            iw.close()
+
+        assert "ROI" in seen, f"ROI tab missing from tab bar: {seen}"
+        assert "Preview" in seen and "Run" in seen, "preview tabs must survive"
+        assert not errors, f"ROI tab raised: {errors}"
+
+
 class TestWidgetSelection:
     def test_cli_routes_widget_name(self):
         from unittest import mock
