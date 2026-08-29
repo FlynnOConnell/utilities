@@ -4,6 +4,8 @@ shared ui components for timepoint, z-plane, and channel selection.
 used by both save-as dialog and suite2p run tab.
 """
 
+import contextlib
+
 from imgui_bundle import imgui, hello_imgui
 
 from mbo_utilities.arrays.features._slicing import parse_timepoint_selection
@@ -106,6 +108,7 @@ def draw_selection_table(
     tp_label: str = "Timepoints",
     z_label: str = "Z-Planes",
     c_label: str = "Channels",
+    axes: dict[str, str] | None = None,
 ):
     """
     Draw a selection table for timepoints, z-planes, and channels.
@@ -134,7 +137,36 @@ def draw_selection_table(
         Row labels for the timepoint, z-plane, and channel rows. Defaults
         match the generic Timepoints/Z-Planes/Channels; callers pass the
         loaded array's slider names via :func:`resolve_dim_labels`.
+    axes : dict of str to str, optional
+        Per-axis consumption mode keyed by "T"/"Z"/"C", from
+        ``PipelineWidget.axes_consumed``. "range" (the default for every
+        axis) draws the editable range input; "all" pins the axis to its
+        full extent and disables editing; "none" hides the row;
+        "select-one" draws a single-index picker. Omitted axes are
+        "range", so callers passing nothing keep the previous behaviour.
     """
+    axes = axes or {}
+    tp_mode = axes.get("T", "range")
+    z_mode = axes.get("Z", "range")
+    c_mode = axes.get("C", "range")
+
+    # An axis consumed whole is pinned to its full extent so the state
+    # the caller reads back stays correct while the row is not editable.
+    if tp_mode == "all":
+        setattr(parent, f"{tp_attr}_selection", f"1:{max_frames}")
+        setattr(parent, f"{tp_attr}_error", "")
+        with contextlib.suppress(ValueError):
+            setattr(
+                parent,
+                f"{tp_attr}_parsed",
+                parse_timepoint_selection(f"1:{max_frames}", max_frames),
+            )
+    if z_mode == "all":
+        setattr(parent, f"{z_attr}_selection", f"1:{num_planes}")
+        setattr(parent, f"{z_attr}_error", "")
+    if c_mode == "all":
+        setattr(parent, f"{c_attr}_selection", f"1:{num_channels}")
+        setattr(parent, f"{c_attr}_error", "")
     # get/set attributes dynamically
     tp_selection = getattr(parent, f"{tp_attr}_selection", f"1:{max_frames}")
     tp_error = getattr(parent, f"{tp_attr}_error", "")
@@ -191,66 +223,76 @@ def draw_selection_table(
         imgui.table_setup_column("all", imgui.TableColumnFlags_.width_fixed, hello_imgui.em_size(3))
         imgui.table_setup_column("info", imgui.TableColumnFlags_.width_stretch)
 
-        # timepoints row
-        imgui.table_next_row()
-        imgui.table_next_column()
-        imgui.text(tp_label)
+        if tp_mode != "none":
+            _tp_disabled = tp_mode == "all"
+            if _tp_disabled:
+                imgui.begin_disabled()
+            # timepoints row
+            imgui.table_next_row()
+            imgui.table_next_column()
+            imgui.text(tp_label)
 
-        imgui.table_next_column()
-        imgui.set_next_item_width(INPUT_WIDTH)
+            imgui.table_next_column()
+            imgui.set_next_item_width(INPUT_WIDTH)
 
-        # red border if error
-        had_error = bool(tp_error)
-        if had_error:
-            imgui.push_style_color(imgui.Col_.frame_bg, imgui.ImVec4(0.3, 0.1, 0.1, 1.0))
+            # red border if error
+            had_error = bool(tp_error)
+            if had_error:
+                imgui.push_style_color(imgui.Col_.frame_bg, imgui.ImVec4(0.3, 0.1, 0.1, 1.0))
 
-        changed, new_val = imgui.input_text(f"##tp{id_suffix}", tp_selection)
-        if changed:
-            setattr(parent, f"{tp_attr}_selection", new_val)
-            try:
-                parsed = parse_timepoint_selection(new_val, max_frames)
+            changed, new_val = imgui.input_text(f"##tp{id_suffix}", tp_selection)
+            if changed:
+                setattr(parent, f"{tp_attr}_selection", new_val)
+                try:
+                    parsed = parse_timepoint_selection(new_val, max_frames)
+                    setattr(parent, f"{tp_attr}_parsed", parsed)
+                    setattr(parent, f"{tp_attr}_error", "")
+                    tp_parsed = parsed
+                    tp_error = ""
+                except ValueError as e:
+                    setattr(parent, f"{tp_attr}_error", str(e))
+                    setattr(parent, f"{tp_attr}_parsed", None)
+                    tp_error = str(e)
+                    tp_parsed = None
+
+            if had_error:
+                imgui.pop_style_color()
+
+            if tp_error and imgui.is_item_hovered():
+                imgui.set_tooltip(tp_error)
+
+            imgui.table_next_column()
+            if imgui.small_button(f"All##tp{id_suffix}"):
+                setattr(parent, f"{tp_attr}_selection", f"1:{max_frames}")
+                parsed = parse_timepoint_selection(f"1:{max_frames}", max_frames)
                 setattr(parent, f"{tp_attr}_parsed", parsed)
                 setattr(parent, f"{tp_attr}_error", "")
                 tp_parsed = parsed
-                tp_error = ""
-            except ValueError as e:
-                setattr(parent, f"{tp_attr}_error", str(e))
-                setattr(parent, f"{tp_attr}_parsed", None)
-                tp_error = str(e)
-                tp_parsed = None
 
-        if had_error:
-            imgui.pop_style_color()
-
-        if tp_error and imgui.is_item_hovered():
-            imgui.set_tooltip(tp_error)
-
-        imgui.table_next_column()
-        if imgui.small_button(f"All##tp{id_suffix}"):
-            setattr(parent, f"{tp_attr}_selection", f"1:{max_frames}")
-            parsed = parse_timepoint_selection(f"1:{max_frames}", max_frames)
-            setattr(parent, f"{tp_attr}_parsed", parsed)
-            setattr(parent, f"{tp_attr}_error", "")
-            tp_parsed = parsed
-
-        imgui.table_next_column()
-        # frame count info
-        if tp_parsed:
-            n_frames = tp_parsed.count
-            if tp_parsed.exclude_str:
-                n_excluded = len(tp_parsed.exclude_indices)
-                imgui.text_colored(imgui.ImVec4(0.6, 0.8, 1.0, 1.0), f"{n_frames}/{max_frames}")
-                imgui.same_line()
-                imgui.text_colored(imgui.ImVec4(1.0, 0.6, 0.4, 1.0), f"(-{n_excluded})")
+            imgui.table_next_column()
+            # frame count info
+            if tp_parsed:
+                n_frames = tp_parsed.count
+                if tp_parsed.exclude_str:
+                    n_excluded = len(tp_parsed.exclude_indices)
+                    imgui.text_colored(imgui.ImVec4(0.6, 0.8, 1.0, 1.0), f"{n_frames}/{max_frames}")
+                    imgui.same_line()
+                    imgui.text_colored(imgui.ImVec4(1.0, 0.6, 0.4, 1.0), f"(-{n_excluded})")
+                else:
+                    imgui.text_colored(imgui.ImVec4(0.6, 0.8, 1.0, 1.0), f"{n_frames}/{max_frames}")
+            elif tp_error:
+                imgui.text_colored(imgui.ImVec4(1.0, 0.3, 0.3, 1.0), "invalid")
             else:
-                imgui.text_colored(imgui.ImVec4(0.6, 0.8, 1.0, 1.0), f"{n_frames}/{max_frames}")
-        elif tp_error:
-            imgui.text_colored(imgui.ImVec4(1.0, 0.3, 0.3, 1.0), "invalid")
-        else:
-            imgui.text_colored(imgui.ImVec4(0.6, 0.8, 1.0, 1.0), f"?/{max_frames}")
+                imgui.text_colored(imgui.ImVec4(0.6, 0.8, 1.0, 1.0), f"?/{max_frames}")
+
+            if _tp_disabled:
+                imgui.end_disabled()
 
         # z-planes row (only if multi-plane)
-        if num_planes > 1:
+        if num_planes > 1 and z_mode != "none":
+            _z_disabled = z_mode == "all"
+            if _z_disabled:
+                imgui.begin_disabled()
             imgui.table_next_row()
             imgui.table_next_column()
             imgui.text(z_label)
@@ -298,8 +340,14 @@ def draw_selection_table(
             else:
                 imgui.text_colored(imgui.ImVec4(0.6, 0.8, 1.0, 1.0), f"{n_planes_selected}/{num_planes}")
 
+            if _z_disabled:
+                imgui.end_disabled()
+
         # channels row (only if multi-channel)
-        if num_channels > 1:
+        if num_channels > 1 and c_mode != "none":
+            _c_disabled = c_mode == "all"
+            if _c_disabled:
+                imgui.begin_disabled()
             imgui.table_next_row()
             imgui.table_next_column()
             imgui.text(c_label)
@@ -312,7 +360,29 @@ def draw_selection_table(
             if had_c_error:
                 imgui.push_style_color(imgui.Col_.frame_bg, imgui.ImVec4(0.3, 0.1, 0.1, 1.0))
 
-            changed, new_val = imgui.input_text(f"##c{id_suffix}", c_selection)
+            if c_mode == "select-one":
+                # A pipeline that reads one channel gets a picker, not a
+                # range: a 2-element range here would silently mean
+                # something the pipeline cannot honour.
+                sel_idx = max(0, min(c_start - 1, num_channels - 1))
+                changed, sel_idx = imgui.combo(
+                    f"##c{id_suffix}",
+                    sel_idx,
+                    [str(i + 1) for i in range(num_channels)],
+                )
+                if changed:
+                    c_start = c_stop = sel_idx + 1
+                    c_step = 1
+                    setattr(parent, c_selection_attr, f"{c_start}:{c_stop}")
+                    setattr(parent, c_error_attr, "")
+                    setattr(parent, f"{c_attr}_start", c_start)
+                    setattr(parent, f"{c_attr}_stop", c_stop)
+                    setattr(parent, f"{c_attr}_step", 1)
+                    c_error = ""
+                changed = False
+                new_val = c_selection
+            else:
+                changed, new_val = imgui.input_text(f"##c{id_suffix}", c_selection)
             if changed:
                 setattr(parent, c_selection_attr, new_val)
                 c_start, c_stop, c_step, err = _parse_channel_selection(new_val, num_channels)
@@ -346,6 +416,9 @@ def draw_selection_table(
                 imgui.text_colored(imgui.ImVec4(1.0, 0.3, 0.3, 1.0), "invalid")
             else:
                 imgui.text_colored(imgui.ImVec4(0.6, 0.8, 1.0, 1.0), f"{n_channels_selected}/{num_channels}")
+
+            if _c_disabled:
+                imgui.end_disabled()
 
         # suffix row (optional)
         if suffix_attr:

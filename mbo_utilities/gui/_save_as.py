@@ -768,6 +768,24 @@ def _draw_video_options(parent: Any):
     )
 
     imgui.set_next_item_width(hello_imgui.em_size(8))
+    _, parent._saveas_video_upscale = imgui.input_int(
+        "Upscale", parent._saveas_video_upscale
+    )
+    parent._saveas_video_upscale = max(0, parent._saveas_video_upscale)
+    set_tooltip(
+        "Integer magnification of every frame, applied before the scalebar and\n"
+        "clock are drawn so their text is rasterised at the output size instead\n"
+        "of being smeared across a handful of pixels.\n"
+        "\n"
+        "Each source pixel becomes an NxN block (nearest-neighbour): nothing is\n"
+        "interpolated and no detail is invented, so 'lossless' stays exact.\n"
+        "\n"
+        "0 = auto: lifts the short side to 480px (long side capped at 2048px).\n"
+        "Frames already that big are left alone. Set 1 to disable."
+    )
+
+
+    imgui.set_next_item_width(hello_imgui.em_size(8))
     _, parent._saveas_video_temporal_mode_idx = imgui.combo(
         "Temporal mode",
         parent._saveas_video_temporal_mode_idx,
@@ -822,12 +840,17 @@ def _draw_video_options(parent: Any):
         "Quality", parent._saveas_video_quality_idx, _VIDEO_QUALITY_PRESETS
     )
     set_tooltip(
-        "Quality preset (libx264, yuv420p):\n"
-        "  preview            crf 23, medium     (small/fast)\n"
-        "  high               crf 18, slow       (web-friendly)\n"
-        "  visually lossless  crf 14, slow       (no perceptible loss)\n"
-        "  lossless           crf 8,  slow, psnr (lossless within 8-bit LSB; standard\n"
-        "                                         profile so every player accepts it)\n"
+        "Quality preset (libx264), fastest/smallest at the top:\n"
+        "  preview            crf 23, veryfast, yuvj420p  (rough check)\n"
+        "  high               crf 17, medium,   yuvj420p  (slides, talks)\n"
+        "  visually lossless  crf  1, slow,     yuvj420p  (max error 8/255)\n"
+        "  lossless           qp   0, veryslow, yuvj444p  (bit-exact)\n"
+        "\n"
+        "The top three are standard High profile and open anywhere.\n"
+        "'lossless' is High 4:4:4 Predictive: VLC, mpv, ImageJ and ffmpeg\n"
+        "play it, but Chrome, Windows Photos and PowerPoint do not. Pick\n"
+        "'visually lossless' if it has to open in a browser or a deck.\n"
+        "Colormapped movies keep exact color only at 'lossless' (4:4:4).\n"
         "mpeg4 maps these to -qscale:v 8/4/2/1."
     )
 
@@ -1352,6 +1375,7 @@ def _draw_save_button(parent: Any):
                     save_kwargs["temporal_mode"] = _VIDEO_TEMPORAL_MODES[parent._saveas_video_temporal_mode_idx]
                     save_kwargs["time_overlay"] = parent._saveas_video_time_overlay
                     save_kwargs["scalebar"] = parent._saveas_video_scalebar
+                    save_kwargs["upscale"] = parent._saveas_video_upscale or None
                     mean_sub_path = _write_mean_subtract_stack(parent)
                     if mean_sub_path:
                         save_kwargs["mean_subtract_path"] = mean_sub_path
@@ -1408,6 +1432,7 @@ def _draw_save_button(parent: Any):
                             "temporal_mode": _VIDEO_TEMPORAL_MODES[parent._saveas_video_temporal_mode_idx],
                             "time_overlay": parent._saveas_video_time_overlay,
                             "scalebar": parent._saveas_video_scalebar,
+                            "upscale": parent._saveas_video_upscale or None,
                         }
                         mean_sub_path = _write_mean_subtract_stack(parent)
                         if mean_sub_path:

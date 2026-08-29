@@ -490,8 +490,7 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
     """Create fastplotlib ImageWidget with an optional side widget.
 
     `widget` names which one to attach: "preview" (PreviewDataWidget),
-    "manualroi" (the same with the manual ROI widget already turned on - the
-    Widgets > ROIs menu toggle), or "none". True/False are the legacy
+    "manualroi" (manual ROI drawing), or "none". True/False are the legacy
     spellings of "preview"/"none".
 
     `figure_kwargs_override` replaces the auto-selected canvas/size dict (used by
@@ -648,6 +647,19 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
     if widget in ("preview", "manualroi"):
         from mbo_utilities.gui.widgets.preview_data import PreviewDataWidget
 
+        # drawing needs the windowing controls to see anything, so the ROI
+        # ui takes the free top and left edges alongside the preview widget,
+        # not instead of it. Flip the Widgets-menu toggle on for this session
+        # when asked for, or when this data already has annotations beside
+        # it; the widget builds itself from the toggle. Not persisted — the
+        # flag came from the command line or the disk, not the menu.
+        from mbo_utilities.gui.manual_roi import labels_path
+        from mbo_utilities.gui.widgets.widget_toggles import set_widget_enabled
+
+        src = data_array.source_path
+        if widget == "manualroi" or (src is not None and labels_path(src).exists()):
+            set_widget_enabled("manual_roi", True, persist=False)
+
         gui = PreviewDataWidget(
             iw=iw,
             fpath=data_array.source_path,
@@ -658,14 +670,6 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
         add_gui = getattr(iw.figure, "add_gui", None)
         if add_gui is not None:
             add_gui(gui)
-        # the manual ROI widget is a Widgets-menu toggle; start with it on
-        # when asked for, or when this data already has annotations beside
-        # it. attach_roi_widget logs (never raises) if it cannot be built.
-        from mbo_utilities.gui.manual_roi import attach_roi_widget, labels_path
-
-        src = data_array.source_path
-        if widget == "manualroi" or (src is not None and labels_path(src).exists()):
-            attach_roi_widget(gui, focus=widget == "manualroi")
     elif widget != "none":
         raise ValueError(
             f"unknown widget {widget!r}, expected one of: preview, manualroi, none"
@@ -1442,9 +1446,8 @@ def run_gui(
         ROI index(es) to display. None shows all ROIs for raw files.
     widget : bool or str, default True
         Side widget to attach: ``"preview"`` (PreviewDataWidget, the default),
-        ``"manualroi"`` (the same with the manual ROI widget turned on - the
-        ``Widgets > ROIs`` menu toggle) or ``"none"``. ``True``/``False`` are
-        the legacy spellings of ``"preview"``/``"none"``.
+        ``"manualroi"`` (manual ROI drawing) or ``"none"``. ``True``/``False``
+        are the legacy spellings of ``"preview"``/``"none"``.
     metadata_only : bool, default False
         If True, only show metadata inspector (no image viewer).
     select_only : bool, default False

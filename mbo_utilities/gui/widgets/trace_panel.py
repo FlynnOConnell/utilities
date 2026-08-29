@@ -54,7 +54,10 @@ class TracePanel:
         self.status = ""
         self.normalize = False
         self.visible = False
+        # the viewer's t: drawn as a guide, and draggable when the owner
+        # supplies ``on_scrub(frame)`` so the cursor scrubs the movie
         self.frame_marker: int | None = None
+        self.on_scrub = None
         self.draw_count = 0
         self._closed = False
         self._placed = False
@@ -116,6 +119,20 @@ class TracePanel:
         imgui.set_next_window_size(imgui.ImVec2(w, h), imgui.Cond_.first_use_ever)
         self._placed = True
 
+    def _draw_cursor(self) -> None:
+        if self.on_scrub is None:
+            implot.plot_inf_lines(
+                "##t",
+                np.array([float(self.frame_marker)]),
+                spec=implot.Spec(line_color=imgui.ImVec4(1, 1, 1, 0.5)),
+            )
+            return
+        moved, frame = implot.drag_line_x(
+            0, float(self.frame_marker), imgui.ImVec4(1.0, 0.85, 0.3, 0.9), 1.5
+        )[:2]
+        if moved:
+            self.on_scrub(int(round(frame)))
+
     def draw(self) -> None:
         """Call every frame from a host update call; a no-op while hidden."""
         if not self.visible:
@@ -159,11 +176,7 @@ class TracePanel:
                             spec=implot.Spec(line_color=imgui.ImVec4(r, g, b, 1.0), line_weight=1.5),
                         )
                     if self.frame_marker is not None:
-                        implot.plot_inf_lines(
-                            "##t",
-                            np.array([float(self.frame_marker)]),
-                            spec=implot.Spec(line_color=imgui.ImVec4(1, 1, 1, 0.5)),
-                        )
+                        self._draw_cursor()
                 finally:
                     implot.end_plot()
         finally:

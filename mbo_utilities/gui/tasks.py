@@ -1502,3 +1502,59 @@ TASKS = {
     "isoview_fuse": task_multi_fuse,
     "isoview_bigstitcher": task_generate_bigstitcher,
 }
+
+_PLUGIN_TASKS_LOADED = False
+
+
+def register_task(name: str, func) -> None:
+    """
+    Register a worker function under ``name``.
+
+    Parameters
+    ----------
+    name : str
+        The ``task_type`` the GUI spawns with. Must not collide with a
+        built-in.
+    func : callable
+        Called as ``func(args, logger)`` in the worker subprocess.
+
+    Raises
+    ------
+    ValueError
+        If ``name`` is already registered to a different function.
+    """
+    existing = TASKS.get(name)
+    if existing is not None and existing is not func:
+        raise ValueError(f"task {name!r} is already registered")
+    TASKS[name] = func
+
+
+def load_plugin_tasks() -> None:
+    """
+    Register worker functions contributed by entry-point pipelines.
+
+    A pipeline widget class may expose ``task_type`` and ``task_func``; the
+    pair is registered here so the worker subprocess can dispatch to it
+    without mbo_utilities importing the plugin by name. Cached.
+    """
+    global _PLUGIN_TASKS_LOADED
+    if _PLUGIN_TASKS_LOADED:
+        return
+    _PLUGIN_TASKS_LOADED = True
+
+    try:
+        from mbo_utilities.pipeline_registry import load_entry_point_pipelines
+
+        classes = load_entry_point_pipelines()
+    except Exception:
+        return
+
+    for cls in classes:
+        name = getattr(cls, "task_type", None)
+        func = getattr(cls, "task_func", None)
+        if not name or func is None:
+            continue
+        try:
+            register_task(name, func)
+        except ValueError:
+            continue

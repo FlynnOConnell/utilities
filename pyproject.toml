@@ -3,7 +3,7 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "utilities"
+name = "mbo_utilities"
 version = "3.3.4"
 description = "Various utilities for the Miller Brain Observatory"
 readme = "README.md"
@@ -166,7 +166,8 @@ docs = [
     "myst_nb",
     "pygfx>=0.14.0",
 ]
-all = ["utilities[napari,notebooks]"]
+cloud = ["imgui_cloud>=0.1.0"]
+all = ["mbo_utilities[napari,notebooks]"]
 
 [tool.uv]
 # repo dev env keeps the full stack so `uv run mbo` is unchanged.

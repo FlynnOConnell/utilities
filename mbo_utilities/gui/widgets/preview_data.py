@@ -67,7 +67,6 @@ from mbo_utilities.gui._stats import (
     refresh_zstats,
 )
 from mbo_utilities.gui._help_viewer import draw_help_popup
-from mbo_utilities.gui._biohpc import draw_biohpc_popup
 from mbo_utilities.gui._imgui_helpers import fit_width
 from mbo_utilities.gui._metadata_editor import draw_metadata_popup
 from mbo_utilities.gui._options_popup import draw_options_popup
@@ -167,6 +166,10 @@ class PreviewDataWidget(EdgeWindow):
     location : str
         Panel location ("right" or "bottom").
     """
+
+    # built on demand by sync_manual_roi() when the Widgets menu entry is on;
+    # owns the figure's top (controls) and left (ROI table) edge windows
+    manual_roi = None
 
     def __init__(
         self,
@@ -565,9 +568,8 @@ class PreviewDataWidget(EdgeWindow):
         # (see gui/_metadata_editor.draw_metadata_popup).
         self._show_metadata_popup = False
         # Widgets menu: the manual ROI widget while it is on (see
-        # gui/manual_roi.attach_roi_widget) and the BioHPC popup request
+        # sync_manual_roi / gui/manual_roi.attach_roi_widget)
         self.manual_roi = None
-        self._show_biohpc_popup = False
 
         # Directories
         save_as_dir = get_last_dir("save_as")
@@ -647,6 +649,7 @@ class PreviewDataWidget(EdgeWindow):
         self._saveas_video_mean_subtract = False
         self._saveas_video_time_overlay = False
         self._saveas_video_scalebar = False
+        self._saveas_video_upscale = 0  # 0 = auto
 
     def _init_viewer(self):
         """Initialize the viewer based on data type."""
@@ -665,6 +668,31 @@ class PreviewDataWidget(EdgeWindow):
             maybe_spawn_raw_projections(self)
         except Exception:
             self.logger.debug("raw projection prefetch skipped", exc_info=True)
+        # honour a persisted / CLI-set "Manual ROI Labeling" toggle
+        from mbo_utilities.gui.widgets.widget_toggles import widget_enabled
+        self.sync_manual_roi(widget_enabled("manual_roi"))
+
+    def sync_manual_roi(self, enabled: bool) -> None:
+        """Create or tear down the manual-ROI widget to match the toggle.
+
+        Building it attaches an overlay graphic to the subplot and claims the
+        figure's top and left edge windows, so it is created lazily the first
+        time the widget is switched on and dropped again when it is switched
+        off.
+        """
+        from mbo_utilities.gui.manual_roi import attach_roi_widget, detach_roi_widget
+
+        current = getattr(self, "manual_roi", None)
+        if enabled and current is None:
+            # attach logs (never raises) when the widget cannot be built, and
+            # adopts the store parked by the previous detach in this session
+            attach_roi_widget(self)
+        elif not enabled and current is not None:
+            try:
+                detach_roi_widget(self)
+            except Exception:
+                self.logger.debug("manual ROI teardown failed", exc_info=True)
+                self.manual_roi = None
 
     def _seed_playback_fps(self):
         """Seed the t playback rate from the loaded array's frame rate.
@@ -1222,7 +1250,6 @@ class PreviewDataWidget(EdgeWindow):
         draw_keybinds_popup(self)
         draw_help_popup(self)
         draw_options_popup(self)
-        draw_biohpc_popup(self)
         try:
             from mbo_utilities.gui.widgets.isoview_crop import draw_window as _draw_iso_crop_window
             _draw_iso_crop_window(self)
@@ -1337,10 +1364,7 @@ class PreviewDataWidget(EdgeWindow):
 
         cleanup_pipelines(self)
         cleanup_all_widgets(self._widgets)
-        if getattr(self, "manual_roi", None) is not None:
-            from mbo_utilities.gui.manual_roi import detach_roi_widget
-
-            detach_roi_widget(self)
+        self.sync_manual_roi(False)
 
         self._file_dialog = None
         self._folder_dialog = None

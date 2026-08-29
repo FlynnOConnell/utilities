@@ -1,13 +1,14 @@
 """Manual ROI drawing + labeling widget for the viewer.
 
-Toggled from the ``Widgets > ROIs`` menu of the preview GUI (``mbo <path>
---widget manualroi`` opens with it on). Laid out like masknmf's
+Toggled from ``Widgets > Manual ROI Labeling`` in the preview GUI (``mbo
+<path> --widget manualroi`` opens with it on). Laid out like masknmf's
 ``ClassificationVis``: a panel across the top of the figure carries every
-control - drawing tools, overlay toggles, labeling progress, the class
-label editor and buttons - and a "ROIs" tab in the right-hand widget holds
-the filter row and the sortable ROI table. The panel, table, label set,
-stroke capture and overlay compositing are the shared widgets from
-``masknmf.visualization.imgui``, so the two GUIs look and behave the same.
+control - drawing tools, background and overlay controls, labeling
+progress, the class label editor and buttons - and a "ROIs" tab in the
+right-hand widget (see ``widgets/tabs.py``) holds the filter row and the
+sortable ROI table. The panel, table, label set, stroke capture and overlay
+compositing are the shared widgets from ``masknmf.visualization.imgui``,
+so the two GUIs look and behave the same.
 
 Arm "Add ROI", drag a closed stroke around a cell, release and the enclosed
 pixels become a mask. ROIs live in a ``RoiLabelStore``: one ``(Z, Y, X)``
@@ -19,12 +20,24 @@ without a z slider degrades to a single plane.
 
 Each ROI can carry a class label from a user-defined label set (colored
 buttons in the panel; keys 1-9 assign, 0 clears) and a free-text note.
-Classified ROIs render in their class color, unclassified ones keep their
-own hue.
+The colour mode picks whether ROIs render in their class colour, their own
+hue, or the class colour where labelled and their own hue otherwise.
 
 Annotations autosave next to the data as an OME-NGFF-style labels zarr
 (``manual_labels.zarr``, see ``mbo_utilities.annotation``) and are restored
 from it on relaunch. "Save" writes the full store explicitly.
+
+The background is the viewer's own image graphic, so the bg source combo
+picks between the live movie and mean / max / std projections of the plane
+on screen. Those same images (plus the movie and the ROI outlines) open in
+"Full FOV", the shared ``SummaryImageViewer``.
+
+Each row of the ROI table carries a Run button (extract or demix that ROI
+through ``roi_workflow``, writing ``rois_<tag>/`` beside the data), a
+Quick trace and an Extract trace button. Traces run on their own thread,
+tracked as a job in the process manager, and land in the floating Traces
+panel, whose cursor is the viewer's own ``t`` - drag it to scrub the movie.
+With drawing off, clicking a background pixel traces that pixel.
 
 With drawing off, clicking an ROI selects it: it is redrawn at
 ``SELECTED_OPACITY`` behind a white rim, and its row in the table is
@@ -38,16 +51,26 @@ subplot per ROI and the rest are left alone.
 
 from __future__ import annotations
 
+import queue
+import threading
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
+import tifffile
 from fastplotlib.ui import ImguiWindow
 from imgui_bundle import imgui, imgui_ctx, icons_fontawesome_6 as fa
 from masknmf.visualization.imgui import (
+    OUTLINE_PLACEMENT,
+    OUTLINE_PLACEMENTS,
+    OUTLINE_WIDTH,
+    SELECTED_ALPHA,
+    UNLABEL_ALL,
     AsyncLoad,
     LabelSet,
     RoiOrder,
+    RowAction,
     StrokeDrawer,
     SummaryImageViewer,
     draw_filter_row,
@@ -56,13 +79,18 @@ from masknmf.visualization.imgui import (
     draw_label_editor,
     draw_progress,
     draw_roi_table,
-    label_edges,
     label_image_rgba,
+    outline_labels,
 )
-from masknmf.visualization.imgui.overlay import SELECTED_ALPHA
 
 from mbo_utilities import log
-from mbo_utilities.annotation import UNLABELED, LabelsZarr, RoiLabelStore
+from mbo_utilities.annotation import (
+    ROI_COLORS,
+    UNLABELED,
+    LabelsZarr,
+    RoiLabelStore,
+    class_color,
+)
 from mbo_utilities.arrays.features import find_slider_name
 from mbo_utilities.gui._imgui_helpers import (
     button_width,
@@ -73,6 +101,7 @@ from mbo_utilities.gui._imgui_helpers import (
     set_tooltip,
 )
 from mbo_utilities.gui.widgets.trace_panel import TracePanel
+from mbo_utilities.gui.widgets.widget_toggles import sub_enabled
 from mbo_utilities.roi_workflow import (
     OUT_PREFIX,
     PlaneMovie,
@@ -82,21 +111,29 @@ from mbo_utilities.roi_workflow import (
     roi_trace,
 )
 
-# what the per-row Run button and "run in view" send the ROIs through
-PROCESSES = ("extract", "demix")
-
 __all__ = [
+    "COLOR_MODES",
+    "MAX_OUTLINE_WIDTH",
+    "OUTLINE_PLACEMENTS",
+    "PANEL_HEIGHT",
+    "PANEL_LOCATION",
+    "PROCESSES",
+    "PROJECTIONS",
     "ManualRoiWidget",
     "SAVE_NAME",
     "SELECTED_OPACITY",
     "attach_roi_widget",
+    "compute_projections",
     "detach_roi_widget",
     "labels_path",
     "roi_widgets_available",
 ]
 
-# the top panel: three control rows, like ClassificationVis
-TOOLBAR_HEIGHT = 110
+# the top panel: the control rows, like ClassificationVis. Rows wrap on
+# overflow and the window grows to fit (fit_edge_window), so this is a floor
+PANEL_LOCATION = "top"
+PANEL_HEIGHT = 110
+TOOLBAR_HEIGHT = PANEL_HEIGHT
 
 # below these widths the panel / tab collapse to a placeholder line rather
 # than clip: the tools need one button row, the table its three columns
@@ -116,20 +153,58 @@ DEFAULT_LABEL_NAMES = ("cell", "not cell")
 
 COLUMNS = ("id", "label", "area")
 
+# what the per-row Run button and "run in view" send the ROIs through
+PROCESSES = ("extract", "demix")
+
+# how ROI fills and outlines are coloured
+COLOR_MODES = ("label + roi", "label", "roi")
+UNLABELED_COLOR = (0.62, 0.62, 0.62)
+
+# a thicker boundary than this swallows a small ROI whole
+MAX_OUTLINE_WIDTH = 6
+
+
+def _icon(name: str, fallback: str) -> str:
+    """FontAwesome glyph by constant name, or a plain-text stand-in."""
+    return getattr(fa, name, "") or fallback
+
+
+# the per-row action buttons: glyph only, so the column stays narrow, with
+# the name in the tooltip
+RUN_ICON = _icon("ICON_FA_PLAY", ">")
+QUICK_TRACE_ICON = _icon("ICON_FA_BOLT", "~")
+EXTRACT_TRACE_ICON = _icon("ICON_FA_FLASK", "F")
+
+# background sources besides the live movie. Reduced over an evenly spaced
+# sample rather than every frame: this runs off a lazy array and only has to
+# be good enough to draw ROIs on.
+PROJECTIONS = {
+    "mean": lambda stack: stack.mean(axis=0),
+    "max": lambda stack: stack.max(axis=0),
+    "std": lambda stack: stack.std(axis=0),
+}
+PROJECTION_FRAMES = 300
+
 KEYBINDS = (
     ("a", "arm / disarm drawing"),
     ("esc", "stop drawing"),
     ("ctrl+z", "undo last ROI"),
     ("delete", "delete the selected ROI"),
+    ("up / down", "previous / next ROI"),
+    ("shift + up / down", "jump 10 ROIs"),
+    ("left / right", "previous / next label group"),
     ("1-9", "assign label to the selected ROI"),
     ("0", "clear its label"),
+    ("u", "jump to next unlabeled ROI"),
+    ("m", "toggle masks"),
+    ("o", "toggle outlines"),
+    ("b", "toggle background"),
     ("click", "select the ROI under the cursor (drawing off)"),
 )
 
-_DANGER_COLORS = (
-    imgui.ImVec4(0.75, 0.15, 0.15, 0.8),
-    imgui.ImVec4(0.90, 0.20, 0.20, 1.0),
-)
+_CODE_COLOR = imgui.ImVec4(0.55, 0.75, 1.0, 1.0)
+_LOADING_COLOR = imgui.ImVec4(1.0, 0.8, 0.2, 1.0)
+_ERROR_COLOR = imgui.ImVec4(1.0, 0.4, 0.3, 1.0)
 
 
 def labels_path(fpath) -> Path:
@@ -147,6 +222,20 @@ def roi_widgets_available() -> bool:
     except Exception:
         return False
     return True
+
+
+def _byte_exact(rgb) -> np.ndarray:
+    """uint8 rgb as 0-1 floats that come back as the same bytes after the
+    overlay's ``(colors * 255).astype(uint8)`` truncation."""
+    return (np.asarray(rgb, np.float32) + 0.5) / 255.0
+
+
+def compute_projections(movie, n_frames: int = PROJECTION_FRAMES) -> dict:
+    """Reduce an evenly spaced sample of ``movie`` down to one image each."""
+    total = int(movie.shape[0])
+    picks = np.unique(np.linspace(0, total - 1, min(total, n_frames)).astype(int))
+    stack = np.stack([np.asarray(movie[int(i)], dtype=np.float32) for i in picks])
+    return {name: reduce(stack) for name, reduce in PROJECTIONS.items()}
 
 
 class _PlaneOrder(RoiOrder):
@@ -189,18 +278,21 @@ class ManualRoiWidget:
 
     def __init__(self, iw, fpath=None, label_names=(), store=None):
         self.iw = iw
+        self.figure = iw.figure
         self.fpath = Path(fpath) if fpath is not None else None
         self.logger = log.get("gui.manual_roi")
         # one-shot: the host selects the ROIs tab on the next frame
         self.focus_tab = False
 
         self.subplot = iw.figure[0, 0]
-        self.ny, self.nx = iw.graphics[0].data.value.shape[:2]
+        self.image = iw.graphics[0]
+        self.ny, self.nx = self.image.data.value.shape[:2]
 
         # z axis of the viewer, resolved through the same aliases the rest of
         # the GUI uses ("z", "Zplane", "Z-plane", "Cube-slice", ...); None
         # when the data has no depth
         self.zdim = find_slider_name(iw.dim_names, "z")
+        self.tdim = find_slider_name(iw.dim_names, "t")
         nz = 1
         if self.zdim is not None:
             rr = iw.ndwidget.indices.ref_ranges.get(self.zdim)
@@ -223,9 +315,29 @@ class ManualRoiWidget:
         self.keybinds_open = False
         self.scroll_to_selection = False
 
+        # overlay appearance
         self.show_masks = True
         self.show_outlines = True
         self.opacity = 0.45
+        # px per side of the mask boundary; masknmf's shared default, kept
+        # here so it can be tuned per host
+        self.outline_width = OUTLINE_WIDTH
+        self.outline_alpha = 1.0
+        self.placement_idx = OUTLINE_PLACEMENTS.index(OUTLINE_PLACEMENT)
+        self.color_mode_idx = 0
+
+        # background: the viewer's own graphic, showing either the live movie
+        # or one of the projections of the plane on screen
+        self.show_bg = True
+        self.bg_alpha = 1.0
+        self.bg_source_idx = 0
+        self._projections: dict[str, np.ndarray] = {}
+        # (z, c) the cached projections were reduced from
+        self._projection_key: tuple[int, int] | None = None
+        self._loader = AsyncLoad()
+        self._live_frame: np.ndarray | None = None
+        self._frozen_index: dict | None = None
+        self._contours: list | None = None
 
         # ui-side mirrors of the store: the masknmf label set + table order
         self.classes = LabelSet(0, self.store.label_names)
@@ -242,6 +354,12 @@ class ManualRoiWidget:
             alpha_mode="blend",
             offset=(0, 0, 1),
         )
+        # the overlay is literal uint8 RGBA, not data to be contrast-stretched.
+        # fastplotlib auto-ranges it off the initial all-zero array, giving
+        # vmin == vmax == 0, which saturates every non-zero channel to 255 -
+        # tab10 class colours all come out white, and only hues with a zero
+        # channel survive. Pin the full byte range instead.
+        self.overlay.vmin, self.overlay.vmax = 0, 255
         # keep the overlay out of picking: the tooltip then reports the image
         # intensity under the cursor as it does without this widget, and ROI
         # hit-testing is a label lookup here rather than a pick
@@ -250,23 +368,32 @@ class ManualRoiWidget:
 
         self.drawer = StrokeDrawer(self.subplot, self.add_roi, self._pick)
 
-        self.summary = SummaryImageViewer(iw.figure, title="Full FOV")
+        self.summary = SummaryImageViewer(
+            iw.figure,
+            title="Full FOV",
+            roi_provider=self.roi_contours,
+            on_export=self.export_image,
+        )
 
-        # quick traces (bottom panel, built on first use) and pipeline runs,
-        # both computed off the draw thread through the movie contract
-        # ``arr[t, c, z, y, x]`` so any lazy array the viewer shows works
+        # traces (floating panel, built on first use) and pipeline runs, both
+        # computed off the draw thread through the movie contract
+        # ``arr[t, c, z, y, x]`` so any lazy array the viewer shows works.
+        # Every trace click is its own thread and process-manager job; the
+        # results come back through a queue drained on the draw loop.
         self.traces: TracePanel | None = None
         self.pixel_traces = True
+        self._trace_results: queue.Queue = queue.Queue()
+        self._trace_threads: list[threading.Thread] = []
         self.process = PROCESSES[0]
         self.run_status = ""
-        self._trace_job = AsyncLoad()
         self._run_job = AsyncLoad()
 
-        # keep the window handle so the panel can grow when its rows wrap
+        # keep the window handle so the panel can grow when its rows wrap,
+        # and so teardown never reclaims an edge another widget took over
         self.tools_window = iw.figure.add_imgui_window(
             ImguiWindow(update_call=self.draw_panel),
-            location="top",
-            size=TOOLBAR_HEIGHT,
+            location=PANEL_LOCATION,
+            size=PANEL_HEIGHT,
             title="ROIs",
         )
 
@@ -279,11 +406,19 @@ class ManualRoiWidget:
     # ------------------------------------------------------------------
 
     def close(self):
-        """Take everything back off the figure: panel, overlays, handlers."""
+        """Take everything back off the figure: panel, overlays, handlers,
+        and hand the viewer's graphic back to the live movie."""
         if self._closed:
             return
         self._closed = True
         self.set_drawing(False)
+        try:
+            self.set_bg_source(0)
+            self.show_bg = True
+            self.bg_alpha = 1.0
+            self.apply_background()
+        except Exception:
+            self.logger.debug("background restore failed", exc_info=True)
         renderer = self.subplot.renderer
         for fn, kind in (
             (self.drawer._down, "pointer_down"),
@@ -305,18 +440,19 @@ class ManualRoiWidget:
             except (KeyError, ValueError):
                 pass
         try:
+            self.summary.close()
             self.summary.cleanup()
         except Exception:
             self.logger.debug("summary viewer cleanup failed", exc_info=True)
         if self.traces is not None:
             self.traces.close()
             self.traces = None
-        if self.iw.figure.imgui_windows.get("top") is self.tools_window:
-            self.iw.figure.remove_imgui_window("top")
+        if self.figure.imgui_windows.get(PANEL_LOCATION) is self.tools_window:
+            self.figure.remove_imgui_window(PANEL_LOCATION)
         self.tools_window = None
 
     # ------------------------------------------------------------------
-    # z tracking
+    # z / t tracking
     # ------------------------------------------------------------------
 
     def _current_z(self) -> int:
@@ -331,6 +467,7 @@ class ManualRoiWidget:
         if z == self.z:
             return
         self.z = z
+        self._contours = None
         if self.drawer.stroke:
             # a stroke cannot span planes; drop one interrupted by a z jump
             self.drawer.stroke = []
@@ -339,6 +476,20 @@ class ManualRoiWidget:
             self.order.plane = z
             self.order.rebuild()
         self.refresh_overlay()
+
+    def current_frame(self) -> int:
+        """The viewer's t (0 for data without a time axis)."""
+        if self.tdim is None:
+            return 0
+        return int(self.iw.indices[self.tdim])
+
+    def set_frame(self, frame: int):
+        """Move the viewer's t, so dragging the trace cursor scrubs the movie."""
+        if self.tdim is None:
+            return
+        movie = self.movie()
+        limit = (int(movie.shape[0]) - 1) if movie is not None else 0
+        self.iw.indices[self.tdim] = int(np.clip(frame, 0, limit))
 
     # ------------------------------------------------------------------
     # store <-> ui mirrors
@@ -390,6 +541,7 @@ class ManualRoiWidget:
         self.order.planes = planes
         self.order.set_range_column("area")
         self.order.rebuild()
+        self._contours = None
 
     def _sync_store_from_classes(self):
         """Push label-set edits (add / remove a class) back into the store."""
@@ -449,14 +601,16 @@ class ManualRoiWidget:
         if index < 0 and self.pixel_traces:
             self.trace_pixel(row, col)
 
-    def select_roi(self, index: int):
+    pick_roi = _pick
+
+    def select_roi(self, index: int | None):
         """Select ROI ``index``; anything out of range clears the selection.
 
         The selected ROI is redrawn at ``SELECTED_OPACITY`` behind a white
         rim, and the table scrolls its row into view on the next frame.
         Selecting an ROI on another plane jumps the z slider to it.
         """
-        self.selected = index if 0 <= index < self.n_rois else -1
+        self.selected = index if index is not None and 0 <= index < self.n_rois else -1
         self.scroll_to_selection = True
         if self.selected < 0:
             self._note_buf = ""
@@ -469,12 +623,59 @@ class ManualRoiWidget:
             if self.zdim is not None and record.z != self.z:
                 # fires _on_indices, which refreshes the overlay for that plane
                 self.iw.indices[self.zdim] = record.z
+        self.summary.set_highlight(self.selected_bbox())
         self.refresh_overlay()
+
+    def selected_bbox(self) -> tuple | None:
+        """``(y0, x0, h, w)`` of the selected ROI, for the Full FOV highlight."""
+        if self.selected < 0:
+            return None
+        record = self.store.rois[self.selected]
+        rows, cols = np.nonzero(self.store.labels[record.z] == self.selected + 1)
+        if not rows.size:
+            return None
+        y0, x0 = int(rows.min()), int(cols.min())
+        return y0, x0, int(rows.max()) - y0 + 1, int(cols.max()) - x0 + 1
+
+    def roi_contours(self) -> list:
+        """Outline of every ROI on the current plane as ``(N, 2)`` y/x
+        points, for the Full FOV."""
+        if self._contours is not None:
+            return self._contours
+        contours = []
+        plane = self.labels
+        for i in self.store.rois_on_plane(self.z):
+            mask = (plane == i + 1).astype(np.uint8)
+            found, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            contours.extend(c.reshape(-1, 2)[:, ::-1] for c in found if len(c) > 1)
+        self._contours = contours
+        return contours
+
+    def step(self, delta: int):
+        """Move through the filtered/sorted view by ``delta`` ROIs."""
+        if self.order.step(delta):
+            self.select_roi(self.order.current)
+
+    def step_group(self, direction: int):
+        """Jump to the first ROI in view of the next/previous label class."""
+        if self.order.step_group(direction):
+            self.select_roi(self.order.current)
+
+    def next_unlabeled(self):
+        """Jump to the next unlabeled ROI in the current view."""
+        if self.order.next_unlabeled():
+            self.select_roi(self.order.current)
 
     def delete_roi(self, index: int):
         """Drop one ROI and renumber the labels above it."""
         if not self.store.delete_roi(index):
             return
+        # deleting renumbers every ROI above it, so traces named by index no
+        # longer belong to the ROIs that key them
+        if self.traces is not None:
+            self.traces.clear()
         self._resync()
         self.select_roi(min(index, self.n_rois - 1))
         self.status = f"deleted ROI {index}"
@@ -482,6 +683,8 @@ class ManualRoiWidget:
 
     def clear(self):
         self.store.clear()
+        if self.traces is not None:
+            self.traces.clear()
         self._resync()
         self.select_roi(-1)
         self.status = "cleared"
@@ -508,14 +711,49 @@ class ManualRoiWidget:
         self.classes.assign(range(self.n_rois), UNLABELED)
         self.order.rebuild()
         self.refresh_overlay()
+        self.status = f"cleared {self.n_rois} labels"
         self._autosave()
 
+    # ------------------------------------------------------------------
+    # overlay
+    # ------------------------------------------------------------------
+
+    @property
+    def color_mode(self) -> str:
+        return COLOR_MODES[self.color_mode_idx]
+
+    @property
+    def outline_placement(self) -> str:
+        return OUTLINE_PLACEMENTS[self.placement_idx]
+
+    def edges(self, width: int | None = None, placement: str | None = None) -> np.ndarray:
+        """Outline of the current plane's labels, as a label image."""
+        return outline_labels(
+            self.labels,
+            self.outline_width if width is None else width,
+            self.outline_placement if placement is None else placement,
+        )
+
     def _colors(self) -> np.ndarray:
-        """(n, 3) float rgb per ROI: class color where labeled, own hue else."""
-        n = max(self.n_rois, 1)
-        colors = np.zeros((n, 3), np.float32)
-        for i in range(self.n_rois):
-            colors[i] = np.asarray(self.store.roi_rgb(i), np.float32) / 255.0
+        """One RGB (0-1) per ROI, per the colour mode.
+
+        ``label`` gives every ROI in a class the same colour and greys the
+        unlabeled; ``roi`` gives each its own hue so neighbours stay apart
+        while drawing; ``label + roi`` does the first where a label exists
+        and the second where it does not.
+        """
+        mode = self.color_mode
+        colors = np.zeros((max(self.n_rois, 1), 3), np.float32)
+        for i, record in enumerate(self.store.rois):
+            identity = _byte_exact(ROI_COLORS[i % len(ROI_COLORS)])
+            if mode == "roi":
+                colors[i] = identity
+            elif record.class_index >= 0:
+                colors[i] = _byte_exact(
+                    [round(c * 255) for c in class_color(record.class_index)]
+                )
+            else:
+                colors[i] = identity if mode == "label + roi" else UNLABELED_COLOR
         return colors
 
     def refresh_overlay(self):
@@ -523,15 +761,17 @@ class ManualRoiWidget:
         self.overlay.visible = self.show_masks or self.show_outlines
         if not self.overlay.visible:
             return
-        plane = self.store.labels[self.z]
         self.overlay.data = label_image_rgba(
-            plane,
+            self.labels,
             colors=self._colors(),
             alpha=self.opacity,
             selected=self.selected,
             show_masks=self.show_masks,
             show_outlines=self.show_outlines,
-            edges=label_edges(plane),
+            edges=self.edges(),
+            outline_width=self.outline_width,
+            outline_alpha=self.outline_alpha,
+            outline_placement=self.outline_placement,
         )
 
     # ------------------------------------------------------------------
@@ -540,6 +780,10 @@ class ManualRoiWidget:
 
     def _save_target(self) -> Path:
         return labels_path(self.fpath)
+
+    def _output_path(self, name: str) -> Path:
+        """``name`` beside the data (the labels zarr's directory)."""
+        return self._save_target().parent / name
 
     def _restore(self):
         """Adopt a previously saved labels zarr next to the data, if any."""
@@ -597,68 +841,296 @@ class ManualRoiWidget:
         self.logger.info(f"saved {self.n_rois} ROIs to {target}")
 
     # ------------------------------------------------------------------
-    # full-FOV popup
-    # ------------------------------------------------------------------
-
-    def open_full_fov(self):
-        """masknmf's summary-image popup over the frame on screen and the
-        current plane's label image."""
-        frame = np.asarray(self.iw.graphics[0].data.value, np.float32)
-        if frame.ndim == 3:
-            frame = frame[..., :3].mean(axis=-1)
-        images = {"current frame": frame}
-        if self.n_rois:
-            images["ROI labels"] = self.store.labels[self.z].astype(np.float32)
-        self.summary.set_images(images, selected="current frame")
-        self.summary.open()
-
-    # ------------------------------------------------------------------
-    # quick traces and pipeline runs, through the movie contract
+    # the movie contract
     # ------------------------------------------------------------------
 
     def _channel(self) -> int:
         cdim = find_slider_name(self.iw.dim_names, "c")
         return int(self.iw.indices[cdim]) if cdim is not None else 0
 
-    def movie(self, z: int | None = None) -> PlaneMovie:
+    def movie(self, z: int | None = None) -> PlaneMovie | None:
         """``(T, Y, X)`` view of the viewer's array on plane ``z`` (default:
-        the plane on screen) and the channel on screen."""
-        arr = self.iw.data[0]
+        the plane on screen) and the channel on screen, or None when the
+        array is not something the movie contract can wrap."""
+        try:
+            arr = self.iw.data[0]
+        except (AttributeError, IndexError, TypeError):
+            return None
         z = self.z if z is None else int(z)
-        nz = PlaneMovie(arr, z=0, c=0).nz
-        return PlaneMovie(arr, z=(z if nz > 1 else 0), c=self._channel())
+        try:
+            nz = PlaneMovie(arr, z=0, c=0).nz
+            return PlaneMovie(arr, z=(z if nz > 1 else 0), c=self._channel())
+        except (ValueError, IndexError, TypeError):
+            return None
+
+    plane_movie = movie
+
+    # ------------------------------------------------------------------
+    # background and summary images
+    # ------------------------------------------------------------------
+
+    @property
+    def bg_sources(self) -> list[str]:
+        """The live movie, then the projections. Reduced on first selection."""
+        return ["movie", *PROJECTIONS]
+
+    def _plane_key(self) -> tuple[int, int]:
+        return self.z, self._channel()
+
+    def drop_stale_projections(self):
+        """Forget projections reduced from a plane the viewer has left."""
+        if self._projection_key is None:
+            return
+        if self._plane_key() != self._projection_key:
+            self._projections = {}
+            self._projection_key = None
+
+    def request_projections(self):
+        """Kick off the projection reduce for the plane on screen, once."""
+        self.drop_stale_projections()
+        movie = self.movie()
+        if movie is None or self._loader.busy or self._projections:
+            return
+        self._projection_key = self._plane_key()
+        self._loader.start(
+            lambda: compute_projections(movie), "computing projections..."
+        )
+
+    def _poll_projections(self):
+        result = self._loader.poll()
+        if result is None:
+            return
+        self._projections = result
+        name = self.bg_sources[self.bg_source_idx]
+        if name in result:
+            self._freeze_background(name)
+        self.refresh_full_fov()
+
+    def apply_background(self):
+        self.image.visible = self.show_bg
+        self.image.alpha = self.bg_alpha
+
+    def _freeze_background(self, name: str):
+        """Park the projection in the viewer's graphic, keeping the live frame."""
+        if self._frozen_index is None:
+            self._live_frame = np.asarray(self.image.data.value).copy()
+        self.image.data = self._projections[name]
+        self._frozen_index = dict(self.iw.current_index)
+
+    def set_bg_source(self, index: int):
+        """Freeze the viewer graphic to a projection, or hand it back."""
+        self.drop_stale_projections()
+        sources = self.bg_sources
+        self.bg_source_idx = int(np.clip(index, 0, len(sources) - 1))
+        name = sources[self.bg_source_idx]
+        if name == "movie":
+            if self._frozen_index is not None and self._live_frame is not None:
+                self.image.data = self._live_frame
+            self._frozen_index = None
+        elif name in self._projections:
+            self._freeze_background(name)
+        else:
+            # the reduce runs on a thread; _poll_projections parks it
+            self.request_projections()
+
+    def _follow_viewer(self):
+        """Snap back to "movie" once the viewer has repainted the graphic.
+
+        The NDWidget rewrites the image whenever a slider moves, so a frozen
+        projection is gone the moment the user scrubs; the combo has to say
+        so. The projections themselves stay cached - they only depend on
+        the plane / channel, which ``drop_stale_projections`` checks.
+        """
+        if self._frozen_index is None:
+            return
+        if dict(self.iw.current_index) != self._frozen_index:
+            self._frozen_index = None
+            self.bg_source_idx = 0
+
+    def open_full_fov(self):
+        """Open the shared summary viewer over the movie, the projections and
+        the current plane's ROI outlines."""
+        self.request_projections()
+        movie = self.movie()
+        # movies first: set_images resolves `selected` against both sets
+        self.summary.set_movies({"movie": movie} if movie is not None else {})
+        self.summary.set_images(
+            {"current frame": np.asarray(self.image.data.value), **self._projections},
+            selected=self.bg_sources[self.bg_source_idx],
+        )
+        self.summary.set_highlight(self.selected_bbox())
+        self.summary.open()
+
+    def refresh_full_fov(self):
+        """Push newly computed projections into an already-open Full FOV."""
+        if self.summary.is_open and self._projections:
+            self.summary.set_images(
+                {
+                    "current frame": np.asarray(self.image.data.value),
+                    **self._projections,
+                }
+            )
+
+    def export_image(self, key: str, array):
+        """Write one summary image beside the data, as the Full FOV's export."""
+        out = self._output_path(f"summary_{key.replace(' ', '_')}.tif")
+        try:
+            tifffile.imwrite(out, np.asarray(array, dtype=np.float32))
+        except OSError as error:
+            self.status = f"export failed: {error}"
+            return
+        self.status = f"exported {out.name}"
+        self.logger.info(f"exported {key} to {out}")
+
+    # ------------------------------------------------------------------
+    # traces: each click is a thread + process-manager job, landing in the
+    # floating Traces panel
+    # ------------------------------------------------------------------
 
     def _trace_panel(self) -> TracePanel:
         if self.traces is None:
             self.traces = TracePanel(self.iw.figure)
+            self.traces.on_scrub = self.set_frame
         self.traces.show()
         return self.traces
 
+    @property
+    def trace_busy(self) -> bool:
+        self._trace_threads = [t for t in self._trace_threads if t.is_alive()]
+        return bool(self._trace_threads)
+
+    def trace_extractor(self):
+        """The pipeline "Extract trace" would run, or None."""
+        from mbo_utilities.gui.widgets.pipelines import get_trace_extractors
+
+        extractors = get_trace_extractors()
+        return extractors[0] if extractors else None
+
+    def trace_disabled(self, index: int) -> str | None:
+        """Why the trace actions cannot run for ``index``, or None."""
+        movie = self.movie()
+        if movie is None or int(movie.shape[0]) < 2:
+            return "no (T, Y, X) movie behind this view"
+        return None
+
+    def extract_disabled(self, index: int) -> str | None:
+        reason = self.trace_disabled(index)
+        if reason is not None:
+            return reason
+        if self.trace_extractor() is None:
+            return (
+                "no installed pipeline can extract traces.\n"
+                "Install one, e.g. uv pip install mbo_utilities[all]"
+            )
+        return None
+
+    def _start_trace(self, description: str, work):
+        """Run ``work`` on a thread, tracked as a process-manager job.
+
+        Every click gets its own job and its own thread: the button is the
+        only feedback the user has otherwise, and two ROIs can be tracing
+        at once. ``work`` returns ``{trace name: 1-D array}``; the results
+        come back through a queue and are added to the Traces panel by
+        :meth:`_poll_jobs` on the draw loop.
+        """
+        from mbo_utilities.gui.widgets.process_manager import get_process_manager
+
+        job = get_process_manager().start_job("roi_trace", description)
+        self.status = f"{description} started"
+        self._trace_panel().status = f"{description}..."
+
+        def run():
+            try:
+                result = work()
+            except Exception as error:  # noqa: BLE001 - reported on the job
+                self.logger.exception(f"{description} failed")
+                job.fail(f"{type(error).__name__}: {error}")
+                self._trace_results.put((description, None, str(error)))
+                return
+            if not result:
+                job.fail("the extractor returned nothing")
+                self._trace_results.put((description, None, "no trace returned"))
+                return
+            frames = int(np.asarray(next(iter(result.values()))).reshape(-1).size)
+            job.done(f"{frames} frames")
+            self._trace_results.put((description, result, None))
+
+        thread = threading.Thread(target=run, name=f"roi-trace", daemon=True)
+        self._trace_threads.append(thread)
+        thread.start()
+
     def trace_pixel(self, row: int, col: int):
         """Plot ``arr[:, c, z, row, col]`` in the trace panel."""
-        if self._trace_job.busy:
-            self.status = "trace still computing"
-            return
         movie = self.movie()
+        if movie is None:
+            return
         name = f"px ({row}, {col}) z{self.z + 1}"
-        self._trace_job.start(
-            lambda: (name, pixel_trace(movie, row, col)), status=f"tracing {name}"
+        self._start_trace(
+            f"pixel trace - ({row}, {col})",
+            lambda: {name: pixel_trace(movie, row, col)},
         )
-        self._trace_panel().status = f"tracing {name}..."
 
     def quick_trace(self, index: int):
-        """Plot the mean over ROI ``index`` per frame in the trace panel."""
+        """Mean of the ROI's pixels per frame - no pipeline, just the mask."""
         if not 0 <= index < self.n_rois:
             return
-        if self._trace_job.busy:
-            self.status = "trace still computing"
-            return
         record = self.store.rois[index]
-        mask = self.store.labels[record.z] == (index + 1)
         movie = self.movie(record.z)
+        if movie is None:
+            return
+        mask = self.store.labels[record.z] == (index + 1)
         name = f"ROI {index}"
-        self._trace_job.start(lambda: (name, roi_trace(movie, mask)), status=f"tracing {name}")
-        self._trace_panel().status = f"tracing {name}..."
+        self._start_trace(
+            f"quick trace - ROI {index}",
+            lambda: {name: roi_trace(movie, mask)},
+        )
+
+    def extract_trace(self, index: int):
+        """Hand the mask to a pipeline's own extractor (suite2p, say)."""
+        if not 0 <= index < self.n_rois:
+            return
+        pipeline = self.trace_extractor()
+        record = self.store.rois[index]
+        movie = self.movie(record.z)
+        if movie is None or pipeline is None:
+            return
+        # one ROI at a time: the pipeline sees only this mask, so its
+        # neuropil ring is not carved up by the others
+        labels = (self.store.labels[record.z] == (index + 1)).astype(np.uint16)
+
+        def work():
+            result = pipeline.extract_traces(movie, labels)
+            if not result:
+                return None
+            return {
+                f"ROI {index} {key} ({pipeline.name})": np.asarray(value).reshape(-1)
+                for key, value in result.items()
+            }
+
+        self._start_trace(f"{pipeline.name} trace - ROI {index}", work)
+
+    def _poll_traces(self):
+        """Drain finished trace jobs; called once per frame from the panel."""
+        while True:
+            try:
+                description, result, error = self._trace_results.get_nowait()
+            except queue.Empty:
+                return
+            if error is not None:
+                self.status = f"{description} failed: {error}"
+                if self.traces is not None:
+                    self.traces.status = self.status
+                continue
+            panel = self._trace_panel()
+            for name, y in result.items():
+                panel.add(name, y)
+            self.status = f"{description}: {panel.status}"
+
+    _poll_trace = _poll_traces
+
+    # ------------------------------------------------------------------
+    # pipeline runs through roi_workflow
+    # ------------------------------------------------------------------
 
     def _run_out_dir(self, tag: str) -> Path | None:
         if self.fpath is None:
@@ -707,16 +1179,7 @@ class ManualRoiWidget:
         self.run_rois([int(i) for i in self.order.order], "manual")
 
     def _poll_jobs(self):
-        got = self._trace_job.poll()
-        if got is not None:
-            name, y = got
-            self._trace_panel().add(name, y)
-            self.status = f"{name}: {y.size} frames"
-        elif self._trace_job.error:
-            self.status = f"trace failed: {self._trace_job.error}"
-            self._trace_job.error = None
-            if self.traces is not None:
-                self.traces.status = self.status
+        self._poll_traces()
         outs = self._run_job.poll()
         if outs is not None:
             self.run_status = (
@@ -743,6 +1206,26 @@ class ManualRoiWidget:
             self.delete_roi(self.n_rois - 1)
         if self.selected >= 0 and imgui.is_key_pressed(imgui.Key.delete, False):
             self.delete_roi(self.selected)
+        if imgui.is_key_pressed(imgui.Key.b, False):
+            self.show_bg = not self.show_bg
+            self.apply_background()
+        if imgui.is_key_pressed(imgui.Key.m, False):
+            self.show_masks = not self.show_masks
+            self.refresh_overlay()
+        if imgui.is_key_pressed(imgui.Key.o, False):
+            self.show_outlines = not self.show_outlines
+            self.refresh_overlay()
+        if imgui.is_key_pressed(imgui.Key.u, False):
+            self.next_unlabeled()
+        stride = 10 if io.key_shift else 1
+        if imgui.is_key_pressed(imgui.Key.up_arrow):
+            self.step(-stride)
+        if imgui.is_key_pressed(imgui.Key.down_arrow):
+            self.step(stride)
+        if imgui.is_key_pressed(imgui.Key.left_arrow):
+            self.step_group(-1)
+        if imgui.is_key_pressed(imgui.Key.right_arrow):
+            self.step_group(1)
         if self.selected >= 0:
             picked = self.classes.hotkey_pressed()
             if picked is not None:
@@ -753,28 +1236,42 @@ class ManualRoiWidget:
     # ------------------------------------------------------------------
 
     def draw_panel(self):
-        """Top edge window: tools, overlay controls, labeling - the same rows
-        as ``ClassificationVis``.
+        """Top edge window: tools, background, overlay, labeling - the same
+        rows as ``ClassificationVis``, each gated by its Widgets-menu
+        subwidget toggle.
 
         Rows wrap on overflow and the window grows to fit, so nothing runs
         off the right edge however narrow the figure or long the label set.
         Narrower than ``MIN_PANEL_WIDTH`` the panel collapses to one line.
         """
-        self.handle_keys()
+        self._poll_projections()
         self._poll_jobs()
+        self.drop_stale_projections()
+        self._follow_viewer()
+        self.handle_keys()
         with fit_width("ROI tools", min_width=MIN_PANEL_WIDTH) as shown:
             if shown:
                 self._draw_tool_rows()
         self.summary.draw()
         if self.traces is not None:
+            self.traces.frame_marker = self.current_frame() if self.tdim else None
             self.traces.draw()
         self.keybinds_open = draw_keybinds_popup(KEYBINDS, self.keybinds_open, "ROI keys")
         if self.tools_window is not None:
-            fit_edge_window(self.tools_window, TOOLBAR_HEIGHT)
+            fit_edge_window(self.tools_window, PANEL_HEIGHT)
 
     def _draw_tool_rows(self):
-        box = imgui.get_frame_height()
+        if sub_enabled("manual_roi", "tools"):
+            self._draw_tools_row()
+        if sub_enabled("manual_roi", "overlay"):
+            self._draw_background_row()
+            self._draw_mask_row()
+        else:
+            draw_toolbar_row([(None, imgui.calc_text_size(self.status).x, self._draw_status)])
+        if sub_enabled("manual_roi", "labels"):
+            self._draw_labels_row()
 
+    def _draw_tools_row(self):
         def _add():
             with selected_button_style(self.drawer.armed):
                 if imgui.button("Add ROI"):
@@ -799,6 +1296,22 @@ class ManualRoiWidget:
             if imgui.button("Save"):
                 self.save()
 
+        def _prev():
+            if imgui.button("prev"):
+                self.step(-1)
+
+        def _next():
+            if imgui.button("next"):
+                self.step(1)
+
+        def _pos():
+            changed, pos = imgui.slider_int(
+                "##pos", self.order.pos, 0, max(len(self.order.order) - 1, 0)
+            )
+            if changed and len(self.order.order):
+                self.order.pos = pos
+                self.select_roi(self.order.current)
+
         def _fov():
             if imgui.button("Open full FOV"):
                 self.open_full_fov()
@@ -807,22 +1320,48 @@ class ManualRoiWidget:
             if imgui.button("keybinds"):
                 self.keybinds_open = True
 
-        def _masks():
-            changed, self.show_masks = imgui.checkbox("masks", self.show_masks)
-            if changed:
-                self.refresh_overlay()
+        draw_toolbar_row(
+            [
+                (None, button_width("Add ROI"), _add),
+                (None, button_width("Undo"), _undo),
+                (None, button_width("Clear"), _clear),
+                (None, button_width("Save"), _save),
+                (None, button_width("prev"), _prev),
+                (None, button_width("next"), _next),
+                ("roi", 120.0, _pos),
+                (None, button_width("Open full FOV"), _fov),
+                (None, button_width("keybinds"), _keybinds),
+                (None, imgui.calc_text_size("Autosaved").x, self._draw_save_note),
+            ]
+        )
 
-        def _outlines():
-            changed, self.show_outlines = imgui.checkbox("outlines", self.show_outlines)
-            if changed:
-                self.refresh_overlay()
+    def _draw_background_row(self):
+        box = imgui.get_frame_height()
 
-        def _opacity():
-            changed, self.opacity = imgui.slider_float(
-                "##opacity", self.opacity, 0.05, 1.0, "%.2f"
+        def _bg():
+            changed, self.show_bg = imgui.checkbox("bg image", self.show_bg)
+            imgui.same_line(0, 4)
+            imgui.text_disabled("(b)")
+            if changed:
+                self.apply_background()
+
+        def _source():
+            changed, index = imgui.combo("##bg-source", self.bg_source_idx, self.bg_sources)
+            if changed:
+                self.set_bg_source(index)
+            set_tooltip(
+                "The viewer's own image. Projections are reduced from an "
+                "evenly spaced sample of the plane on screen; moving a "
+                "slider hands the image back to the movie.",
+                show_mark=False,
+            )
+
+        def _bg_alpha():
+            changed, self.bg_alpha = imgui.slider_float(
+                "##bg-alpha", self.bg_alpha, 0.0, 1.0, "%.2f"
             )
             if changed:
-                self.refresh_overlay()
+                self.apply_background()
 
         def _px_trace():
             _, self.pixel_traces = imgui.checkbox("px trace", self.pixel_traces)
@@ -839,44 +1378,121 @@ class ManualRoiWidget:
                 else:
                     self._trace_panel()
 
-        def _status():
-            imgui.text_disabled(self.status)
-            if self._save_error is not None:
-                imgui.same_line(0, 10)
-                imgui.text_colored(imgui.ImVec4(1.0, 0.4, 0.3, 1.0), self._save_error)
-
-        status = self.status + (self._save_error or "")
         draw_toolbar_row(
             [
-                (None, button_width("Add ROI"), _add),
-                (None, button_width("Undo"), _undo),
-                (None, button_width("Clear"), _clear),
-                (None, button_width("Save"), _save),
-                (None, button_width("Open full FOV"), _fov),
-                (None, button_width("keybinds"), _keybinds),
-                (None, imgui.calc_text_size("Autosaved").x, self._draw_save_note),
-            ]
-        )
-        draw_toolbar_row(
-            [
-                (None, button_width("masks") + box, _masks),
-                (None, button_width("outlines") + box, _outlines),
-                ("roi opacity", 110.0, _opacity),
+                (None, button_width("bg image (b)") + box, _bg),
+                (None, 110.0, _source),
+                ("bg opacity", 80.0, _bg_alpha),
                 (None, button_width("px trace") + box, _px_trace),
                 (None, button_width(f"{fa.ICON_FA_CHART_LINE} Traces"), _traces),
-                (None, imgui.calc_text_size(status).x, _status),
+                (None, imgui.calc_text_size(self._status_text()).x, self._draw_status),
             ]
         )
 
-        # labeling row: progress, then the class editor and buttons. Those
-        # masknmf widgets lay themselves out with same_line, so the row is
-        # given a new line when the editor would not fit after the progress
-        if draw_progress(self.classes.labels):
-            if self.order.next_unlabeled():
-                self.select_roi(self.order.current)
-        right = imgui.get_cursor_screen_pos().x + imgui.get_content_region_avail().x
-        if imgui.get_item_rect_max().x + 24 + 125 + button_width("add") + button_width("del") <= right:
-            imgui.same_line(0, 24)
+    def _draw_mask_row(self):
+        box = imgui.get_frame_height()
+        dirty = []
+
+        def _masks():
+            changed, self.show_masks = imgui.checkbox("masks", self.show_masks)
+            imgui.same_line(0, 4)
+            imgui.text_disabled("(m)")
+            dirty.append(changed)
+
+        def _fill():
+            changed, self.opacity = imgui.slider_float(
+                "##fill", self.opacity, 0.05, 1.0, "%.2f"
+            )
+            set_tooltip("Opacity of the mask interiors.", show_mark=False)
+            dirty.append(changed)
+
+        def _outlines():
+            changed, self.show_outlines = imgui.checkbox("outlines", self.show_outlines)
+            imgui.same_line(0, 4)
+            imgui.text_disabled("(o)")
+            dirty.append(changed)
+
+        def _width():
+            changed, self.outline_width = imgui.slider_int(
+                "##width", self.outline_width, 1, MAX_OUTLINE_WIDTH
+            )
+            set_tooltip(
+                "Outline thickness. The overlay is one texel per data pixel, "
+                "so 1 px is the thinnest a line can be drawn.",
+                show_mark=False,
+            )
+            dirty.append(changed)
+
+        def _placement():
+            changed, self.placement_idx = imgui.combo(
+                "##placement", self.placement_idx, list(OUTLINE_PLACEMENTS)
+            )
+            set_tooltip(
+                "Which side of the boundary the outline sits on.\n"
+                "outer:  on the background just outside the mask - costs no\n"
+                "        mask pixel, so 1-3 px structures keep every pixel\n"
+                "inner:  on the mask's own outermost pixels\n"
+                "center: straddles the boundary, eating a pixel each way",
+                show_mark=False,
+            )
+            dirty.append(changed)
+
+        def _line():
+            changed, self.outline_alpha = imgui.slider_float(
+                "##line", self.outline_alpha, 0.05, 1.0, "%.2f"
+            )
+            set_tooltip("Opacity of the outlines, independent of the fill.", show_mark=False)
+            dirty.append(changed)
+
+        def _color():
+            changed, self.color_mode_idx = imgui.combo(
+                "##color-by", self.color_mode_idx, list(COLOR_MODES)
+            )
+            set_tooltip(
+                "label:       one colour per class, unlabeled grey\n"
+                "label + roi: class colour where labelled, a unique hue otherwise\n"
+                "roi:         a unique hue per ROI",
+                show_mark=False,
+            )
+            dirty.append(changed)
+
+        draw_toolbar_row(
+            [
+                (None, button_width("masks (m)") + box, _masks),
+                ("fill", 70.0, _fill),
+                (None, button_width("outlines (o)") + box, _outlines),
+                ("px", 70.0, _width),
+                (None, 80.0, _placement),
+                ("line", 70.0, _line),
+                ("color by", 100.0, _color),
+            ]
+        )
+        if any(dirty):
+            self.refresh_overlay()
+
+    def _status_text(self) -> str:
+        if self._loader.busy:
+            return self._loader.status
+        return self._loader.error or self._save_error or self.status
+
+    def _draw_status(self):
+        if self._loader.busy:
+            imgui.text_colored(_LOADING_COLOR, self._loader.status)
+        elif self._loader.error or self._save_error:
+            imgui.text_colored(_ERROR_COLOR, self._loader.error or self._save_error)
+        else:
+            imgui.text_disabled(self.status)
+
+    def _draw_labels_row(self):
+        # progress, then the class editor and buttons. Those masknmf widgets
+        # lay themselves out with same_line, so the row is given a new line
+        # when the editor would not fit after the progress
+        if self.n_rois:
+            if draw_progress(self.classes.labels):
+                self.next_unlabeled()
+            right = imgui.get_cursor_screen_pos().x + imgui.get_content_region_avail().x
+            if imgui.get_item_rect_max().x + 24 + 125 + button_width("add") + button_width("del") <= right:
+                imgui.same_line(0, 24)
         self.new_label, changed = draw_label_editor(self.classes, self.new_label, "_roi")
         if changed:
             self._sync_store_from_classes()
@@ -884,15 +1500,10 @@ class ManualRoiWidget:
             self.refresh_overlay()
             self._autosave()
         picked = draw_label_buttons(self.classes, "_roi")
-        if picked is not None:
+        if picked == UNLABEL_ALL:
+            self.unlabel_all()
+        elif picked is not None:
             self.assign_class(picked)
-        if self.classes.names and self.n_rois:
-            imgui.same_line(0, 10)
-            imgui.push_style_color(imgui.Col_.button, _DANGER_COLORS[0])
-            imgui.push_style_color(imgui.Col_.button_hovered, _DANGER_COLORS[1])
-            if imgui.button("unlabel all"):
-                self.unlabel_all()
-            imgui.pop_style_color(2)
 
     def _draw_save_note(self):
         if self._writer is None:
@@ -901,15 +1512,28 @@ class ManualRoiWidget:
                 imgui.set_tooltip("open a file to autosave beside it, or press Save")
             return
         imgui.text_disabled("Autosaved")
-        if imgui.is_item_hovered():
-            imgui.set_tooltip(f"labels zarr: {self._save_target()}")
+        if not imgui.is_item_hovered():
+            return
+        imgui.begin_tooltip()
+        imgui.text(f"labels zarr: {self._save_target()}")
+        imgui.text_colored(
+            _CODE_COLOR,
+            "from mbo_utilities.annotation import LabelsZarr\n"
+            "\n"
+            f'store = LabelsZarr.load(r"{self._save_target()}")\n'
+            "store.labels        # (Z, Y, X) uint16; 0 = bg, ROI i = i + 1\n"
+            "store.rois          # per-ROI plane, area, class index, note\n"
+            "store.label_names   # class names; index = class value",
+        )
+        imgui.end_tooltip()
 
     # ------------------------------------------------------------------
     # imgui: right tab
     # ------------------------------------------------------------------
 
     def draw_tab(self):
-        """The ROIs tab body: filter row, the ROI table, the selected note."""
+        """The ROIs tab body: filter row, the ROI table, the selected note,
+        and the run row."""
         if self.store.nz > 1:
             on = self.order.plane is not None
             changed, on = imgui.checkbox(f"this plane (z {self.z + 1}/{self.store.nz})", on)
@@ -963,28 +1587,50 @@ class ManualRoiWidget:
             show_mark=False,
         )
         imgui.same_line()
-        if imgui.button(f"{fa.ICON_FA_PLAY} in view"):
+        if imgui.button(f"{RUN_ICON} in view"):
             self.run_in_view()
         set_tooltip("Run every ROI currently listed", show_mark=False)
         if self.run_status:
             imgui.same_line()
             imgui.text_disabled(self.run_status)
 
+    draw_table = draw_tab
+
     @property
-    def row_actions(self) -> tuple:
+    def row_actions(self) -> tuple[RowAction, ...]:
         """The icon-only buttons at the end of each table row."""
         return (
-            (fa.ICON_FA_PLAY, f"{self.process} this ROI", self.run_roi),
-            (fa.ICON_FA_CHART_LINE, "quick trace", self.quick_trace),
+            RowAction(RUN_ICON, f"Run - {self.process} this ROI", self.run_roi),
+            RowAction(
+                QUICK_TRACE_ICON,
+                "Quick trace - average this ROI's pixels over time",
+                self.quick_trace,
+                self.trace_disabled,
+            ),
+            RowAction(
+                EXTRACT_TRACE_ICON,
+                self._extract_tooltip(),
+                self.extract_trace,
+                self.extract_disabled,
+            ),
         )
+
+    def _row_actions(self) -> tuple[RowAction, ...]:
+        return self.row_actions
+
+    def _extract_tooltip(self) -> str:
+        pipeline = self.trace_extractor()
+        which = pipeline.name if pipeline is not None else "a pipeline"
+        return f"Extract trace - run this ROI's mask through {which}"
 
 
 # ----------------------------------------------------------------------
 # host wiring: PreviewDataWidget owns at most one widget as ``manual_roi``
+# (see PreviewDataWidget.sync_manual_roi, driven by the Widgets-menu toggle)
 # ----------------------------------------------------------------------
 
 
-def attach_roi_widget(parent, focus: bool = False) -> ManualRoiWidget | None:
+def attach_roi_widget(parent: Any, focus: bool = False) -> ManualRoiWidget | None:
     """Turn the ROI widget on for a ``PreviewDataWidget``.
 
     Adds the top panel and overlays, and makes the "ROIs" tab appear in the
@@ -1013,7 +1659,7 @@ def attach_roi_widget(parent, focus: bool = False) -> ManualRoiWidget | None:
     return widget
 
 
-def detach_roi_widget(parent) -> None:
+def detach_roi_widget(parent: Any) -> None:
     """Turn the ROI widget off, keeping its store for the next toggle."""
     widget = getattr(parent, "manual_roi", None)
     if widget is None:

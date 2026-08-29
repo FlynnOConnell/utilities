@@ -18,6 +18,7 @@ class RasterScanWidget(Widget):
 
     name = "Scan-Phase Correction"
     priority = 50
+    toggle_key = "preview.scan_phase"
 
     @classmethod
     def is_supported(cls, parent: Any) -> bool:

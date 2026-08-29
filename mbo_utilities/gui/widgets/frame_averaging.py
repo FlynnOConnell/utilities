@@ -18,6 +18,7 @@ class FrameAveragingWidget(Widget):
 
     name = "Frame Averaging"
     priority = 55  # after raster scan (50)
+    toggle_key = "preview.frame_averaging"
 
     @classmethod
     def is_supported(cls, parent: Any) -> bool:

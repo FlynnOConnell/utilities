@@ -282,6 +282,7 @@ class SummaryImageViewer(Widget):
 
     name = "Summary Images"
     priority = 60
+    toggle_key = "preview.summary_images"
 
     def __init__(self, parent: Any):
         super().__init__(parent)

@@ -15,6 +15,7 @@ from imgui_bundle import imgui, imgui_ctx, portable_file_dialogs as pfd
 from mbo_utilities.preferences import get_last_dir
 from mbo_utilities.gui._imgui_helpers import PopupAutoSize
 from mbo_utilities.gui.widgets.process_manager import get_process_manager
+from mbo_utilities.gui.widgets.widget_toggles import draw_widgets_menu
 
 
 def draw_menu_bar(parent: Any):
@@ -76,9 +77,7 @@ def draw_menu_bar(parent: Any):
                 if imgui.is_item_hovered():
                     imgui.set_tooltip("Render GPU adapter, debug logging, and other settings")
                 imgui.end_menu()
-            if imgui.begin_menu("Widgets", True):
-                draw_widgets_menu(parent)
-                imgui.end_menu()
+            draw_widgets_menu(parent)
             if imgui.begin_menu("Docs", True):
                 if imgui.menu_item(
                     "Help", "F1", p_selected=False, enabled=True
@@ -101,45 +100,6 @@ def draw_menu_bar(parent: Any):
         # Draw process status indicator (consolidated)
         parent._clear_stale_progress()
         draw_process_status_indicator(parent)
-
-def draw_widgets_menu(parent: Any) -> None:
-    """Items of the Widgets menu: toggleable widgets first, then the ones
-    that open a popup.
-
-    ``ROIs`` turns the manual ROI widget (top panel + "ROIs" tab) on or
-    off. ``BioHPC`` is not a toggle - it opens the BioHPC workbench popup.
-    """
-    from mbo_utilities.gui.manual_roi import (
-        attach_roi_widget,
-        detach_roi_widget,
-        roi_widgets_available,
-    )
-
-    roi_on = getattr(parent, "manual_roi", None) is not None
-    available = roi_on or roi_widgets_available()
-    clicked, _ = imgui.menu_item("ROIs", "", p_selected=roi_on, enabled=available)
-    if clicked:
-        if roi_on:
-            detach_roi_widget(parent)
-        else:
-            attach_roi_widget(parent, focus=True)
-    if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
-        if available:
-            imgui.set_tooltip(
-                "Draw + label ROIs by hand: a tool panel across the top and a "
-                "ROIs tab on the right. Annotations autosave next to the data."
-            )
-        else:
-            imgui.set_tooltip(
-                "needs masknmf's shared imgui widgets\n"
-                "(masknmf.visualization.imgui) - update masknmf"
-            )
-    imgui.separator()
-    if imgui.menu_item("BioHPC", "", p_selected=False, enabled=True)[0]:
-        parent._show_biohpc_popup = True
-    if imgui.is_item_hovered():
-        imgui.set_tooltip("Open the BioHPC workbench: transfer, metadata, analysis, jobs")
-
 
 def draw_process_status_indicator(parent: Any):
     """Draw compact process status indicator in top-left with color coding."""
@@ -164,6 +124,10 @@ def draw_process_status_indicator(parent: Any):
     # Get in-app progress items
     from mbo_utilities.gui.widgets.progress_bar import _get_active_progress_items
     progress_items = _get_active_progress_items(parent)
+
+    # in-process jobs (ROI traces, etc.) count the same as spawned ones —
+    # a click has to show up somewhere or the user cannot tell it landed
+    all_procs = [*all_procs, *pm.get_jobs()]
 
     # categorize processes
     running_procs = [p for p in all_procs if p.is_alive()]

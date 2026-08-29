@@ -59,16 +59,14 @@ def _discover_widgets() -> None:
     _WIDGET_CLASSES.sort(key=lambda w: w.priority)
 
 
-def get_supported_widgets(parent: Any) -> list[Widget]:
-    """
-    Get all widgets that are supported for the given parent.
-
-    returns instantiated widgets sorted by priority.
-    """
+def _instantiate(parent: Any, placement: str) -> list[Widget]:
+    """Instantiate every supported widget with the given placement."""
     _discover_widgets()
 
     supported = []
     for widget_cls in _WIDGET_CLASSES:
+        if widget_cls.placement != placement:
+            continue
         try:
             if widget_cls.is_supported(parent):
                 supported.append(widget_cls(parent))
@@ -82,9 +80,34 @@ def get_supported_widgets(parent: Any) -> list[Widget]:
     return supported
 
 
+def get_supported_widgets(parent: Any) -> list[Widget]:
+    """
+    Get the panel widgets that are supported for the given parent.
+
+    returns instantiated widgets sorted by priority.
+    """
+    return _instantiate(parent, "panel")
+
+
+def get_tab_widgets(parent: Any) -> list[Widget]:
+    """Get the supported widgets that render as their own viewer tab."""
+    return _instantiate(parent, "tab")
+
+
+def widget_is_visible(widget: Widget) -> bool:
+    """Whether the Widgets menu currently has this widget switched on."""
+    if widget.toggle_key is None:
+        return True
+    from mbo_utilities.gui.widgets.widget_toggles import widget_enabled
+
+    return widget_enabled(widget.toggle_key)
+
+
 def draw_all_widgets(parent: Any, widgets: list[Widget]) -> None:
-    """Draw all supported widgets."""
+    """Draw all supported widgets that the Widgets menu leaves switched on."""
     for widget in widgets:
+        if not widget_is_visible(widget):
+            continue
         try:
             widget.draw()
         except Exception as e:
@@ -118,4 +141,6 @@ __all__ = [
     "draw_all_widgets",
     "draw_menu_bar",
     "get_supported_widgets",
+    "get_tab_widgets",
+    "widget_is_visible",
 ]
