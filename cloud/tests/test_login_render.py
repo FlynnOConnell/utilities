@@ -19,11 +19,6 @@ PROJECT = account.Project(
 )
 
 
-@pytest.fixture(autouse=True)
-def imgui_context(context):
-    """Every test here draws, so the headless context is always up."""
-
-
 @pytest.fixture
 def panel():
     """A panel that never starts a worker thread."""

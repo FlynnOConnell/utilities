@@ -145,11 +145,11 @@ def test_choosing_a_gpu_sets_the_machine_the_accelerator_and_the_count(panel):
     assert machine.needs_guest_accelerator is False
 
 
-def test_the_machine_tab_draws_with_no_quota_read_yet(panel, context, render):
+def test_the_machine_tab_draws_with_no_quota_read_yet(panel, render):
     render(panel._draw_machine)
 
 
-def test_the_machine_tab_draws_the_quota_it_did_read(panel, context, render):
+def test_the_machine_tab_draws_the_quota_it_did_read(panel, render):
     panel.login.state = SetupState(
         quotas={
             "NVIDIA_A100_GPUS": 0.0,
@@ -169,7 +169,7 @@ def test_the_machine_tab_draws_a_machine_the_catalog_does_not_carry(
     render(panel._draw_machine)
 
 
-def test_the_run_tab_draws_before_anything_is_known(panel, context, render):
+def test_the_run_tab_draws_before_anything_is_known(panel, render):
     render(panel._draw_run)
 
 
@@ -237,7 +237,7 @@ def test_signing_in_opens_the_tabs_even_before_everything_checks_out(panel):
     assert panel.login.verified is True
 
 
-def test_the_whole_panel_draws_for_a_half_finished_account(panel, context, render):
+def test_the_whole_panel_draws_for_a_half_finished_account(panel, render):
     panel.login.status.credentials_ok = True
     panel.login.profile.bucket = ""
     render(panel.draw)
@@ -246,8 +246,7 @@ def test_the_whole_panel_draws_for_a_half_finished_account(panel, context, rende
 def test_a_project_with_no_quota_asks_for_the_cap_and_the_gpu(panel):
     panel.login.state = state_no_quota()
     panel.choose_gpu(config_module.gpu_option("a2-highgpu-1g"))
-    asks = panel.quota_asks(config_module.gpu_option("a2-highgpu-1g"))
-    assert [(info.metric, value, region) for info, value, region in asks] == [
+    assert panel.quota_asks(config_module.gpu_option("a2-highgpu-1g")) == [
         ("GPUS_ALL_REGIONS", 1.0, ""),
         ("NVIDIA_A100_GPUS", 1.0, "us-central1"),
     ]
@@ -275,16 +274,18 @@ def test_a_region_we_have_no_zone_list_for_still_moves_the_profile(panel):
     assert panel.login.profile.zone == "europe-west4-a"
 
 
-def test_the_quota_card_draws_the_request_block(panel, context, render):
+def test_the_quota_card_draws_the_request_block(panel, render):
     panel.login.state = state_no_quota()
     render(panel._draw_machine, panel._draw_run)
 
 
-def test_without_the_quotas_api_the_card_offers_to_turn_it_on(panel, context, render):
+def test_the_request_stands_without_the_quotas_api_having_been_read(panel, render):
+    """Asking turns the Quotas API on itself, so the button cannot depend on it."""
     state = state_no_quota()
     state.quota_infos = {}
     state.apis[account.SERVICE_QUOTAS] = False
     panel.login.state = state
+    assert panel.quota_asks(config_module.gpu_option("a2-highgpu-1g"))
     render(panel._draw_machine)
 
 
