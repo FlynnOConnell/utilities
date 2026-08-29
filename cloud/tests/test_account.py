@@ -229,6 +229,12 @@ def test_an_interactive_login_does_not_wait_on_the_browser(monkeypatch):
     assert spawned == [["gcloud", "auth", "application-default", "login"]]
 
 
+QUOTA_INFO_A100_ZONE = {
+    "quotaId": "NVIDIA-A100-GPUS-per-project-zone",
+    "metric": "compute.googleapis.com/nvidia_a100_gpus",
+    "dimensions": ["zone"],
+    "dimensionsInfos": [{"dimensions": {}, "details": {"value": "-1"}}],
+}
 QUOTA_INFO_A100 = {
     "quotaId": "NVIDIA-A100-GPUS-per-project-region",
     "metric": "compute.googleapis.com/nvidia_a100_gpus",
@@ -254,8 +260,8 @@ def test_quota_infos_keeps_the_gpu_entries_and_their_ids(session):
         FakeResponse({"quotaInfos": [QUOTA_INFO_A100, QUOTA_INFO_CPUS]}),
     )
     found = account.quota_infos(object(), "pml-subcellular-imaging")
-    assert set(found) == {"NVIDIA_A100_GPUS"}
-    info = found["NVIDIA_A100_GPUS"]
+    assert set(found) == {"NVIDIA-A100-GPUS-per-project-region"}
+    info = account.info_gating(found, "NVIDIA_A100_GPUS")
     assert info.quota_id == "NVIDIA-A100-GPUS-per-project-region"
     assert info.is_regional
     assert info.limit_in("us-central1") == 0.0
@@ -313,3 +319,13 @@ def test_a_disabled_api_is_recognised_from_googles_own_wording():
 def test_every_offered_api_says_what_it_allows():
     for api in account.APIS_ALL:
         assert account.PURPOSE_API[api]
+
+
+def test_the_region_quota_wins_over_its_unlimited_per_zone_twin(session):
+    """Compute publishes both; the per-zone one reads unlimited and gates nothing."""
+    session.reply(FakeResponse({"quotaInfos": [QUOTA_INFO_A100_ZONE, QUOTA_INFO_A100]}))
+    infos = account.quota_infos(object(), "pml-subcellular-imaging")
+    assert len(infos) == 2
+    gating = account.info_gating(infos, "NVIDIA_A100_GPUS")
+    assert gating.quota_id == "NVIDIA-A100-GPUS-per-project-region"
+    assert account.info_gating(infos, "NVIDIA_T4_GPUS") is None

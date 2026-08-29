@@ -64,8 +64,8 @@ class SetupState:
         return self.apis.get(api)
 
     def info_for(self, metric: str):
-        """The Cloud Quotas entry for a metric, or None when unread."""
-        return self.quota_infos.get(metric)
+        """The Cloud Quotas entry that limits ``metric``, or None when unread."""
+        return account.info_gating(self.quota_infos, metric)
 
     @property
     def quota_a100(self) -> float:

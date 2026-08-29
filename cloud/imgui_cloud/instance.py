@@ -25,6 +25,10 @@ LABEL_MANAGED = "imgui-cloud"
 STATES_ALIVE = ("PROVISIONING", "STAGING", "RUNNING", "REPAIRING")
 
 
+STATES_IMAGE_DEAD = ("DEPRECATED", "OBSOLETE", "DELETED")
+PREFIXES_IMAGE = ("pytorch", "common-cu", "tf")
+
+
 def sanitize_label(value: str) -> str:
     """Coerce a string into something Compute Engine accepts as a label value."""
     cleaned = re.sub(r"[^a-z0-9_-]", "-", str(value).lower()).strip("-")
@@ -52,25 +56,65 @@ def clients(credentials):
     )
 
 
+def families_live(credentials, image_project: str) -> list:
+    """Non-deprecated image families in a project, newest image name first."""
+    _, images = clients(credentials)
+    newest: dict = {}
+    for image in images.list(project=image_project):
+        state = image.deprecated.state if image.deprecated else ""
+        if state in STATES_IMAGE_DEAD or not image.family:
+            continue
+        if image.name > newest.get(image.family, ""):
+            newest[image.family] = image.name
+    return sorted(newest, key=lambda family: newest[family], reverse=True)
+
+
+def family_replacing(families: list, wanted: str) -> str:
+    """
+    The best stand-in for a family that no longer exists.
+
+    Google retires Deep Learning VM families on its own schedule
+    (``pytorch-latest-gpu`` went that way), so a run that has already uploaded
+    its data should land on the current equivalent rather than fail.
+    """
+    kind = next((word for word in PREFIXES_IMAGE if word in wanted), "")
+    for prefix in ([kind] if kind else []) + list(PREFIXES_IMAGE):
+        matching = [family for family in families if family.startswith(prefix)]
+        if matching:
+            return matching[0]
+    return families[0] if families else ""
+
+
 def resolve_image(credentials, image_project: str, image_family: str) -> str:
     """
     Self-link of the newest non-deprecated image in a family.
 
+    Falls back to the closest live family when the requested one is gone, and
+    says which it took; a retired family is Google's doing, not the run's.
+
     Raises
     ------
     RuntimeError
-        If the family does not resolve - usually a renamed Deep Learning VM
-        family, which is worth failing loudly on rather than booting something
-        arbitrary.
+        If the project has no usable family at all.
     """
     _, images = clients(credentials)
     try:
-        image = images.get_from_family(project=image_project, family=image_family)
+        return images.get_from_family(
+            project=image_project, family=image_family
+        ).self_link
     except Exception as e:
+        error_first = e
+
+    families = families_live(credentials, image_project)
+    replacement = family_replacing(families, image_family)
+    if not replacement:
         raise RuntimeError(
-            f"no image family {image_family!r} in project {image_project!r}: {e}"
-        ) from e
-    return image.self_link
+            f"no image family {image_family!r} in project {image_project!r}, and "
+            f"nothing to fall back on: {error_first}"
+        ) from error_first
+    return images.get_from_family(
+        project=image_project, family=replacement
+    ).self_link
 
 
 def build_instance(

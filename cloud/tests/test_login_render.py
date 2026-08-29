@@ -28,7 +28,8 @@ def panel():
 
 
 def test_the_panel_draws_before_anyone_signs_in(panel, render):
-    render(panel.draw, panel._draw_settings)
+    render(panel.draw)
+    render(panel._draw_settings)
 
 
 def test_the_panel_draws_with_a_project_loaded(panel, render):
@@ -43,13 +44,15 @@ def test_the_panel_draws_with_a_project_loaded(panel, render):
         quotas={"NVIDIA_A100_GPUS": 2.0, "PREEMPTIBLE_NVIDIA_A100_GPUS": 0.0},
     )
     panel.choose_project(PROJECT, read_details=False)
-    render(panel.draw, panel._draw_settings)
+    render(panel.draw)
+    render(panel._draw_settings)
 
 
 def test_every_step_control_draws(panel, render):
+    """One frame each: the panel only ever draws the step you are standing on."""
     panel.state = SetupState(gcloud=True, email="flynn@example.org", projects=[PROJECT])
     panel.choose_project(PROJECT, read_details=False)
-    render(
+    for draw in (
         panel._draw_control_install,
         panel._draw_control_signin,
         panel._draw_control_project,
@@ -57,7 +60,8 @@ def test_every_step_control_draws(panel, render):
         panel._draw_control_bucket,
         panel._draw_control_quota,
         panel._draw_control_verify,
-    )
+    ):
+        render(draw)
 
 
 def test_problems_and_warnings_draw(panel, render):
@@ -69,7 +73,7 @@ def test_problems_and_warnings_draw(panel, render):
 
 def test_a_console_sign_in_says_it_is_waiting(panel, render):
     panel.waiting_console = True
-    render(panel.draw, panel._draw_control_signin)
+    render(panel.draw)
 
 
 def test_a_busy_panel_disables_its_controls(panel, render):

@@ -96,7 +96,7 @@ def test_reading_the_project_fills_apis_buckets_and_quota(panel, monkeypatch):
         account,
         "quota_infos",
         lambda credentials, project: {
-            "NVIDIA_A100_GPUS": account.QuotaInfo(
+            "NVIDIA-A100-GPUS-per-project-region": account.QuotaInfo(
                 quota_id="NVIDIA-A100-GPUS-per-project-region",
                 metric="NVIDIA_A100_GPUS",
                 dimensions=("region",),

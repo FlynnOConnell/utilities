@@ -79,6 +79,7 @@ class CloudPanel:
         self._pending_pick = None
         self._pick_target = ""
         self._tab_next = ""
+        self._gpu_checked = False
 
     def set_input(self, dir_input: str) -> None:
         """Point the panel at a dataset, filling in a matching output folder."""
@@ -100,6 +101,7 @@ class CloudPanel:
             )
             return
 
+        self.adopt_workable_gpu()
         if imgui.begin_tab_bar("##cloudtabs"):
             if imgui.begin_tab_item(f"{fa.ICON_FA_ROCKET}  Run")[0]:
                 self._draw_run()
@@ -388,14 +390,12 @@ class CloudPanel:
                 style.wrapped(f"{metric}: not read yet", theme.text_dim)
             elif limit >= option.count:
                 style.wrapped(
-                    f"{metric} = {limit:.0f} in {profile.region}, needs "
-                    f"{option.count}",
+                    f"{metric} = {limit:.0f} in {profile.region}, needs {option.count}",
                     theme.ok,
                 )
             else:
                 style.wrapped(
-                    f"{metric} = {limit:.0f} in {profile.region}, needs "
-                    f"{option.count}",
+                    f"{metric} = {limit:.0f} in {profile.region}, needs {option.count}",
                     theme.err,
                 )
             self._draw_quota_detail(option)
@@ -563,6 +563,23 @@ class CloudPanel:
             imgui.same_line()
         imgui.new_line()
 
+    def adopt_workable_gpu(self) -> bool:
+        """Once the quotas land, move off a GPU this project cannot run."""
+        state = self.login.state
+        if self._gpu_checked or not state.quotas:
+            return False
+        self._gpu_checked = True
+        machine = self.config.machine
+        option = config_module.gpu_option(
+            machine.machine_type, machine.accelerator_type
+        )
+        if option is None:
+            return False
+        limit, _ = config_module.quota_effective(state.quotas, option, machine.spot)
+        if limit >= option.count:
+            return False
+        return self.use_recommended_gpu()
+
     def use_recommended_gpu(self) -> bool:
         """Switch to the cheapest box this project can actually run."""
         state = self.login.state
@@ -680,9 +697,7 @@ class CloudPanel:
             style.desc(theme, f"{metric}: not read yet")
             return
         if limit >= option.count:
-            style.desc(
-                theme, f"{metric} = {limit:.0f} in {self.login.profile.region}"
-            )
+            style.desc(theme, f"{metric} = {limit:.0f} in {self.login.profile.region}")
             return
         style.wrapped(
             f"{metric} = {limit:.0f} in {self.login.profile.region}, and this "
@@ -711,7 +726,6 @@ class CloudPanel:
                 style.em2(18, 1.8),
             ):
                 self.use_recommended_gpu()
-
 
     def _draw_run_summary(self) -> None:
         """Where it lands, what it runs on, and roughly what it costs."""

@@ -186,7 +186,7 @@ class LoginPanel:
         self.state.quota_infos = infos
         answers = []
         for metric, value, region in self.quota_asks:
-            info = infos.get(metric)
+            info = account.info_gating(infos, metric)
             if info is None:
                 answers.append(f"{metric}: Cloud Quotas does not offer this one")
                 continue

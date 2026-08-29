@@ -432,6 +432,11 @@ class QuotaInfo:
             return self.limits[region]
         return self.limits.get("", -1.0)
 
+    @property
+    def binding(self) -> bool:
+        """Whether this entry is the one that actually caps a launch."""
+        return self.is_regional or not self.dimensions
+
     def regions_with(self, needed: float) -> list:
         """Regions whose limit already covers ``needed``."""
         return sorted(
@@ -461,7 +466,12 @@ def quota_info_of(item: dict) -> QuotaInfo:
 
 def quota_infos(credentials, project: str, service: str = SERVICE_COMPUTE) -> dict:
     """
-    GPU entries from the Cloud Quotas API, keyed by metric name.
+    GPU entries from the Cloud Quotas API, keyed by quota id.
+
+    One metric has several entries - Compute publishes an A100 quota per region
+    *and* per zone - so they cannot be keyed by metric: the per-zone one reads
+    as unlimited while the per-region one is the zero that blocks the launch.
+    Use :func:`info_gating` to pick the one that decides.
 
     This is the modern, authoritative view: it carries the quota id needed to
     request an increase, and the effective limit in every region, which is what
@@ -487,10 +497,23 @@ def quota_infos(credentials, project: str, service: str = SERVICE_COMPUTE) -> di
             if info.metric.endswith(SUFFIX_METRIC_GPU) or info.metric.startswith(
                 "GPUS_"
             ):
-                found[info.metric] = info
+                found[info.quota_id] = info
         token = body.get("nextPageToken", "")
         if not token:
             return found
+
+
+def info_gating(infos: dict, metric: str) -> QuotaInfo | None:
+    """
+    The entry that actually limits ``metric``, or None when it is not offered.
+
+    Prefers the per-region quota, which is the one Compute enforces; the
+    per-zone twin of the same metric is usually unlimited and asking for more
+    of it changes nothing.
+    """
+    matches = [info for info in infos.values() if info.metric == metric]
+    binding = [info for info in matches if info.binding]
+    return next(iter(binding or matches), None)
 
 
 def request_quota(

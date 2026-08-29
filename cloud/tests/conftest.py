@@ -69,9 +69,7 @@ class Renderer:
     def check_ids(self) -> None:
         """Fail when two buttons in the frame claimed the same id."""
         counts = Counter(claimed for claimed, _ in self.ids_claimed)
-        clashing = {
-            label for claimed, label in self.ids_claimed if counts[claimed] > 1
-        }
+        clashing = {label for claimed, label in self.ids_claimed if counts[claimed] > 1}
         if clashing:
             raise AssertionError(
                 f"items with conflicting IDs: {sorted(clashing)}. Two widgets in "

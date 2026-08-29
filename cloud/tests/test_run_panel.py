@@ -31,8 +31,8 @@ def state_no_quota() -> SetupState:
         quotas={"NVIDIA_A100_GPUS": 0.0, "PREEMPTIBLE_NVIDIA_A100_GPUS": 0.0},
         quotas_project={"GPUS_ALL_REGIONS": 0.0},
         quota_infos={
-            "NVIDIA_A100_GPUS": INFO_A100,
-            "GPUS_ALL_REGIONS": INFO_ALL_REGIONS,
+            INFO_A100.quota_id: INFO_A100,
+            INFO_ALL_REGIONS.quota_id: INFO_ALL_REGIONS,
         },
         zones_by_accelerator={"nvidia-tesla-a100": ["us-central1-a", "us-west4-b"]},
     )
@@ -276,7 +276,8 @@ def test_a_region_we_have_no_zone_list_for_still_moves_the_profile(panel):
 
 def test_the_quota_card_draws_the_request_block(panel, render):
     panel.login.state = state_no_quota()
-    render(panel._draw_machine, panel._draw_run)
+    render(panel._draw_machine)
+    render(panel._draw_run)
 
 
 def test_the_request_stands_without_the_quotas_api_having_been_read(panel, render):
@@ -305,3 +306,22 @@ def test_enabling_one_api_names_it_for_the_worker_thread(panel):
     panel.login.enable_api(account.SERVICE_IAM)
     assert panel.login.api_pending == account.SERVICE_IAM
     assert started == ["_task_enable_api"]
+
+
+def test_the_panel_moves_off_a_gpu_the_project_cannot_run(panel):
+    """A100 quota is 0 and T4 is 1: the panel should not sit on the A100."""
+    state = state_no_quota()
+    state.quotas["NVIDIA_T4_GPUS"] = 1.0
+    state.zones_by_accelerator["nvidia-tesla-t4"] = ["us-central1-a"]
+    panel.login.state = state
+    assert panel.adopt_workable_gpu() is True
+    assert panel.config.machine.accelerator_type == "nvidia-tesla-t4"
+    assert panel.adopt_workable_gpu() is False
+
+
+def test_a_workable_gpu_is_left_alone(panel):
+    state = state_no_quota()
+    state.quotas["NVIDIA_A100_GPUS"] = 4.0
+    panel.login.state = state
+    assert panel.adopt_workable_gpu() is False
+    assert panel.config.machine.machine_type == "a2-highgpu-1g"

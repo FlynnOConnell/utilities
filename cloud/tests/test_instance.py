@@ -87,3 +87,20 @@ def test_the_startup_script_rides_in_instance_metadata():
 def test_instance_names_are_dns_safe():
     assert instance_module.instance_name("MK355_run/2") == "imgui-cloud-mk355-run-2"
     assert len(instance_module.instance_name("x" * 100)) <= 63
+
+
+def test_a_retired_image_family_falls_back_to_the_current_one():
+    """pytorch-latest-gpu was retired; a run mid-flight should still boot."""
+    live = [
+        "pytorch-2-9-cu129-ubuntu-2404-nvidia-580",
+        "pytorch-2-9-cu129-ubuntu-2204-nvidia-580",
+        "common-cu129-ubuntu-2204-nvidia-580",
+    ]
+    assert instance_module.family_replacing(live, "pytorch-latest-gpu") == (
+        "pytorch-2-9-cu129-ubuntu-2404-nvidia-580"
+    )
+    assert instance_module.family_replacing(live, "common-cu999") == (
+        "common-cu129-ubuntu-2204-nvidia-580"
+    )
+    assert instance_module.family_replacing(["only-this"], "pytorch-x") == "only-this"
+    assert instance_module.family_replacing([], "pytorch-x") == ""

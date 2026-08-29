@@ -197,7 +197,7 @@ class MachineConfig:
     data_disk_type: str = "pd-ssd"
     data_disk_name: str = ""
     keep_data_disk: bool = False
-    image_family: str = "pytorch-latest-gpu"
+    image_family: str = "pytorch-2-9-cu129-ubuntu-2204-nvidia-580"
     image_project: str = "deeplearning-platform-release"
     max_runtime_min: int = 480
     keep_instance: bool = False
