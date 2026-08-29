@@ -33,8 +33,10 @@ from imgui_bundle import (
 )
 
 from mbo_utilities.gui._imgui_helpers import set_tooltip
+from mbo_utilities.gui.widgets._base import Widget
+from mbo_utilities.gui.widgets.widget_toggles import sub_enabled
 
-__all__ = ["draw_biohpc_tab"]
+__all__ = ["BioHpcWidget", "draw_biohpc_tab"]
 
 # demo credentials for the proof of concept. real auth never belongs in
 # source — this gate only unlocks a local, simulated workflow.
@@ -589,15 +591,21 @@ class _BioHpcPanel:
         imgui.spacing()
 
         if imgui.begin_tab_bar("##biohpc_subtabs"):
-            if imgui.begin_tab_item(f"{_icon('ICON_FA_CLOUD_ARROW_UP')} Transfer")[0]:
+            if sub_enabled("biohpc", "transfer") and imgui.begin_tab_item(
+                f"{_icon('ICON_FA_CLOUD_ARROW_UP')} Transfer"
+            )[0]:
                 imgui.spacing()
                 self._draw_transfer_tab()
                 imgui.end_tab_item()
-            if imgui.begin_tab_item(f"{_icon('ICON_FA_TAGS')} Metadata")[0]:
+            if sub_enabled("biohpc", "metadata") and imgui.begin_tab_item(
+                f"{_icon('ICON_FA_TAGS')} Metadata"
+            )[0]:
                 imgui.spacing()
                 self._draw_metadata_tab()
                 imgui.end_tab_item()
-            if imgui.begin_tab_item(f"{_icon('ICON_FA_SLIDERS')} Analysis")[0]:
+            if sub_enabled("biohpc", "analysis") and imgui.begin_tab_item(
+                f"{_icon('ICON_FA_SLIDERS')} Analysis"
+            )[0]:
                 imgui.spacing()
                 self._draw_analysis_tab()
                 imgui.end_tab_item()
@@ -605,7 +613,7 @@ class _BioHpcPanel:
             jobs_label = f"{_icon('ICON_FA_LIST_CHECK')} Jobs"
             if njobs:
                 jobs_label += f" ({njobs})"
-            if imgui.begin_tab_item(jobs_label)[0]:
+            if sub_enabled("biohpc", "jobs") and imgui.begin_tab_item(jobs_label)[0]:
                 imgui.spacing()
                 self._draw_jobs_tab()
                 imgui.end_tab_item()
@@ -1099,3 +1107,33 @@ def draw_biohpc_tab(parent: Any) -> None:
         panel.draw_authenticated()
     else:
         panel.draw_login()
+
+
+class BioHpcWidget(Widget):
+    """BioHPC transfer / metadata / analysis / jobs, as its own viewer tab."""
+
+    name = "BioHPC"
+    tab_label = "BioHPC"
+    placement = "tab"
+    toggle_key = "biohpc"
+    priority = 80
+
+    @classmethod
+    def is_supported(cls, parent: Any) -> bool:
+        """Always available: the panel handles the no-dataset case itself."""
+        return True
+
+    def draw(self) -> None:
+        # horizontal scrollbar: over-wide content scrolls, never clips
+        with imgui_ctx.begin_child(
+            "##BioHpcContent",
+            imgui.ImVec2(0, 0),
+            imgui.ChildFlags_.none,
+            imgui.WindowFlags_.horizontal_scrollbar,
+        ):
+            draw_biohpc_tab(self.parent)
+
+    def cleanup(self) -> None:
+        panel = getattr(self.parent, "_biohpc_panel", None)
+        if panel is not None and hasattr(panel, "cleanup"):
+            panel.cleanup()

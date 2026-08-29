@@ -647,17 +647,21 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
     if widget in ("preview", "manualroi"):
         from mbo_utilities.gui.widgets.preview_data import PreviewDataWidget
 
+        if widget == "manualroi":
+            # drawing needs the windowing controls to see anything, so the ROI
+            # ui takes the free top and left edges alongside the preview
+            # widget, not instead of it. Flip the Widgets-menu toggle on for
+            # this session only; the widget builds itself from it. Not
+            # persisted — the flag came from the command line, not the menu.
+            from mbo_utilities.gui.widgets.widget_toggles import set_widget_enabled
+
+            set_widget_enabled("manual_roi", True, persist=False)
+
         gui = PreviewDataWidget(
             iw=iw,
             fpath=data_array.source_path,
             size=300,
         )
-        if widget == "manualroi":
-            # drawing needs the windowing controls to see anything, so the ROI
-            # ui is an extra tab on the preview widget, not a replacement
-            from mbo_utilities.gui.manual_roi import ManualRoiWidget
-
-            gui.manual_roi = ManualRoiWidget(iw, data_array.source_path)
         # the EdgeWindow shim registers itself with the figure during
         # __init__; add_gui exists only on mbo-fastplotlib
         add_gui = getattr(iw.figure, "add_gui", None)

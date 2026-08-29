@@ -166,6 +166,10 @@ class PreviewDataWidget(EdgeWindow):
         Panel location ("right" or "bottom").
     """
 
+    # built on demand by sync_manual_roi() when the Widgets menu entry is on;
+    # owns the figure's top (controls) and left (ROI table) edge windows
+    manual_roi = None
+
     def __init__(
         self,
         iw: "fpl.ImageWidget",
@@ -660,6 +664,33 @@ class PreviewDataWidget(EdgeWindow):
             maybe_spawn_raw_projections(self)
         except Exception:
             self.logger.debug("raw projection prefetch skipped", exc_info=True)
+        # honour a persisted / CLI-set "Manual ROI Labeling" toggle
+        from mbo_utilities.gui.widgets.widget_toggles import widget_enabled
+        self.sync_manual_roi(widget_enabled("manual_roi"))
+
+    def sync_manual_roi(self, enabled: bool) -> None:
+        """Create or tear down the manual-ROI widget to match the toggle.
+
+        Building it attaches an overlay graphic to the subplot and claims the
+        figure's top and left edge windows, so it is created lazily the first
+        time the widget is switched on and dropped again when it is switched
+        off.
+        """
+        current = getattr(self, "manual_roi", None)
+        if enabled and current is None:
+            try:
+                from mbo_utilities.gui.manual_roi import ManualRoiWidget
+
+                self.manual_roi = ManualRoiWidget(self.image_widget, self.fpath)
+            except Exception:
+                self.manual_roi = None
+                self.logger.exception("manual ROI widget failed to load")
+        elif not enabled and current is not None:
+            try:
+                current.close()
+            except Exception:
+                self.logger.debug("manual ROI teardown failed", exc_info=True)
+            self.manual_roi = None
 
     def _seed_playback_fps(self):
         """Seed the t playback rate from the loaded array's frame rate.

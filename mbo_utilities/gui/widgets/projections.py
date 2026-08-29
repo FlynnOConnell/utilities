@@ -68,6 +68,7 @@ class ProjectionsViewer(Widget):
 
     name = "Projections"
     priority = 65  # right after SummaryImageViewer (60)
+    toggle_key = "preview.projections"
 
     def __init__(self, parent: Any):
         super().__init__(parent)

@@ -23,6 +23,19 @@ class Widget(ABC):
     # priority for ordering (lower = rendered first)
     priority: int = 100
 
+    # where the widget is drawn:
+    #   "panel" -> stacked in the Preview tab's control column
+    #   "tab"   -> its own tab in the viewer tab bar, labelled `tab_label`
+    placement: str = "panel"
+
+    # tab caption for placement == "tab"; defaults to `name`
+    tab_label: str | None = None
+
+    # key in widget_toggles.WIDGET_REGISTRY. When set, the host skips the
+    # widget entirely while its Widgets-menu entry is off, so draw() never
+    # has to check the top-level toggle itself (subwidget checks still do).
+    toggle_key: str | None = None
+
     def __init__(self, parent: Any):
         self.parent = parent
 
@@ -40,6 +53,18 @@ class Widget(ABC):
     def draw(self) -> None:
         """Draw the imgui ui for this widget."""
         ...
+
+    def tab_disabled(self) -> str | None:
+        """For placement == "tab": None when selectable, else a reason.
+
+        The reason is shown as the tooltip on the greyed-out tab; return an
+        empty string to grey it out without one.
+        """
+        return None
+
+    def wants_focus(self) -> bool:
+        """For placement == "tab": select this tab on the next frame."""
+        return False
 
     def cleanup(self) -> None:
         """Clean up resources when widget is destroyed.

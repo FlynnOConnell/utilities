@@ -15,6 +15,7 @@ from imgui_bundle import imgui, imgui_ctx, portable_file_dialogs as pfd
 from mbo_utilities.preferences import get_last_dir
 from mbo_utilities.gui._imgui_helpers import PopupAutoSize
 from mbo_utilities.gui.widgets.process_manager import get_process_manager
+from mbo_utilities.gui.widgets.widget_toggles import draw_widgets_menu
 
 
 def draw_menu_bar(parent: Any):
@@ -76,6 +77,7 @@ def draw_menu_bar(parent: Any):
                 if imgui.is_item_hovered():
                     imgui.set_tooltip("Render GPU adapter, debug logging, and other settings")
                 imgui.end_menu()
+            draw_widgets_menu(parent)
             if imgui.begin_menu("Docs", True):
                 if imgui.menu_item(
                     "Help", "F1", p_selected=False, enabled=True

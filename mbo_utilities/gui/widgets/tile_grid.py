@@ -141,6 +141,7 @@ class TileGridViewer(Widget):
 
     name = "Tile Grid"
     priority = 66  # right after Projections (65)
+    toggle_key = "preview.tile_grid"
 
     def __init__(self, parent: Any):
         super().__init__(parent)

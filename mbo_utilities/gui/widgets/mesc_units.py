@@ -58,6 +58,7 @@ class MescUnitsWidget(Widget):
 
     name = "MESc Units"
     priority = 4
+    toggle_key = "preview.mesc_units"
 
     def __init__(self, parent: Any):
         super().__init__(parent)
