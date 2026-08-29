@@ -227,3 +227,89 @@ def test_an_interactive_login_does_not_wait_on_the_browser(monkeypatch):
     monkeypatch.setattr(account, "run_gcloud", lambda *args, **kwargs: "")
     account.login_gcloud(interactive=True)
     assert spawned == [["gcloud", "auth", "application-default", "login"]]
+
+
+QUOTA_INFO_A100 = {
+    "quotaId": "NVIDIA-A100-GPUS-per-project-region",
+    "metric": "compute.googleapis.com/nvidia_a100_gpus",
+    "quotaDisplayName": "NVIDIA A100 GPUs",
+    "dimensions": ["region"],
+    "dimensionsInfos": [
+        {"dimensions": {"region": "us-central1"}, "details": {"value": "0"}},
+        {"dimensions": {"region": "us-west4"}, "details": {"value": "8"}},
+    ],
+}
+QUOTA_INFO_CPUS = {
+    "quotaId": "CPUS-per-project-region",
+    "metric": "compute.googleapis.com/cpus",
+    "dimensions": ["region"],
+    "dimensionsInfos": [
+        {"dimensions": {"region": "us-central1"}, "details": {"value": "24"}}
+    ],
+}
+
+
+def test_quota_infos_keeps_the_gpu_entries_and_their_ids(session):
+    session.reply(
+        FakeResponse({"quotaInfos": [QUOTA_INFO_A100, QUOTA_INFO_CPUS]}),
+    )
+    found = account.quota_infos(object(), "pml-subcellular-imaging")
+    assert set(found) == {"NVIDIA_A100_GPUS"}
+    info = found["NVIDIA_A100_GPUS"]
+    assert info.quota_id == "NVIDIA-A100-GPUS-per-project-region"
+    assert info.is_regional
+    assert info.limit_in("us-central1") == 0.0
+    assert info.regions_with(1) == ["us-west4"]
+
+
+def test_an_unlisted_region_falls_back_to_the_default_entry():
+    info = account.quota_info_of(
+        {
+            "quotaId": "GPUS-ALL-REGIONS-per-project",
+            "metric": "compute.googleapis.com/gpus_all_regions",
+            "dimensions": [],
+            "dimensionsInfos": [{"dimensions": {}, "details": {"value": "0"}}],
+        }
+    )
+    assert info.is_regional is False
+    assert info.limit_in("us-central1") == 0.0
+
+
+def test_requesting_a_quota_sends_the_id_the_amount_and_the_region(session):
+    session.reply(FakeResponse({"quotaConfig": {"stateDetail": "pending"}}))
+    info = account.quota_info_of(QUOTA_INFO_A100)
+    answer = account.request_quota(
+        object(),
+        "pml-subcellular-imaging",
+        info,
+        1,
+        region="us-central1",
+        email="flynn@example.org",
+    )
+    assert session.body_sent["quotaId"] == "NVIDIA-A100-GPUS-per-project-region"
+    assert session.body_sent["quotaConfig"] == {"preferredValue": "1"}
+    assert session.body_sent["dimensions"] == {"region": "us-central1"}
+    assert session.body_sent["contactEmail"] == "flynn@example.org"
+    assert "requested" in answer
+
+
+def test_asking_twice_reports_the_request_already_in_flight(session):
+    session.reply(FakeResponse({"error": {"message": "already exists"}}, 409))
+    info = account.quota_info_of(QUOTA_INFO_A100)
+    answer = account.request_quota(object(), "p-1", info, 1, region="us-central1")
+    assert "already requested" in answer
+
+
+def test_a_disabled_api_is_recognised_from_googles_own_wording():
+    message = (
+        "IAM API has not been used in project 1039039069680 before or it is "
+        "disabled. Enable it by visiting https://console.developers.google.com"
+        "/apis/api/iam.googleapis.com/overview?project=1039039069680"
+    )
+    assert account.api_disabled_in(message) == "iam.googleapis.com"
+    assert account.api_disabled_in("bucket gs://nope: 404") == ""
+
+
+def test_every_offered_api_says_what_it_allows():
+    for api in account.APIS_ALL:
+        assert account.PURPOSE_API[api]

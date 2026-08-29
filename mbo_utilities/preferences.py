@@ -503,3 +503,20 @@ def get_s2p_torch_device() -> str:
 def set_s2p_torch_device(value: str) -> None:
     """Persist the suite2p torch device as a sticky default for new datasets."""
     _set_option("s2p_torch_device", str(value))
+
+
+def get_widget_toggles() -> dict:
+    """Return the persisted widget/subwidget visibility flags.
+
+    Flat mapping of ``"widget"`` / ``"widget.subwidget"`` keys to bools.
+    Missing keys fall back to each entry's registry default.
+    """
+    toggles = _get_options().get("widget_toggles")
+    if not isinstance(toggles, dict):
+        return {}
+    return {str(k): bool(v) for k, v in toggles.items()}
+
+
+def set_widget_toggles(toggles: dict) -> None:
+    """Persist the widget/subwidget visibility flags."""
+    _set_option("widget_toggles", {str(k): bool(v) for k, v in toggles.items()})

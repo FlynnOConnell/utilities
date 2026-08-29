@@ -435,7 +435,9 @@ class QuotaInfo:
     def regions_with(self, needed: float) -> list:
         """Regions whose limit already covers ``needed``."""
         return sorted(
-            region for region, limit in self.limits.items() if region and limit >= needed
+            region
+            for region, limit in self.limits.items()
+            if region and limit >= needed
         )
 
 

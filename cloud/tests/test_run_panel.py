@@ -6,9 +6,36 @@ from pathlib import Path
 
 import pytest
 
+from imgui_cloud import account
 from imgui_cloud import config as config_module
 from imgui_cloud.gui.panel import CloudPanel
 from imgui_cloud.gui.setup import SetupState
+
+INFO_A100 = account.QuotaInfo(
+    quota_id="NVIDIA-A100-GPUS-per-project-region",
+    metric="NVIDIA_A100_GPUS",
+    dimensions=("region",),
+    limits={"us-central1": 0.0, "us-west4": 8.0},
+)
+INFO_ALL_REGIONS = account.QuotaInfo(
+    quota_id="GPUS-ALL-REGIONS-per-project",
+    metric="GPUS_ALL_REGIONS",
+    limits={"": 0.0},
+)
+
+
+def state_no_quota() -> SetupState:
+    """A signed-in project whose GPU quota is zero everywhere, as new ones are."""
+    return SetupState(
+        apis={api: True for api in account.APIS_ALL},
+        quotas={"NVIDIA_A100_GPUS": 0.0, "PREEMPTIBLE_NVIDIA_A100_GPUS": 0.0},
+        quotas_project={"GPUS_ALL_REGIONS": 0.0},
+        quota_infos={
+            "NVIDIA_A100_GPUS": INFO_A100,
+            "GPUS_ALL_REGIONS": INFO_ALL_REGIONS,
+        },
+        zones_by_accelerator={"nvidia-tesla-a100": ["us-central1-a", "us-west4-b"]},
+    )
 
 
 @pytest.fixture
@@ -214,3 +241,66 @@ def test_the_whole_panel_draws_for_a_half_finished_account(panel, context, rende
     panel.login.status.credentials_ok = True
     panel.login.profile.bucket = ""
     render(panel.draw)
+
+
+def test_a_project_with_no_quota_asks_for_the_cap_and_the_gpu(panel):
+    panel.login.state = state_no_quota()
+    panel.choose_gpu(config_module.gpu_option("a2-highgpu-1g"))
+    asks = panel.quota_asks(config_module.gpu_option("a2-highgpu-1g"))
+    assert [(info.metric, value, region) for info, value, region in asks] == [
+        ("GPUS_ALL_REGIONS", 1.0, ""),
+        ("NVIDIA_A100_GPUS", 1.0, "us-central1"),
+    ]
+
+
+def test_nothing_is_asked_for_once_the_quota_covers_the_run(panel):
+    state = state_no_quota()
+    state.quotas["NVIDIA_A100_GPUS"] = 4.0
+    state.quotas_project["GPUS_ALL_REGIONS"] = 4.0
+    panel.login.state = state
+    assert panel.quota_asks(config_module.gpu_option("a2-highgpu-1g")) == []
+
+
+def test_a_region_with_quota_is_one_click_away(panel):
+    panel.login.state = state_no_quota()
+    option = config_module.gpu_option("a2-highgpu-1g")
+    panel.use_region("us-west4", option)
+    assert panel.login.profile.zone == "us-west4-b"
+
+
+def test_a_region_we_have_no_zone_list_for_still_moves_the_profile(panel):
+    panel.login.state = state_no_quota()
+    option = config_module.gpu_option("a2-ultragpu-1g")
+    panel.use_region("europe-west4", option)
+    assert panel.login.profile.zone == "europe-west4-a"
+
+
+def test_the_quota_card_draws_the_request_block(panel, context, render):
+    panel.login.state = state_no_quota()
+    render(panel._draw_machine, panel._draw_run)
+
+
+def test_without_the_quotas_api_the_card_offers_to_turn_it_on(panel, context, render):
+    state = state_no_quota()
+    state.quota_infos = {}
+    state.apis[account.SERVICE_QUOTAS] = False
+    panel.login.state = state
+    render(panel._draw_machine)
+
+
+def test_asking_queues_the_requests_for_the_worker_thread(panel):
+    started = []
+    panel.login._start = lambda task: started.append(task.__name__)
+    panel.login.state = state_no_quota()
+    asks = panel.quota_asks(config_module.gpu_option("a2-highgpu-1g"))
+    panel.login.ask_for_quota(asks)
+    assert started == ["_task_quota"]
+    assert panel.login.quota_asks == asks
+
+
+def test_enabling_one_api_names_it_for_the_worker_thread(panel):
+    started = []
+    panel.login._start = lambda task: started.append(task.__name__)
+    panel.login.enable_api(account.SERVICE_IAM)
+    assert panel.login.api_pending == account.SERVICE_IAM
+    assert started == ["_task_enable_api"]
