@@ -178,22 +178,29 @@ class LoginPanel:
         self._read_details(credentials)
 
     def _task_quota(self) -> None:
-        """Send the queued quota requests, turning the Quotas API on first."""
+        """Turn the Quotas API on, look the quotas up by metric, and ask."""
         credentials, _ = credentials_module.credentials_for(self.profile)
-        account.enable_services(
-            credentials, self.profile.project_id, (account.SERVICE_QUOTAS,)
-        )
-        self.quota_answers = [
-            account.request_quota(
-                credentials,
-                self.profile.project_id,
-                info,
-                value,
-                region=region,
-                email=self.profile.user_email,
+        project = self.profile.project_id
+        account.enable_services(credentials, project, (account.SERVICE_QUOTAS,))
+        infos = account.quota_infos(credentials, project)
+        self.state.quota_infos = infos
+        answers = []
+        for metric, value, region in self.quota_asks:
+            info = infos.get(metric)
+            if info is None:
+                answers.append(f"{metric}: Cloud Quotas does not offer this one")
+                continue
+            answers.append(
+                account.request_quota(
+                    credentials,
+                    project,
+                    info,
+                    value,
+                    region=region,
+                    email=self.profile.user_email,
+                )
             )
-            for info, value, region in self.quota_asks
-        ]
+        self.quota_answers = answers
         self._read_details(credentials)
 
     def _task_bucket(self) -> None:
@@ -219,7 +226,7 @@ class LoginPanel:
         self._start(self._task_enable_api)
 
     def ask_for_quota(self, asks: list) -> None:
-        """Send ``(info, value, region)`` quota requests to Google."""
+        """Send ``(metric, value, region)`` quota requests to Google."""
         self.quota_asks = asks
         self.quota_answers = []
         self._start(self._task_quota)
@@ -440,20 +447,11 @@ class LoginPanel:
                 self.sign_out()
             pop_button_style()
         if self.waiting_console:
-            style.wrapped(
-                "waiting for the console window; this picks itself up the moment "
-                "you finish signing in there.",
-                theme.warn,
-            )
+            style.wrapped("waiting for the console window...", theme.warn)
 
         if not imgui.tree_node("Other ways to sign in"):
             return
-        style.wrapped(
-            "A service-account key signs in without a browser - the right choice "
-            "for a shared workstation or a headless machine. Create one, download "
-            "the JSON, and point this at it.",
-            theme.text_dim,
-        )
+        style.wrapped("A key file signs in without a browser.", theme.text_dim)
         self._draw_link(
             "Create a key",
             setup_module.url_console(
@@ -471,12 +469,8 @@ class LoginPanel:
         if imgui.small_button(f"{fa.ICON_FA_FOLDER_OPEN}##browsekey"):
             self._browse("key", "Service-account key")
 
-        imgui.dummy(imgui.ImVec2(0, 6))
-        style.wrapped(
-            "No Cloud SDK and no key? Create a desktop OAuth client instead, "
-            "download its JSON, and sign in through the browser with that.",
-            theme.text_dim,
-        )
+        imgui.dummy(style.em2(0, 0.2))
+        style.wrapped("Or a desktop OAuth client, with no SDK at all.", theme.text_dim)
         self._draw_link(
             "Create an OAuth client",
             setup_module.url_console("/auth/clients", self.profile.project_id),
@@ -515,11 +509,7 @@ class LoginPanel:
             if picked != current:
                 self.choose_project(self.state.projects[labels.index(picked)])
         else:
-            style.wrapped(
-                "No projects listed yet - sign in first, or paste the link of the "
-                "project you already have open in the console.",
-                theme.text_dim,
-            )
+            style.wrapped("No projects listed yet.", theme.text_dim)
             field_row("Project id", "Lowercase id, not the display name.")
             changed, value = imgui.input_text("##projectid", self.profile.project_id)
             if changed:
@@ -564,12 +554,12 @@ class LoginPanel:
         if api in account.APIS_OPTIONAL:
             imgui.same_line()
             imgui.text_colored(to_vec4(theme.text_dim), "(optional)")
+        style.help_marker(theme, account.PURPOSE_API.get(api, ""))
         if known is not True and self.profile.project_id:
             imgui.same_line()
             with style.button_style(theme, primary=False):
                 if imgui.button("Enable"):
                     self.enable_api(api)
-        style.desc(theme, account.PURPOSE_API.get(api, ""))
         imgui.pop_id()
 
     def _draw_control_bucket(self) -> None:
@@ -623,15 +613,13 @@ class LoginPanel:
         pop_button_style()
 
     def _draw_link(self, label: str, url: str, note: str) -> None:
-        """A console link with the click-path to follow once it opens."""
-        push_button_style(self.theme, primary=False)
-        if imgui.button(f"{fa.ICON_FA_ARROW_UP_RIGHT_FROM_SQUARE}  {label}"):
-            webbrowser.open(url)
-        pop_button_style()
+        """A console link whose click-path lives in its tooltip."""
+        with style.button_style(self.theme, primary=False):
+            opened = imgui.button(f"{fa.ICON_FA_ARROW_UP_RIGHT_FROM_SQUARE}  {label}")
         if imgui.is_item_hovered():
-            imgui.set_tooltip(url)
-        imgui.same_line()
-        imgui.text_colored(to_vec4(self.theme.text_dim), note)
+            imgui.set_tooltip(f"{note}\n{url}")
+        if opened:
+            webbrowser.open(url)
 
     def _draw_settings(self) -> None:
         """Everything the checklist filled in, editable by hand."""
@@ -729,14 +717,16 @@ class LoginPanel:
         if not api or not self.profile.project_id:
             return
         theme = self.theme
-        style.desc(theme, account.PURPOSE_API.get(api, ""))
         imgui.push_id(f"enable-{api}")
         imgui.begin_disabled(bool(self.busy))
         with style.button_style(theme, primary=False):
-            if imgui.button(
+            enable = imgui.button(
                 f"{fa.ICON_FA_TOGGLE_ON}  Enable {api}", style.em2(20, 1.8)
-            ):
-                self.enable_api(api)
+            )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(account.PURPOSE_API.get(api, ""))
+        if enable:
+            self.enable_api(api)
         imgui.end_disabled()
         imgui.pop_id()
 

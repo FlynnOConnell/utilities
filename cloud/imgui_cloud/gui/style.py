@@ -11,7 +11,13 @@ from contextlib import contextmanager
 
 from imgui_bundle import hello_imgui, icons_fontawesome_6 as fa
 from imgui_bundle import imgui, imgui_ctx
-from imgui_data_loader import Theme, pop_button_style, push_button_style, to_vec4
+from imgui_data_loader import (
+    Theme,
+    pop_button_style,
+    push_button_style,
+    to_vec4,
+    wrapped_tooltip,
+)
 
 WIDTH_LABEL_EM = 7.5
 ROUNDING_CARD = 8.0
@@ -57,6 +63,14 @@ def center_text(text: str, color) -> None:
         return
     imgui.set_cursor_pos_x(imgui.get_cursor_pos_x() + (width - width_text) * 0.5)
     imgui.text_colored(to_vec4(color), text)
+
+
+def help_marker(theme: Theme, text: str) -> None:
+    """A dim (?) that keeps the long explanation in a tooltip instead of on screen."""
+    imgui.same_line()
+    imgui.text_colored(to_vec4(theme.text_dim), "(?)")
+    if imgui.is_item_hovered():
+        wrapped_tooltip(text)
 
 
 def section(theme: Theme, glyph: str, title: str, hint: str = "") -> None:

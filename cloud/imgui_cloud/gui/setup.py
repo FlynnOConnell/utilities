@@ -147,45 +147,31 @@ def steps_for(
         steps.append(
             Step(
                 title="Install the Google Cloud SDK",
-                body=(
-                    "The one-click sign-in below uses gcloud, Google's own "
-                    "command-line tool. Install it, then reopen this panel."
-                ),
+                body="The one-click sign-in uses gcloud, Google's own CLI.",
                 action=ACTION_INSTALL,
                 url=account.URL_INSTALL_GCLOUD,
                 label_url="Download",
                 command=account.command_install_gcloud(),
-                note="Or skip it and sign in with a key file, below.",
+                note="Or sign in with a key file, below.",
             )
         )
 
     steps += [
         Step(
             title="Sign in with Google",
-            body=(
-                "Opens your browser, asks for the Google account that owns the "
-                "project, and stores the result on this machine. No API key is "
-                "involved: API keys cannot authorise Compute Engine or Cloud "
-                "Storage on your behalf."
-            ),
+            body="Opens your browser. No API key is involved.",
             action=ACTION_SIGNIN,
             done=signed_in,
             command="gcloud auth application-default login",
             note=(
                 f"signed in as {state.email}"
                 if state.email
-                else "On Google's consent page every permission starts unticked: "
-                "press Select all, or the sign-in ends with 'scope is required "
-                "but was not consented' and nothing is saved."
+                else "Tick every box on Google's consent page, or it refuses."
             ),
         ),
         Step(
             title="Pick your project",
-            body=(
-                "Every project you can see is listed once you are signed in; "
-                "picking one fills in its number, its buckets and its service "
-                "accounts. Nothing here has to be typed."
-            ),
+            body="Everything below fills itself in from the project you pick.",
             action=ACTION_PROJECT,
             done=bool(project),
             url=url_console("/projectselector2/home/dashboard"),
@@ -194,16 +180,12 @@ def steps_for(
                 f"{profile.project_name or project}  ·  id {project}  ·  number "
                 f"{profile.project_number}"
                 if project and profile.project_number
-                else "A billing account must be linked or the APIs stay off."
+                else "Needs a billing account linked."
             ),
         ),
         Step(
             title="Turn on Compute Engine and Cloud Storage",
-            body=(
-                "New projects have every API off. Compute Engine creates the "
-                "A100 worker; Cloud Storage holds the data on the way up and "
-                "the results on the way back."
-            ),
+            body="New projects have every API off.",
             action=ACTION_APIS,
             done=state.apis_ok if state.apis else status.compute_ok,
             url=url_console("/apis/library/compute.googleapis.com", project),
@@ -213,15 +195,11 @@ def steps_for(
                 + " ".join(APIS_REQUIRED)
                 + (f" --project={project}" if project else "")
             ),
-            note="Enabling Compute Engine takes a minute or two to finish.",
+            note="Compute Engine takes a minute to come up.",
         ),
         Step(
             title="Choose the staging bucket",
-            body=(
-                "One bucket per project is plenty. Keep it in the same region "
-                "as the zone you run in, or every upload and download crosses "
-                "regions and is billed for it."
-            ),
+            body="One per project, in the region you run in.",
             action=ACTION_BUCKET,
             done=status.bucket_ok
             or bool(profile.bucket and profile.bucket in state.buckets),
@@ -232,17 +210,11 @@ def steps_for(
                 + (f" --project={project}" if project else "")
                 + f" --location={profile.region}"
             ),
-            note=f"Bucket names are global: gs://{bucket} must be unused by anyone.",
+            note=f"gs://{bucket} must be unused by anyone, anywhere.",
         ),
         Step(
             title="Request A100 quota",
-            body=(
-                "A new project's GPU quota is zero, and that otherwise only "
-                "shows up when a run fails to start. Filter the quota page for "
-                "NVIDIA_A100_GPUS in your region and request at least 1. This "
-                "step blocks nothing: the Run tab will launch anyway, and "
-                "Google's refusal names the quota it wants."
-            ),
+            body="A new project gets zero GPUs until you ask. The Machine tab asks.",
             action=ACTION_QUOTA,
             done=state.quota_a100 >= 1,
             url=url_console("/iam-admin/quotas", project),
@@ -255,10 +227,7 @@ def steps_for(
         ),
         Step(
             title="Check the connection",
-            body=(
-                "Probes all three at once: credentials, bucket, compute. "
-                "Whatever fails comes back as a line you can act on."
-            ),
+            body="Probes credentials, bucket and compute in one go.",
             action=ACTION_VERIFY,
             done=status.ok,
         ),
@@ -328,10 +297,8 @@ class SetupGuide:
             pop_button_style()
             if imgui.is_item_hovered():
                 imgui.set_tooltip(step.command)
-            imgui.same_line()
-            imgui.text_colored(
-                to_vec4(theme.ok if self.copied == step.command else theme.text_dim),
-                "copied" if self.copied == step.command else step.command,
-            )
+            if self.copied == step.command:
+                imgui.same_line()
+                imgui.text_colored(to_vec4(theme.ok), "copied")
         if step.note:
             wrapped(step.note, theme.warn if not step.done else theme.text_dim)

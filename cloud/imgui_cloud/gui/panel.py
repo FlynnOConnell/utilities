@@ -23,7 +23,6 @@ from imgui_bundle import icons_fontawesome_6 as fa
 from imgui_bundle import imgui, portable_file_dialogs as pfd
 from imgui_data_loader import Theme, pop_button_style, push_button_style, to_vec4
 
-from imgui_cloud import account
 from imgui_cloud import config as config_module
 from imgui_cloud import credentials as credentials_module
 from imgui_cloud import history, pipelines
@@ -245,12 +244,10 @@ class CloudPanel:
         )
         if changed:
             machine.spot = value
-        if machine.spot:
-            style.desc(
-                theme,
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
                 "Google can reclaim a spot box at any time; the run fails and "
-                "nothing is lost except the compute already spent. Spot draws on "
-                "the PREEMPTIBLE_ quota, which is counted separately.",
+                "nothing is lost but the compute already spent."
             )
 
         field_row(
@@ -366,17 +363,16 @@ class CloudPanel:
             imgui.text_colored(to_vec4(theme.err), f"{limit:.0f}")
 
     def _draw_gpu_detail(self) -> None:
-        """What the chosen GPU needs, and every number that decides whether it runs."""
+        """Whether the chosen GPU can run, and what to do when it cannot."""
         theme = self.theme
         machine = self.config.machine
         profile = self.login.profile
-        state = self.login.state
         option = config_module.gpu_option(
             machine.machine_type, machine.accelerator_type
         )
         if option is None:
             style.wrapped(
-                f"{machine.machine_type} is not in the catalog; it is sent as typed.",
+                f"{machine.machine_type} is not in the catalog; sent as typed.",
                 theme.warn,
             )
             return
@@ -386,32 +382,27 @@ class CloudPanel:
                 to_vec4(theme.accent), f"{option.label}   ({option.machine_type})"
             )
             limit, metric = config_module.quota_effective(
-                state.quotas, option, machine.spot
+                self.login.state.quotas, option, machine.spot
             )
             if limit < 0:
-                style.wrapped(
-                    f"{metric} has not been read yet - sign in and pick a project "
-                    "on the Account tab and the quota lands here.",
-                    theme.text_dim,
-                )
+                style.wrapped(f"{metric}: not read yet", theme.text_dim)
             elif limit >= option.count:
                 style.wrapped(
-                    f"{metric} = {limit:.0f} in {profile.region}, and this run "
-                    f"needs {option.count}.",
+                    f"{metric} = {limit:.0f} in {profile.region}, needs "
+                    f"{option.count}",
                     theme.ok,
                 )
             else:
                 style.wrapped(
-                    f"{metric} = {limit:.0f} in {profile.region}, but this run "
-                    f"needs {option.count}.",
+                    f"{metric} = {limit:.0f} in {profile.region}, needs "
+                    f"{option.count}",
                     theme.err,
                 )
-                self._draw_quota_link(metric)
             self._draw_quota_detail(option)
             self._draw_gpu_zones(option)
 
     def _draw_quota_detail(self, option: config_module.GpuOption) -> None:
-        """Both metrics, the project-wide cap, and what to do about either."""
+        """The numbers behind the verdict, and the request that fixes them."""
         theme = self.theme
         state = self.login.state
         regular = state.quota_for(option.metric_quota)
@@ -421,21 +412,20 @@ class CloudPanel:
             f"{option.metric_quota_spot}: {number_quota(spot)}",
             theme.text_dim,
         )
-        if spot <= 0 < regular:
-            style.wrapped(
-                "Preemptible quota is opt-in and most projects have none; spot "
-                "VMs then count against the ordinary quota above, so that zero "
-                "is not what stops a run.",
-                theme.text_dim,
-            )
+        style.help_marker(
+            theme,
+            "Preemptible quota is opt-in and most projects have none; spot VMs "
+            "then count against the ordinary quota, so a zero next to "
+            "PREEMPTIBLE_ is not what stops a run.",
+        )
         cap = state.gpus_all_regions
         if cap == 0:
-            style.wrapped(
-                "GPUS_ALL_REGIONS is 0 for this project: that one is counted "
-                "across every region at once, so no GPU starts anywhere and "
-                "switching region cannot help until it is raised. This is the "
-                "default for a new project, not a fault.",
-                theme.err,
+            style.wrapped("GPUS_ALL_REGIONS = 0, so no region works", theme.err)
+            style.help_marker(
+                theme,
+                "That quota is counted across every region at once. While it is "
+                "zero no GPU starts anywhere, and switching region cannot help. "
+                "Zero is the default for a new project, not a fault.",
             )
         elif cap > 0:
             style.wrapped(f"GPUS_ALL_REGIONS: {cap:.0f}", theme.text_dim)
@@ -443,86 +433,63 @@ class CloudPanel:
         self._draw_quota_regions(option)
 
     def quota_asks(self, option: config_module.GpuOption) -> list:
-        """The ``(quota, amount, region)`` increases this GPU still needs."""
+        """The ``(metric, amount, region)`` increases this GPU still needs."""
         state = self.login.state
         asks = []
-        info_all = state.info_for("GPUS_ALL_REGIONS")
-        if info_all is not None and 0 <= state.gpus_all_regions < option.count:
-            asks.append((info_all, float(option.count), ""))
-        info_gpu = state.info_for(option.metric_quota)
+        if 0 <= state.gpus_all_regions < option.count:
+            asks.append(("GPUS_ALL_REGIONS", float(option.count), ""))
         limit, _ = config_module.quota_effective(
             state.quotas, option, self.config.machine.spot
         )
-        if info_gpu is not None and 0 <= limit < option.count:
-            asks.append((info_gpu, float(option.count), self.login.profile.region))
+        if 0 <= limit < option.count:
+            asks.append(
+                (option.metric_quota, float(option.count), self.login.profile.region)
+            )
         return asks
 
     def _draw_quota_ask(self, option: config_module.GpuOption) -> None:
         """Exactly what to ask Google for, and the button that asks."""
         theme = self.theme
         login = self.login
-        if not login.state.quota_infos:
-            style.wrapped(
-                "Turn on the Cloud Quotas API and this panel can read your real "
-                "limits per region and ask for more without the console.",
-                theme.text_dim,
-            )
-            with style.button_style(theme, primary=False):
-                if imgui.button(
-                    f"{fa.ICON_FA_TOGGLE_ON}  Enable cloudquotas.googleapis.com",
-                    style.em2(22, 1.8),
-                ):
-                    login.enable_api(account.SERVICE_QUOTAS)
-            imgui.same_line()
-            self._draw_quota_link(option.metric_quota)
-            return
-
         asks = self.quota_asks(option)
         if not asks:
             return
         imgui.dummy(style.em2(0, 0.2))
         imgui.text_colored(to_vec4(theme.accent), "Ask Google for")
-        for info, value, region in asks:
+        for metric, value, region in asks:
             style.wrapped(
-                f"    {info.metric} = {value:.0f}"
-                f"    {f'in {region}' if region else 'project-wide'}",
-                theme.text,
+                f"    {metric} = {value:.0f}    {region or 'project-wide'}", theme.text
             )
         imgui.begin_disabled(bool(login.busy))
         with style.button_style(theme, primary=True):
-            if imgui.button(
-                f"{fa.ICON_FA_PAPER_PLANE}  Ask Google for "
-                f"{'both' if len(asks) > 1 else 'it'}",
-                style.em2(18, 2.0),
-            ):
-                login.ask_for_quota(asks)
+            asked = imgui.button(
+                f"{fa.ICON_FA_PAPER_PLANE}  Ask Google"
+                f"{' for both' if len(asks) > 1 else ''}",
+                style.em2(14, 2.0),
+            )
         imgui.end_disabled()
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Files the increase through the Cloud Quotas API, turning that "
+                "API on first. Small increases are granted in minutes."
+            )
+        if asked:
+            login.ask_for_quota(asks)
         imgui.same_line()
         self._draw_quota_link(option.metric_quota)
-        style.desc(
-            theme,
-            "Increases under Google's auto-approval threshold land in minutes; "
-            "bigger ones go to a person. The answer appears on the Account tab.",
-        )
         for answer in login.quota_answers:
             style.wrapped(f"{fa.ICON_FA_CIRCLE_CHECK}  {answer}", theme.ok)
 
     def _draw_quota_regions(self, option: config_module.GpuOption) -> None:
         """Regions that already allow this GPU, each one click away."""
         theme = self.theme
-        state = self.login.state
-        info = state.info_for(option.metric_quota)
+        info = self.login.state.info_for(option.metric_quota)
         if info is None:
             return
         regions = info.regions_with(option.count)
         if not regions:
-            style.wrapped(
-                f"No region allows {option.count}x {option.gpu} yet.", theme.warn
-            )
             return
-        style.wrapped(
-            f"Regions that already allow {option.count}x {option.gpu}:", theme.ok
-        )
+        style.wrapped(f"Regions that allow {option.count}:", theme.ok)
         for region in regions[:COUNT_ZONES_OFFERED]:
             imgui.push_id(f"region-{region}")
             with style.button_style(theme, primary=False):
@@ -543,16 +510,16 @@ class CloudPanel:
         self.use_zone(zones[0] if zones else f"{region}-a")
 
     def _draw_quota_link(self, metric: str) -> None:
-        """The console page for a quota, with the metric to filter it by."""
+        """The console quota page, and the metric to filter it by."""
+        imgui.push_id(f"quotalink-{metric}")
         with style.button_style(self.theme, primary=False):
-            clicked = imgui.button(
-                f"{fa.ICON_FA_ARROW_UP_RIGHT_FROM_SQUARE}  Request quota"
-            )
+            clicked = imgui.button(f"{fa.ICON_FA_ARROW_UP_RIGHT_FROM_SQUARE}  Console")
         if imgui.is_item_hovered():
-            imgui.set_tooltip(f"filter the quota page for {metric}")
+            imgui.set_tooltip(f"the quota page, filtered by hand for {metric}")
         imgui.same_line()
         with style.button_style(self.theme, primary=False):
-            copied = imgui.button(f"{fa.ICON_FA_COPY}  Copy metric")
+            copied = imgui.button(f"{fa.ICON_FA_COPY}  Copy {metric}")
+        imgui.pop_id()
         if copied:
             imgui.set_clipboard_text(metric)
         if clicked:
@@ -587,8 +554,10 @@ class CloudPanel:
             theme.warn,
         )
         for zone in zones[:COUNT_ZONES_OFFERED]:
+            imgui.push_id(f"zone-{zone}")
             with style.button_style(theme, primary=False):
                 taken = imgui.button(zone)
+            imgui.pop_id()
             if taken:
                 self.use_zone(zone)
             imgui.same_line()
@@ -672,11 +641,11 @@ class CloudPanel:
             if imgui.button(f"{fa.ICON_FA_ROCKET}  Launch run", style.em2(18, 2.4)):
                 self.launch()
         imgui.end_disabled()
-        style.desc(
-            theme,
-            "Quota is advice, not a gate: if it is wrong, launch anyway and "
-            "Google's refusal names the quota and the number it wants.",
-        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Quota is advice, not a gate: if it looks wrong, launch anyway "
+                "and Google's refusal names the quota it wants."
+            )
 
     def launch(self) -> None:
         """Start the run described by the form."""
@@ -708,17 +677,11 @@ class CloudPanel:
             state.quotas, option, machine.spot
         )
         if limit < 0:
-            style.desc(
-                theme,
-                f"{metric}: not read yet - the Account tab fills this in once a "
-                "project is picked.",
-            )
+            style.desc(theme, f"{metric}: not read yet")
             return
         if limit >= option.count:
             style.desc(
-                theme,
-                f"{metric} = {limit:.0f} in {self.login.profile.region}: enough "
-                f"for the {option.count} this needs.",
+                theme, f"{metric} = {limit:.0f} in {self.login.profile.region}"
             )
             return
         style.wrapped(
@@ -739,11 +702,7 @@ class CloudPanel:
             self.config.machine.spot,
         )
         if better is None:
-            style.wrapped(
-                "No GPU in the catalog has quota in this project yet - which is "
-                "the default for a new one, not a fault.",
-                theme.warn,
-            )
+            style.wrapped("Nothing in the catalog has quota here yet.", theme.warn)
             self._draw_quota_ask(option)
             return
         with style.button_style(theme, primary=False):
@@ -752,10 +711,7 @@ class CloudPanel:
                 style.em2(18, 1.8),
             ):
                 self.use_recommended_gpu()
-        style.desc(
-            theme,
-            f"{better.label} on {better.machine_type} has quota in this project.",
-        )
+
 
     def _draw_run_summary(self) -> None:
         """Where it lands, what it runs on, and roughly what it costs."""
