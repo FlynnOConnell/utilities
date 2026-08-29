@@ -85,10 +85,38 @@ the live quota that actually gates it. That last part has a trap in it:
 > can start, so it is only believed when it is above zero.
 
 The panel prints both numbers and the project-wide `GPUS_ALL_REGIONS` cap, tells
-you which one it used, offers the cheapest box that does have quota, and says
-whether your zone carries the GPU (with one-click zone switches for the zones
-that do). Quota never disables Launch: if the numbers look wrong, launch anyway
-and Google's refusal names the quota and the amount it wants.
+you which one it used, and offers the cheapest box that does have quota.
+
+A **new project has zero GPU quota everywhere** - that is Google's default, not
+a fault, and `GPUS_ALL_REGIONS = 0` is the giveaway: it is counted across every
+region at once, so switching region cannot help until it is raised. When the
+Cloud Quotas API is on, the panel reads your real limits region by region, says
+exactly which increases this run needs, and asks for them from here:
+
+```
+Ask Google for
+    GPUS_ALL_REGIONS  = 1    project-wide
+    NVIDIA_A100_GPUS  = 1    in us-central1
+[ Ask Google for both ]   [ Request quota ]   [ Copy metric ]
+```
+
+Increases under Google's auto-approval threshold land in minutes. Regions that
+already allow the GPU are listed as buttons that move your zone there. Quota
+never disables Launch either: if the numbers look wrong, launch anyway and
+Google's refusal names the quota and the amount it wants.
+
+### APIs
+
+The API step lists every API the panel uses, what turning it on allows, and an
+Enable button per row - and any failure that says *"has not been used in project
+... or it is disabled"* grows the same button underneath it, wherever it appears.
+
+| API | what it allows | |
+| --- | --- | --- |
+| `compute.googleapis.com` | creates, watches and deletes the worker | required |
+| `storage.googleapis.com` | moves data up and results back | required |
+| `iam.googleapis.com` | lists service accounts a worker can run as | optional |
+| `cloudquotas.googleapis.com` | reads real GPU limits and requests increases in-app | optional |
 
 `imgui-cloud gui --pick` puts the
 [imgui_data_loader](https://github.com/FlynnOConnell/imgui_data_loader) launcher
