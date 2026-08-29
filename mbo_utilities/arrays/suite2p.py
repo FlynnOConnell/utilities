@@ -102,7 +102,14 @@ def find_suite2p_plane_dirs(directory: Path) -> list[Path]:
     for subdir in directory.iterdir():
         if subdir.is_dir():
             ops_file = subdir / "ops.npy"
-            if ops_file.exists():
+            # an ops.npy alone is not a plane: ROI-subset outputs
+            # (roi_workflow's rois_<tag>/) carry one without a movie
+            has_movie = (
+                (subdir / "data.bin").exists()
+                or (subdir / "data_raw.bin").exists()
+                or (subdir / "reg_tif").is_dir()
+            )
+            if ops_file.exists() and has_movie:
                 plane_dirs.append(subdir)
 
     # Sort by plane number extracted from directory name

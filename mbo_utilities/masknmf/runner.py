@@ -331,15 +331,15 @@ def _stage_compression(
     pmd_path = plane_dir / PMD_FILE
     cached = pmd_path.exists()
     action = stage_action(cfg.do_compression, cached)
-    if action == "skip" and not cached:
-        raise ValueError(
-            f"compression set to Skip but {pmd_path} does not exist"
-        )
-
-    import masknmf
-
     prov = {"settings": _stage_hash(cfg, "do_compression"), "input": upstream_key, "fs": fs}
     key = _hash(prov)
+    if action == "skip" and not cached:
+        # registration-only run (e.g. roi_workflow.register): nothing to
+        # demix from, so the caller skips demixing too
+        logger.info("masknmf: compression skipped (no cached PMD; demixing will be skipped)")
+        return None, 0.0, key
+
+    import masknmf
 
     if action == "skip":
         logger.info(f"masknmf: reusing {PMD_FILE} (compression skipped)")
@@ -670,10 +670,14 @@ def run_plane(
 
     # 4) demixing
     _progress("demixing", f"Demixing plane {plane}")
-    results, timing["detection"] = _stage_demixing(
-        pmd, demix, runtime, plane_dir, device, fs, logger,
-        pmd_key, reg_computed or comp_computed,
-    )
+    if pmd is None:
+        logger.info("masknmf: demixing skipped (no PMD)")
+        results, timing["detection"] = None, 0.0
+    else:
+        results, timing["detection"] = _stage_demixing(
+            pmd, demix, runtime, plane_dir, device, fs, logger,
+            pmd_key, reg_computed or comp_computed,
+        )
     if timing["detection"]:
         history.append(_history_entry("masknmf_demixing", timing["detection"]))
     elif results is not None:

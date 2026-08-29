@@ -296,7 +296,7 @@ def main(
     is_flag=False,
     flag_value="preview",
     default="preview",
-    help="Side widget to attach: 'preview' (default) or 'manualroi'.",
+    help="Side widget to attach: 'preview' (default), 'manualroi' (preview with the ROIs widget on) or 'none'.",
 )
 @click.option(
     "--no-widget",
@@ -339,7 +339,7 @@ def view(data_in=None, roi=None, widget="preview", no_widget=False, metadata=Fal
       mbo view /data/raw.tiff        Open specific file
       mbo view /data/raw --metadata  Show only metadata
       mbo view /data --roi 0 --roi 2 View specific ROIs
-      mbo view /data --widget manualroi  Draw ROIs by hand
+      mbo view /data --widget manualroi  Open with the ROIs widget on (draw + label by hand)
       mbo view /data/scan.mesc --unit 2   Open one MESc measurement unit
       mbo view --list-gpus           Show available GPU adapters
       mbo view /data/raw --gpu 0     Force GPU index 0
@@ -1638,6 +1638,91 @@ def netcheck(host, remote_path, size_mb, streams, quick, as_json):
     click.echo(nc.format_report(results))
     if not results.get("reachable"):
         raise click.Abort
+
+
+def _csv_ints(_ctx, _param, value):
+    if not value:
+        return None
+    try:
+        return [int(v) for v in value.split(",") if v.strip()]
+    except ValueError as e:
+        raise click.BadParameter(f"expected comma-separated integers, got {value!r}") from e
+
+
+@main.command("roi-run")
+@click.argument("input_path", type=click.Path(exists=True))
+@click.option("-o", "--output", "output_dir", type=click.Path(), default=None,
+              help="Where registration writes plane dirs. Required unless --register none.")
+@click.option("--register", "register_method", type=click.Choice(["suite2p", "masknmf", "none"]),
+              default="suite2p", show_default=True,
+              help="Registration engine; 'none' treats INPUT_PATH as registered plane dir(s).")
+@click.option("--process", type=click.Choice(["extract", "demix", "none"]), default="extract",
+              show_default=True,
+              help="extract: suite2p-style traces from the masks; demix: masknmf seeded NMF; "
+                   "none: register only, then draw ROIs on the registered movie.")
+@click.option("--rois", type=click.Path(exists=True), default=None,
+              help="Labels zarr. Default: manual_labels.zarr in each plane dir (drawn on the "
+                   "registered movie), else beside INPUT_PATH.")
+@click.option("--planes", callback=_csv_ints, default=None,
+              help="1-based z-planes to register/process, e.g. 1,3. Default: all.")
+@click.option("--roi-planes", callback=_csv_ints, default=None,
+              help="Only ROIs drawn on these 0-based planes, e.g. 0,2.")
+@click.option("--indices", callback=_csv_ints, default=None,
+              help="Only these ROI indices (as shown in the ROI tool), e.g. 0,4,7.")
+@click.option("--labels", default=None,
+              help="Only ROIs with these class labels, comma-separated, e.g. soma,dendrite.")
+@click.option("--engine", type=click.Choice(["mean", "suite2p"]), default="mean", show_default=True,
+              help="Extraction engine (--process extract only).")
+@click.option("--no-neuropil", is_flag=True, default=False, help="Skip neuropil traces (extract only).")
+@click.option("--force", is_flag=True, default=False, help="Re-register even when cached.")
+@click.option("--tag", default="manual", show_default=True, help="Output subdir name: rois_<tag>/.")
+def roi_run(input_path, output_dir, register_method, process, rois, planes, roi_planes,
+            indices, labels, engine, no_neuropil, force, tag):
+    """Register, then run some or all drawn ROIs through extraction or demixing.
+
+    \b
+    Draw on the registered movie (recommended):
+      mbo roi-run raw.tif -o out --register suite2p --process none
+      mbo out/zplane01            # draw ROIs in the viewer, they autosave
+      mbo roi-run out --register none --process extract
+
+    \b
+    Or in one go with ROIs drawn on the raw data:
+      mbo roi-run raw.tif -o out --register masknmf --process demix --labels soma
+      mbo roi-run out/zplane01 --register none --process extract --indices 0,3,5
+    """
+    from mbo_utilities.roi_workflow import RoiSelection, run
+
+    sel = RoiSelection(
+        planes=roi_planes or [],
+        indices=indices or [],
+        labels=[s.strip() for s in labels.split(",") if s.strip()] if labels else [],
+    )
+    proc_settings = None
+    if process == "extract":
+        proc_settings = {"engine": engine, "neuropil": not no_neuropil}
+    try:
+        outputs = run(
+            input_path,
+            output_dir,
+            register_method=register_method,
+            process=process,
+            rois=rois,
+            selection=sel,
+            planes=planes,
+            process_settings=proc_settings,
+            force=force,
+            tag=tag,
+        )
+    except (ValueError, KeyError, IndexError, FileNotFoundError) as e:
+        click.echo(f"error: {e}", err=True)
+        raise click.Abort
+    for z, out in sorted(outputs.items()):
+        click.echo(f"z={z}: {out}")
+    if process == "none" and outputs:
+        root = output_dir or Path(next(iter(outputs.values()))).parent
+        click.echo(f"registered. Draw ROIs on the registered movie with:  mbo {root}")
+        click.echo(f"then:  mbo roi-run {root} --register none --process extract|demix")
 
 
 # hpc subcommand group (light import: heavy deps load lazily inside the commands).
