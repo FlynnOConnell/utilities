@@ -112,9 +112,7 @@ def resolve_image(credentials, image_project: str, image_family: str) -> str:
             f"no image family {image_family!r} in project {image_project!r}, and "
             f"nothing to fall back on: {error_first}"
         ) from error_first
-    return images.get_from_family(
-        project=image_project, family=replacement
-    ).self_link
+    return images.get_from_family(project=image_project, family=replacement).self_link
 
 
 def build_instance(

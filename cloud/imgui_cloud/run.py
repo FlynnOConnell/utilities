@@ -283,6 +283,8 @@ class CloudRun:
             run_id=self.run_id,
             requirements=pipelines.requirements(spec, self.config.job.pip),
             env=self.config.job.env,
+            python=self.config.job.python,
+            torch_backend=self.config.job.torch_backend,
             self_delete=not self.config.machine.keep_instance,
         )
         image = instance_module.resolve_image(

@@ -11,6 +11,7 @@ import click
 
 from imgui_cloud import account
 from imgui_cloud import config as config_module
+from imgui_cloud import environment
 from imgui_cloud import credentials as credentials_module
 from imgui_cloud import (
     gcs,
@@ -501,6 +502,39 @@ def list_pipelines():
         click.echo(f"{name:<12} {spec.description}")
         click.echo(f"{'':<12} entry: {spec.entry}")
         click.echo(f"{'':<12} pip:   {', '.join(spec.pip) or '-'}")
+
+
+@main.command("env", short_help="Build a pipeline's environment with uv.")
+@click.argument("pipeline", default="masknmf")
+@click.option("--dir", "dir_venv", default=None, help="Where to create the venv.")
+@click.option("--python", default=None, help="Python version uv should fetch.")
+@click.option(
+    "--torch", "torch_backend", default=None, help="cpu, cu126, cu128... or auto."
+)
+@click.option(
+    "--print", "show", is_flag=True, help="Print the bootstrap script instead."
+)
+def env(pipeline, dir_venv, python, torch_backend, show):
+    """
+    Create the environment PIPELINE runs in, here or anywhere else.
+
+    This is the same environment the cloud worker builds - same interpreter,
+    same branches, same torch - so a pipeline can be run on any machine that
+    has uv, not only on a worker this tool created.
+    """
+    spec = environment.spec_for(pipeline, python=python or "", dir_venv=dir_venv or "")
+    if torch_backend:
+        spec.torch_backend = torch_backend
+    if show:
+        if not dir_venv:
+            spec.dir_venv = environment.DIR_VENV_DEFAULT
+        click.echo(environment.script_bootstrap(spec, standalone=True))
+        return
+    click.echo(f"building {spec.dir_venv} (python {spec.python})")
+    for requirement in spec.requirements:
+        click.echo(f"  {requirement}")
+    filepath_python = environment.build_here(spec)
+    click.echo(click.style(f"ready: {filepath_python}", fg="green"))
 
 
 @main.command("projects", short_help="List the projects this account can see.")

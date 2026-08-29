@@ -77,11 +77,12 @@ def test_reading_the_project_fills_apis_buckets_and_quota(panel, monkeypatch):
     )
     monkeypatch.setattr(
         account,
-        "quotas_gpu",
+        "quotas_region",
         lambda credentials, project, region: {
             "NVIDIA_A100_GPUS": 0.0,
             "PREEMPTIBLE_NVIDIA_A100_GPUS": 2.0,
             "NVIDIA_L4_GPUS": 8.0,
+            "SSD_TOTAL_GB": 500.0,
         },
     )
     monkeypatch.setattr(
@@ -128,7 +129,7 @@ def test_one_failing_call_becomes_a_warning_not_a_crash(panel, monkeypatch):
         lambda credentials, project, services: {api: True for api in services},
     )
     monkeypatch.setattr(account, "list_buckets", refuse)
-    monkeypatch.setattr(account, "quotas_gpu", refuse)
+    monkeypatch.setattr(account, "quotas_region", refuse)
     monkeypatch.setattr(account, "quotas_project", refuse)
     monkeypatch.setattr(account, "quota_infos", refuse)
     monkeypatch.setattr(account, "list_service_accounts", refuse)

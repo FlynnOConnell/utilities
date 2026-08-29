@@ -278,7 +278,7 @@ class LoginPanel:
             self.state.quotas = self._soft(
                 "quota",
                 {},
-                account.quotas_gpu,
+                account.quotas_region,
                 credentials,
                 project,
                 self.profile.region,

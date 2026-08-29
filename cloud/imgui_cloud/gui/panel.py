@@ -603,6 +603,17 @@ class CloudPanel:
             self._draw_run_form()
         self._draw_run_state()
 
+    def fit_disks(self) -> None:
+        """Move the scratch disk onto the quota that has room, and inside it."""
+        machine = self.config.machine
+        quotas = self.login.state.quotas
+        machine.data_disk_type = "pd-balanced"
+        room = quotas.get(config_module.METRIC_QUOTA_DISK, -1.0)
+        if room >= 0:
+            machine.data_disk_gb = max(
+                10, min(machine.data_disk_gb, int(room) - machine.boot_disk_gb)
+            )
+
     def problems_profile(self) -> list:
         """What the account still owes this run, in the order worth fixing."""
         profile = self.login.profile
@@ -642,7 +653,10 @@ class CloudPanel:
         self._draw_run_summary()
 
         problems_account = self.problems_profile()
-        problems = self.config.validate() + problems_account
+        problems_disk = config_module.problems_disk(
+            self.config.machine, self.login.state.quotas, self.login.profile.region
+        )
+        problems = self.config.validate() + problems_account + problems_disk
         for problem in problems:
             style.wrapped(f"{fa.ICON_FA_TRIANGLE_EXCLAMATION}  {problem}", theme.err)
         if problems_account:
@@ -651,6 +665,13 @@ class CloudPanel:
                     f"{fa.ICON_FA_USER}  Fix it on the Account tab", style.em2(16, 1.8)
                 ):
                     self._tab_next = "account"
+        if problems_disk:
+            with style.button_style(theme, primary=False):
+                if imgui.button(
+                    f"{fa.ICON_FA_HARD_DRIVE}  Shrink the disks to fit",
+                    style.em2(16, 1.8),
+                ):
+                    self.fit_disks()
         imgui.dummy(style.em2(0, 0.3))
         running = self.run is not None and not self.run.state.is_terminal
         imgui.begin_disabled(bool(problems) or running)
@@ -839,11 +860,19 @@ class CloudPanel:
                     time.strftime("%m-%d %H:%M", time.localtime(record.time_created))
                 )
                 imgui.table_next_column()
-                color = {
-                    history.PHASE_DONE: theme.ok,
-                    history.PHASE_FAILED: theme.err,
-                }.get(record.phase, theme.text_dim)
-                imgui.text_colored(to_vec4(color), record.phase)
+                if record.stalled:
+                    imgui.text_colored(to_vec4(theme.warn), "stalled")
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip(
+                            f"last said {record.phase!r}; nothing has reported "
+                            "since, so the window that started it is gone"
+                        )
+                else:
+                    color = {
+                        history.PHASE_DONE: theme.ok,
+                        history.PHASE_FAILED: theme.err,
+                    }.get(record.phase, theme.text_dim)
+                    imgui.text_colored(to_vec4(color), record.phase)
                 imgui.table_next_column()
                 imgui.text(record.pipeline)
                 imgui.table_next_column()

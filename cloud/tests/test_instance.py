@@ -30,7 +30,7 @@ def test_the_box_is_an_a100_with_a_scratch_disk():
     assert boot.boot is True and boot.auto_delete is True
     assert data.boot is False
     assert data.device_name == "imgui-cloud-data"
-    assert data.initialize_params.disk_size_gb == 1000
+    assert data.initialize_params.disk_size_gb == 500
 
 
 def test_a2_types_do_not_declare_guest_accelerators():

@@ -59,13 +59,25 @@ class PipelineSpec:
     default_params: dict = field(default_factory=dict)
 
 
+# The lab packages are installed from git, not from an index: the releases on
+# PyPI lag the branches these pipelines are written against.
+MBO_UTILITIES = "git+https://github.com/FlynnOConnell/utilities.git@pipeline-plugin-api"
+MASKNMF_TOOLBOX = (
+    "masknmf[multisession] @ "
+    "git+https://github.com/apasarkar/masknmf-toolbox.git@shared-widgets"
+)
+LBM_SUITE2P = (
+    "git+https://github.com/MillerBrainObservatory/LBM-Suite2p-Python.git@master"
+)
+
+# mbo_utilities depends on masknmf, which is not on any index either, so the
+# toolbox URL travels with every pipeline rather than only the demixing one.
+PIP_LAB = [MBO_UTILITIES, MASKNMF_TOOLBOX]
+
 MASKNMF = PipelineSpec(
     name="masknmf",
     description="maskNMF demixing (registration -> compression -> demixing) per z-plane",
-    pip=[
-        "mbo_utilities",
-        "masknmf[multisession] @ git+https://github.com/apasarkar/masknmf-toolbox.git@curation-viz",
-    ],
+    pip=list(PIP_LAB),
     entry="mbo_utilities.masknmf:run_volume",
     arg_params="settings",
     params_flat=[
@@ -81,7 +93,7 @@ MASKNMF = PipelineSpec(
 SUITE2P = PipelineSpec(
     name="suite2p",
     description="LBM Suite2p: registration, cellpose detection, extraction, dF/F",
-    pip=["mbo_utilities", "lbm_suite2p_python"],
+    pip=PIP_LAB + [LBM_SUITE2P],
     entry="lbm_suite2p_python:run_volume",
     default_params={"keep_reg": False, "keep_raw": False},
 )

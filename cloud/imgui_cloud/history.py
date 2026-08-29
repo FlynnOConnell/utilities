@@ -25,6 +25,10 @@ PHASE_DONE = "done"
 PHASE_FAILED = "failed"
 PHASE_CANCELLED = "cancelled"
 
+# A run whose process is gone keeps its last phase on disk; after this
+# long with no update it is reported as stalled rather than as running.
+SECONDS_STALE = 900.0
+
 PHASES_TERMINAL = (PHASE_DONE, PHASE_FAILED, PHASE_CANCELLED)
 
 
@@ -59,11 +63,25 @@ class RunRecord:
     message: str = ""
     error: str = ""
     time_created: float = field(default_factory=time.time)
+    time_updated: float = 0.0
     time_started: float = 0.0
     time_finished: float = 0.0
     cost_per_hour_estimate: float = 0.0
     bytes_uploaded: int = 0
     bytes_downloaded: int = 0
+
+    @property
+    def stalled(self) -> bool:
+        """
+        Whether a live-looking run has stopped reporting.
+
+        A closed window or a killed process leaves its last phase written to
+        disk forever, so a run that still says "provisioning" hours later is
+        not provisioning - nobody is watching it any more.
+        """
+        if self.phase in PHASES_TERMINAL:
+            return False
+        return time.time() - (self.time_updated or self.time_created) > SECONDS_STALE
 
     @property
     def uri_run(self) -> str:
@@ -94,7 +112,8 @@ def filepath_record(run_id: str) -> str:
 
 
 def save(record: RunRecord) -> None:
-    """Write (or overwrite) a run record."""
+    """Write (or overwrite) a run record, stamping when it was last alive."""
+    record.time_updated = time.time()
     Path(filepath_record(record.run_id)).write_text(
         json.dumps(asdict(record), indent=2)
     )

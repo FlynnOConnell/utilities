@@ -60,3 +60,26 @@ def test_no_requirements_still_produces_a_valid_block():
 def test_pip_failure_aborts_the_run():
     text = script(requirements=["mbo_utilities"])
     assert 'fail "pip install failed"' in text
+
+
+def test_the_worker_builds_its_environment_with_uv_not_the_image_python():
+    """The image ships 3.10; the lab packages need 3.12, so uv fetches one."""
+    script = startup.build_startup_script(
+        "gs://b/p/r", "r", requirements=["git+https://example.invalid/x.git@main"]
+    )
+    assert "uv venv --python 3.12" in script
+    assert "--torch-backend auto" in script
+    assert "git+https://example.invalid/x.git@main" in script
+
+
+def test_a_pipeline_environment_is_the_same_object_everywhere():
+    from imgui_cloud import environment
+
+    spec = environment.spec_for("suite2p", python="3.12", dir_venv="/opt/x")
+    assert spec.filepath_python.endswith("python") or spec.filepath_python.endswith(
+        "python.exe"
+    )
+    standalone = environment.script_bootstrap(spec, standalone=True)
+    assert standalone.startswith("#!/usr/bin/env bash")
+    assert "fail()" in standalone
+    assert all(requirement in standalone for requirement in spec.requirements)

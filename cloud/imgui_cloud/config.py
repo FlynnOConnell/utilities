@@ -28,6 +28,12 @@ FAMILIES_GPU_IMPLICIT = ("a2-", "a3-", "a4-", "g2-")
 
 PREFIX_QUOTA_SPOT = "PREEMPTIBLE_"
 
+# pd-ssd and pd-extreme are counted by SSD_TOTAL_GB, which a new project caps
+# at 500 GB; everything else lands in DISKS_TOTAL_GB, which starts at 4 TB.
+TYPES_DISK_SSD = ("pd-ssd", "pd-extreme")
+METRIC_QUOTA_SSD = "SSD_TOTAL_GB"
+METRIC_QUOTA_DISK = "DISKS_TOTAL_GB"
+
 
 @dataclass(frozen=True)
 class GpuOption:
@@ -104,6 +110,36 @@ ZONES_A100_COMMON = [
     "europe-west4-a",
     "asia-northeast1-a",
 ]
+
+
+def disk_gb_by_quota(machine: MachineConfig) -> dict:
+    """How many GB this machine asks for, keyed by the quota that counts them."""
+    wanted = {METRIC_QUOTA_SSD: 0, METRIC_QUOTA_DISK: 0}
+    for size, kind in (
+        (machine.boot_disk_gb, machine.boot_disk_type),
+        (machine.data_disk_gb, machine.data_disk_type),
+    ):
+        metric = METRIC_QUOTA_SSD if kind in TYPES_DISK_SSD else METRIC_QUOTA_DISK
+        wanted[metric] += size
+    return wanted
+
+
+def problems_disk(machine: MachineConfig, quotas: dict, region: str) -> list:
+    """
+    Disk quota this run would break, as lines to show before Google refuses it.
+
+    A default project allows 500 GB of SSD, which one 1000 GB scratch disk
+    walks straight past - and the API only says so a minute into provisioning,
+    after the upload.
+    """
+    found = []
+    for metric, wanted in disk_gb_by_quota(machine).items():
+        limit = quotas.get(metric, -1.0)
+        if wanted and 0 <= limit < wanted:
+            found.append(
+                f"disks need {wanted} GB but {metric} is {limit:.0f} in {region}"
+            )
+    return found
 
 
 def quota_effective(quotas: dict, option: GpuOption, spot: bool) -> tuple:
@@ -193,8 +229,8 @@ class MachineConfig:
     spot: bool = True
     boot_disk_gb: int = 200
     boot_disk_type: str = "pd-balanced"
-    data_disk_gb: int = 1000
-    data_disk_type: str = "pd-ssd"
+    data_disk_gb: int = 500
+    data_disk_type: str = "pd-balanced"
     data_disk_name: str = ""
     keep_data_disk: bool = False
     image_family: str = "pytorch-2-9-cu129-ubuntu-2204-nvidia-580"
@@ -243,6 +279,8 @@ class JobConfig:
     """
 
     pipeline: str = "masknmf"
+    python: str = "3.12"
+    torch_backend: str = "auto"
     pip: list = field(default_factory=list)
     env: dict = field(default_factory=dict)
     params: dict = field(default_factory=dict)
@@ -323,8 +361,8 @@ dated_subfolder = true       # write results into <output>/<date>_<name>
 [machine]
 machine_type = "a2-highgpu-1g"   # 1x A100 40GB
 spot = true                      # ~60% cheaper, can be preempted
-data_disk_gb = 1000              # scratch disk mounted at /mnt/data
-data_disk_type = "pd-ssd"
+data_disk_gb = 500               # scratch disk mounted at /mnt/data
+data_disk_type = "pd-balanced"   # pd-ssd is capped at 500 GB on a new project
 boot_disk_gb = 200
 max_runtime_min = 480            # hard cap: the VM deletes itself at this age
 keep_data_disk = false           # true keeps the scratch disk after teardown
@@ -332,6 +370,8 @@ keep_instance = false            # true leaves the VM up for debugging
 
 [job]
 pipeline = "{pipeline}"
+python = "3.12"                  # uv builds the worker env with this
+torch_backend = "auto"           # reads the GPU driver; or cpu, cu126, cu128...
 pip = []                         # extra requirements, e.g. ["git+https://..."]
 
 [job.env]

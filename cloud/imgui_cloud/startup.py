@@ -18,8 +18,12 @@ from __future__ import annotations
 
 import shlex
 
+from imgui_cloud import environment
+
 DEVICE_NAME_DATA = "imgui-cloud-data"
 DIR_DATA = "/mnt/data"
+DIR_VENV = environment.DIR_VENV_DEFAULT
+PYTHON_DEFAULT = environment.PYTHON_DEFAULT
 
 _TEMPLATE = r"""#!/bin/bash
 set -uo pipefail
@@ -131,15 +135,21 @@ exit "$RC"
 """
 
 
-def _pip_block(requirements: list, python_var: str = '"$PY"') -> str:
-    """Bash that installs ``requirements``, failing the run if it cannot."""
+def _pip_block(
+    requirements: list,
+    python: str = PYTHON_DEFAULT,
+    torch_backend: str = environment.BACKEND_TORCH_DEFAULT,
+) -> str:
+    """Bash that builds the run's environment, failing the run if it cannot."""
     if not requirements:
         return 'echo "[startup] no extra requirements"'
-    quoted = " ".join(shlex.quote(r) for r in requirements)
-    return (
-        'echo "[startup] installing: ' + quoted.replace('"', "'") + '"\n'
-        f"{python_var} -m pip install --upgrade pip >/dev/null 2>&1\n"
-        f'{python_var} -m pip install {quoted} || fail "pip install failed"'
+    return environment.script_bootstrap(
+        environment.EnvSpec(
+            python=python,
+            requirements=list(requirements),
+            torch_backend=torch_backend,
+            dir_venv=DIR_VENV,
+        )
     )
 
 
@@ -155,6 +165,8 @@ def build_startup_script(
     run_id: str,
     requirements: list | None = None,
     env: dict | None = None,
+    python: str = PYTHON_DEFAULT,
+    torch_backend: str = environment.BACKEND_TORCH_DEFAULT,
     self_delete: bool = True,
     device_name: str = DEVICE_NAME_DATA,
     dir_data: str = DIR_DATA,
@@ -172,6 +184,10 @@ def build_startup_script(
         pip requirements installed before the pipeline is imported.
     env : dict, optional
         Environment variables exported for the pipeline.
+    python : str
+        Python version uv builds the run's environment with.
+    torch_backend : str
+        CUDA build of torch to install; ``auto`` reads the worker's driver.
     self_delete : bool
         Delete the instance when the job finishes. False leaves the box up for
         debugging (and billing).
@@ -193,7 +209,12 @@ def build_startup_script(
         ("__DIR_DATA__", dir_data),
         ("__DEVICE_NAME__", device_name),
         ("__SELF_DELETE__", "1" if self_delete else "0"),
-        ("__PIP_BLOCK__", _pip_block(list(requirements or []))),
+        (
+            "__PIP_BLOCK__",
+            _pip_block(
+                list(requirements or []), python=python, torch_backend=torch_backend
+            ),
+        ),
         ("__ENV_BLOCK__", _env_block(env)),
     ):
         script = script.replace(token, value)

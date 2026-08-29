@@ -402,13 +402,18 @@ def service_account_default(project_number: str) -> str:
     return f"{project_number}-compute@developer.gserviceaccount.com"
 
 
-def quotas_gpu(credentials, project: str, region: str) -> dict:
-    """Every GPU quota limit in ``region``, keyed by metric name."""
+def quotas_region(credentials, project: str, region: str) -> dict:
+    """Every quota limit in ``region``, keyed by metric name.
+
+    GPUs are what the panel shows, but the disk metrics live here too and are
+    what actually refuses most first runs.
+    """
     from google.cloud import compute_v1
 
     client = compute_v1.RegionsClient(credentials=credentials)
-    quotas = client.get(project=project, region=region).quotas
-    return {q.metric: q.limit for q in quotas if q.metric.endswith(SUFFIX_METRIC_GPU)}
+    return {
+        q.metric: q.limit for q in client.get(project=project, region=region).quotas
+    }
 
 
 @dataclass
