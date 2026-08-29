@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import sys
 import time
 from dataclasses import dataclass, asdict
@@ -201,6 +202,63 @@ class ProcessInfo:
             return []
 
 
+@dataclass
+class LocalJob:
+    """An in-process background job, tracked beside spawned subprocesses.
+
+    Work that runs on a thread inside the GUI — extracting a trace from an
+    ROI, say — never gets a pid, so it cannot go through
+    :meth:`ProcessManager.spawn`. It registers here instead and shows up in
+    the same status button and process console, which is the only way the
+    user can tell a click did anything.
+
+    The worker thread owns this object: call :meth:`set_progress` as it
+    goes, then exactly one of :meth:`done` or :meth:`fail`.
+    """
+
+    job_id: int
+    task_type: str
+    description: str
+    start_time: float
+    status: str = "running"  # running | completed | error
+    progress: float = 0.0
+    status_message: str = ""
+    error_details: str | None = None
+    completed_time: float | None = None
+
+    def elapsed_seconds(self) -> float:
+        end = self.completed_time if self.completed_time is not None else time.time()
+        return max(0.0, end - self.start_time)
+
+    def elapsed_str(self) -> str:
+        seconds = int(self.elapsed_seconds())
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m {seconds % 60}s"
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
+    def is_alive(self) -> bool:
+        return self.status == "running"
+
+    def set_progress(self, value: float, message: str = "") -> None:
+        self.progress = float(min(max(value, 0.0), 1.0))
+        if message:
+            self.status_message = message
+
+    def done(self, message: str = "") -> None:
+        self.status = "completed"
+        self.progress = 1.0
+        self.status_message = message or self.status_message
+        self.completed_time = time.time()
+
+    def fail(self, error: str) -> None:
+        self.status = "error"
+        self.error_details = str(error)
+        self.status_message = str(error)
+        self.completed_time = time.time()
+
+
 class ProcessManager:
     """
     manages background subprocesses that can survive gui closure.
@@ -208,14 +266,58 @@ class ProcessManager:
     spawns processes using subprocess.Popen with no connection to parent.
     tracks process info in a json file so processes can be monitored
     even after gui restart.
+
+    also tracks in-process :class:`LocalJob` work, which lives only as long
+    as the GUI and is never written to the process file.
     """
 
     PROCESS_FILE = get_mbo_dirs()["cache"] / "running_processes.json"
 
     def __init__(self):
         self._processes: dict[int, ProcessInfo] = {}
+        self._jobs: dict[int, LocalJob] = {}
+        self._next_job_id = 1
+        self._job_lock = threading.Lock()
         self._load()
         prune_logs()
+
+    def start_job(self, task_type: str, description: str) -> LocalJob:
+        """Register an in-process job and return its handle."""
+        with self._job_lock:
+            job_id = self._next_job_id
+            self._next_job_id += 1
+            job = LocalJob(
+                job_id=job_id,
+                task_type=task_type,
+                description=description,
+                start_time=time.time(),
+            )
+            self._jobs[job_id] = job
+        logger.debug(f"started local job {job_id}: {description}")
+        return job
+
+    def get_jobs(self) -> list[LocalJob]:
+        """Every in-process job still being shown, newest last."""
+        with self._job_lock:
+            return sorted(self._jobs.values(), key=lambda j: j.job_id)
+
+    def clear_job(self, job_id: int) -> None:
+        with self._job_lock:
+            self._jobs.pop(job_id, None)
+
+    def _cleanup_jobs(self) -> int:
+        """Drop finished jobs once they have been visible long enough."""
+        now = time.time()
+        with self._job_lock:
+            stale = [
+                job_id
+                for job_id, job in self._jobs.items()
+                if job.completed_time is not None
+                and now - job.completed_time > COMPLETED_RETENTION_SECONDS
+            ]
+            for job_id in stale:
+                del self._jobs[job_id]
+        return len(stale)
 
     def _load(self) -> None:
         """Load process info from disk."""
@@ -464,7 +566,7 @@ class ProcessManager:
             if to_remove:
                 logger.debug(f"Cleaned up {len(to_remove)} finished processes")
 
-        return len(to_remove)
+        return len(to_remove) + self._cleanup_jobs()
 
     def kill(self, pid: int) -> bool:
         """Kill a tracked process by pid."""

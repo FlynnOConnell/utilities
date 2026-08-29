@@ -75,13 +75,6 @@ def _toggle_manual_roi(parent: Any, enabled: bool) -> None:
         sync(enabled)
 
 
-def _toggle_manual_roi_table(parent: Any, enabled: bool) -> None:
-    """Add or drop the ROI table's edge window when its section is toggled."""
-    roi = getattr(parent, "manual_roi", None)
-    if roi is not None:
-        roi.sync_table_window(enabled)
-
-
 WIDGET_REGISTRY: tuple[WidgetEntry, ...] = (
     WidgetEntry(
         key="preview",
@@ -112,15 +105,15 @@ WIDGET_REGISTRY: tuple[WidgetEntry, ...] = (
     WidgetEntry(
         key="manual_roi",
         label="Manual ROI Labeling",
-        tooltip="Freehand ROI drawing and labelling, in a top panel and a "
-                "side ROI table.",
+        tooltip="Freehand ROI drawing and labelling: controls and traces "
+                "in a top panel, the table in the ROIs tab.",
         default=False,
         on_toggle=_toggle_manual_roi,
         subwidgets=(
             SubWidget("tools", "Drawing tools"),
             SubWidget("overlay", "Overlay controls"),
             SubWidget("labels", "Label editor"),
-            SubWidget("table", "ROI table", on_toggle=_toggle_manual_roi_table),
+            SubWidget("table", "ROI table", tooltip="The ROIs tab in this panel."),
         ),
     ),
     WidgetEntry(

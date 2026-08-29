@@ -1,12 +1,11 @@
 """Manual ROI drawing, labelling and export.
 
 Opened with ``mbo <path> --widget manualroi``, or from Widgets > Manual ROI
-Labeling. Laid out the way masknmf's ``ClassificationVis`` is: every ROI
-control in one edge window across the top, the sortable ROI table in a
-second edge window down the side. ``PreviewDataWidget`` owns the right edge
-and the NDWidget sliders own the bottom, so the table sits on the left;
-otherwise the panels hold the same controls, in the same order, off the same
-shared widgets.
+Labeling. Every ROI control lives in one edge window across the top — the
+same panel masknmf's ``ClassificationVis`` draws, in the same order, off the
+same shared widgets — plus a collapsible trace viewer that grows the window
+when it is opened. The sortable ROI table is the "ROIs" tab inside
+``PreviewDataWidget`` (see ``widgets/tabs.py``).
 
 Arm "Add ROI", drag a closed stroke around a cell, release and the enclosed
 pixels become a mask. ROIs live in one uint16 label image so they can never
@@ -17,12 +16,19 @@ so the bg source combo picks between the live movie and mean / max / std
 projections of the plane on screen. Those same images (plus the movie and
 the ROI outlines) open in "Full FOV", the shared ``SummaryImageViewer``.
 
+Each row of the ROI table carries a Quick trace and an Extract trace button.
+Both run on their own thread, tracked as a job in the process manager, and
+land in the trace viewer, whose cursor is the viewer's own ``t`` — drag it
+to scrub the movie.
+
 The drawing, mask, overlay, label, table and summary machinery is shared
 with masknmf's classification GUI via ``masknmf.visualization.imgui``.
 """
 
 from __future__ import annotations
 
+import queue
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -64,8 +70,7 @@ __all__ = [
     "PANEL_HEIGHT",
     "PANEL_LOCATION",
     "PROJECTIONS",
-    "TABLE_LOCATION",
-    "TABLE_WIDTH",
+    "TRACE_HEIGHT",
     "ManualRoiWidget",
     "SELECTED_OPACITY",
 ]
@@ -77,8 +82,8 @@ SELECTED_OPACITY = SELECTED_ALPHA
 # 360 because these ROIs carry three columns rather than six.
 PANEL_LOCATION = "top"
 PANEL_HEIGHT = 140
-TABLE_LOCATION = "left"
-TABLE_WIDTH = 300
+# extra height the top window takes while the trace viewer is expanded
+TRACE_HEIGHT = 220
 
 COLUMNS = ("id", "label", "area")
 
@@ -133,6 +138,7 @@ _IDENTITY_COLORS = cv2.cvtColor(_HSV, cv2.COLOR_HSV2RGB).reshape(-1, 3) / 255.0
 
 _CODE_COLOR = imgui.ImVec4(0.55, 0.75, 1.0, 1.0)
 _LOADING_COLOR = imgui.ImVec4(1.0, 0.8, 0.2, 1.0)
+_CURSOR_COLOR = imgui.ImVec4(1.0, 0.85, 0.3, 0.9)
 
 
 class PlaneMovie:
@@ -248,8 +254,10 @@ class ManualRoiWidget:
         self.traces: dict[int, dict] = {}
         self.trace_open = False
         self.trace_roi = -1
-        self._trace_loader = AsyncLoad()
-        self._pending_trace: tuple[int, str] | None = None
+        self._force_traces_open = False
+        # worker threads hand finished traces back here, drained on the draw
+        # loop; each job is tracked separately in the process manager
+        self._trace_results: queue.Queue = queue.Queue()
 
         self.overlay = self.subplot.add_image(
             np.zeros((ny, nx, 4), np.uint8),
@@ -280,7 +288,6 @@ class ManualRoiWidget:
         # an edge another widget has taken over since
         self._windows: dict[str, Any] = {}
         self.attach_panel()
-        self.sync_table_window(sub_enabled("manual_roi", "table"))
 
     @property
     def labels(self) -> np.ndarray:
@@ -342,17 +349,6 @@ class ManualRoiWidget:
     def attach_panel(self) -> None:
         """Hang the control panel off the top edge."""
         self._add_window(self.draw_panel, PANEL_LOCATION, PANEL_HEIGHT, "Manual ROI")
-
-    def sync_table_window(self, enabled: bool) -> None:
-        """Add or drop the ROI table edge window to match its Widgets toggle.
-
-        Gating only the draw would leave an empty reserved panel behind, so
-        the window itself comes and goes.
-        """
-        if enabled:
-            self._add_window(self.draw_table, TABLE_LOCATION, TABLE_WIDTH, "ROIs")
-        else:
-            self._remove_window(TABLE_LOCATION)
 
     # ------------------------------------------------------------------
     # ROI state
@@ -648,8 +644,6 @@ class ManualRoiWidget:
 
     def trace_disabled(self, index: int) -> str | None:
         """Why the trace actions cannot run for ``index``, or None."""
-        if self._trace_loader.busy:
-            return "a trace is already being extracted"
         if self.plane_movie() is None:
             return "no (T, Y, X) movie behind this view"
         return None
@@ -666,10 +660,38 @@ class ManualRoiWidget:
         return None
 
     def _start_trace(self, index: int, source: str, work):
-        self._pending_trace = (index, source)
-        self.trace_roi = index
-        self.trace_open = True
-        self._trace_loader.start(work, f"{source}: ROI {index + 1}...")
+        """Run ``work`` on a thread, tracked as a process-manager job.
+
+        Every click gets its own job and its own thread: the button is the
+        only feedback the user has otherwise, and two ROIs can be extracting
+        at once. Results come back through a queue and are picked up by
+        :meth:`_poll_trace` on the draw loop.
+        """
+        from mbo_utilities.gui.widgets.process_manager import get_process_manager
+
+        description = f"{source} trace — ROI {index + 1}"
+        job = get_process_manager().start_job("roi_trace", description)
+        self.status = f"{description} started"
+
+        def run():
+            try:
+                result = work()
+            except Exception as error:  # noqa: BLE001 - reported on the job
+                self.logger.exception(f"{description} failed")
+                job.fail(f"{type(error).__name__}: {error}")
+                self._trace_results.put((index, source, None, str(error)))
+                return
+            if not result:
+                job.fail("the extractor returned nothing")
+                self._trace_results.put((index, source, None, "no trace returned"))
+                return
+            frames = int(np.asarray(next(iter(result.values()))).shape[-1])
+            job.done(f"{frames} frames")
+            self._trace_results.put((index, source, result, None))
+
+        threading.Thread(
+            target=run, name=f"roi-trace-{index}", daemon=True
+        ).start()
 
     def quick_trace(self, index: int):
         """Mean of the ROI's pixels per frame — no pipeline, just the mask."""
@@ -699,60 +721,111 @@ class ManualRoiWidget:
         )
 
     def _poll_trace(self):
-        result = self._trace_loader.poll()
-        if result is None or self._pending_trace is None:
-            return
-        index, source = self._pending_trace
-        self._pending_trace = None
-        traces = {k: np.asarray(v, np.float32) for k, v in result.items()}
-        self.traces[index] = {"source": source, **traces}
-        self.status = f"{source} trace for ROI {index + 1}"
+        """Drain finished trace jobs; called once per frame from the panel."""
+        while True:
+            try:
+                index, source, result, error = self._trace_results.get_nowait()
+            except queue.Empty:
+                return
+            if error is not None:
+                self.status = f"{source} trace failed: {error}"
+                continue
+            self.traces[index] = {
+                "source": source,
+                **{k: np.asarray(v, np.float32) for k, v in result.items()},
+            }
+            self.trace_roi = index
+            self.status = f"{source} trace for ROI {index + 1}"
+            # a finished trace is the point of the click, so show it
+            self.trace_open = True
+            self._force_traces_open = True
 
-    def draw_traces(self):
-        """Popup plot of the traces computed for one ROI."""
-        if not self.trace_open:
+    # ------------------------------------------------------------------
+    # the trace viewer, a collapsible section of the top panel
+    # ------------------------------------------------------------------
+
+    def current_frame(self) -> int:
+        return int(dict(self.iw.current_index).get("t", 0))
+
+    def set_frame(self, frame: int):
+        """Move the viewer's t, so dragging the cursor scrubs the movie."""
+        movie = self.plane_movie()
+        limit = (int(movie.shape[0]) - 1) if movie is not None else 0
+        self.iw.current_index = {"t": int(np.clip(frame, 0, limit))}
+
+    def traced_rois(self) -> list[int]:
+        return sorted(self.traces)
+
+    def _sync_panel_height(self):
+        """Grow the top edge window to fit the trace viewer, shrink when closed."""
+        window = self._windows.get(PANEL_LOCATION)
+        if window is None:
             return
-        em = imgui.get_font_size()
-        imgui.set_next_window_size(
-            imgui.ImVec2(40 * em, 22 * em), imgui.Cond_.first_use_ever
-        )
-        opened, self.trace_open = imgui.begin(
-            f"ROI {self.trace_roi + 1} trace###roi_trace",
-            self.trace_open,
-            flags=imgui.WindowFlags_.no_saved_settings,
-        )
-        if not opened:
-            imgui.end()
+        wanted = PANEL_HEIGHT + (TRACE_HEIGHT if self.trace_open else 0)
+        if window.size != wanted:
+            window.size = wanted
+
+    def draw_trace_section(self):
+        """Collapsible trace viewer, its cursor locked to the viewer's t."""
+        traced = self.traced_rois()
+        label = f"Traces ({len(traced)})###roi_traces" if traced else "Traces###roi_traces"
+        if self._force_traces_open:
+            imgui.set_next_item_open(True)
+            self._force_traces_open = False
+        expanded = imgui.collapsing_header(label)
+        if expanded != self.trace_open:
+            self.trace_open = expanded
+            self._sync_panel_height()
+        if not expanded:
             return
-        entry = self.traces.get(self.trace_roi)
-        if self._trace_loader.busy:
-            imgui.text_colored(_LOADING_COLOR, self._trace_loader.status)
-        elif self._trace_loader.error:
-            imgui.text_colored(imgui.ImVec4(1.0, 0.4, 0.4, 1.0), self._trace_loader.error)
-        elif entry is None:
-            imgui.text_disabled("no trace yet")
-        else:
-            imgui.text_disabled(f"source: {entry['source']}")
-            imgui.same_line(0, 12)
-            if imgui.small_button("save npz"):
-                self.save_trace(self.trace_roi)
-            size = imgui.get_content_region_avail()
-            if implot.begin_plot("##roi_trace_plot", imgui.ImVec2(size.x, size.y)):
-                implot.setup_axes(
-                    "frame",
-                    "fluorescence (a.u.)",
-                    implot.AxisFlags_.auto_fit.value,
-                    implot.AxisFlags_.auto_fit.value,
-                )
-                for name in ("F", "Fneu"):
-                    values = entry.get(name)
-                    if values is None:
-                        continue
-                    trace = np.asarray(values, np.float64).reshape(-1)
-                    x = np.arange(trace.size, dtype=np.float64)
-                    implot.plot_line(name, x, trace)
-                implot.end_plot()
-        imgui.end()
+
+        if not traced:
+            imgui.text_disabled(
+                f"No traces yet. Use the {QUICK_TRACE_ICON} or "
+                f"{EXTRACT_TRACE_ICON} button on a row of the ROIs tab."
+            )
+            return
+
+        if self.trace_roi not in traced:
+            self.trace_roi = traced[0]
+        names = [f"ROI {i + 1}" for i in traced]
+        imgui.set_next_item_width(90)
+        changed, pick = imgui.combo(
+            "##trace-roi", traced.index(self.trace_roi), names
+        )
+        if changed:
+            self.trace_roi = traced[pick]
+        entry = self.traces[self.trace_roi]
+        imgui.same_line(0, 10)
+        imgui.text_disabled(f"source: {entry['source']}")
+        imgui.same_line(0, 10)
+        if imgui.small_button("save npz"):
+            self.save_trace(self.trace_roi)
+        imgui.same_line(0, 10)
+        imgui.text_disabled(f"frame {self.current_frame()}")
+
+        height = max(imgui.get_content_region_avail().y - 4, 60.0)
+        if not implot.begin_plot("##roi_trace_plot", imgui.ImVec2(-1, height)):
+            return
+        implot.setup_axes(
+            "frame",
+            "fluorescence (a.u.)",
+            implot.AxisFlags_.auto_fit.value,
+            implot.AxisFlags_.auto_fit.value,
+        )
+        for name in ("F", "Fneu"):
+            values = entry.get(name)
+            if values is None:
+                continue
+            trace = np.asarray(values, np.float64).reshape(-1)
+            implot.plot_line(name, np.arange(trace.size, dtype=np.float64), trace)
+        # the viewer's own t, as a guide you can drag to scrub
+        moved, frame = implot.drag_line_x(
+            0, float(self.current_frame()), _CURSOR_COLOR, 1.5
+        )[:2]
+        if moved:
+            self.set_frame(round(frame))
+        implot.end_plot()
 
     def save_trace(self, index: int):
         entry = self.traces.get(index)
@@ -869,8 +942,7 @@ class ManualRoiWidget:
         self.trace_open = False
         self.summary.close()
         self.summary.cleanup()
-        for location in (PANEL_LOCATION, TABLE_LOCATION):
-            self._remove_window(location)
+        self._remove_window(PANEL_LOCATION)
         renderer = self.subplot.renderer
         for handler, kind in (
             (self.drawer._down, "pointer_down"),
@@ -1082,14 +1154,18 @@ class ManualRoiWidget:
         if sub_enabled("manual_roi", "labels"):
             self._draw_labels_row()
 
+        self.draw_trace_section()
         self.summary.draw()
-        self.draw_traces()
         self.keybinds_open = draw_keybinds_popup(
             KEYBINDS, self.keybinds_open, "ROI keys"
         )
 
     def draw_table(self):
-        """Side edge window: the filter row over the sortable ROI table."""
+        """The ROIs tab: the filter row over the sortable ROI table.
+
+        Hosted by ``PreviewDataWidget``'s tab bar (see ``widgets/tabs.py``),
+        beside Preview and Signal Quality, rather than by an edge window.
+        """
         draw_filter_row(self.order, self.classes, "_roi")
         if not self.n_rois:
             imgui.text_disabled("no ROIs yet")

@@ -432,6 +432,7 @@ def draw_process_console_popup(parent: Any):
             pm = get_process_manager()
             pm.cleanup_finished()
             running = pm.get_running()
+            jobs = pm.get_jobs()
 
             from mbo_utilities.gui.widgets.progress_bar import _get_active_progress_items
             progress_items = _get_active_progress_items(parent)
@@ -481,6 +482,38 @@ def draw_process_console_popup(parent: Any):
                         imgui.progress_bar(item["progress"], ImVec2(-1, 0), f"{pct}%")
                         imgui.spacing()
 
+                    if running or jobs:
+                        imgui.spacing()
+
+                # in-process jobs section (ROI traces, etc.). These run on a
+                # thread inside the GUI rather than as a spawned process, so
+                # they have no pid, log file or kill button — just state.
+                if jobs:
+                    imgui.text_colored(_SYS_TITLE, f"In-Process Jobs ({len(jobs)})")
+                    imgui.separator()
+                    imgui.spacing()
+
+                    for job in jobs:
+                        if job.status == "error":
+                            color = imgui.ImVec4(1.0, 0.4, 0.4, 1.0)
+                            label = f"[Failed] {job.description}"
+                        elif job.status == "completed":
+                            color = imgui.ImVec4(0.4, 1.0, 0.4, 1.0)
+                            label = f"[Done] {job.description}"
+                        else:
+                            color = imgui.ImVec4(1.0, 0.75, 0.3, 1.0)
+                            label = job.description
+                        imgui.push_text_wrap_pos(0.0)
+                        imgui.text_colored(color, label)
+                        if job.status_message:
+                            imgui.text_disabled(f"    {job.status_message}")
+                        imgui.pop_text_wrap_pos()
+                        imgui.same_line()
+                        imgui.text_disabled(f"({job.elapsed_str()})")
+                        if job.is_alive():
+                            imgui.progress_bar(job.progress, ImVec2(-1, 0))
+                        imgui.spacing()
+
                     if running:
                         imgui.spacing()
 
@@ -500,7 +533,7 @@ def draw_process_console_popup(parent: Any):
                             sum_box_h += box_h
 
                 # empty state
-                if not running and not progress_items:
+                if not running and not progress_items and not jobs:
                     imgui.spacing()
                     imgui.text_disabled("No active tasks or background processes.")
 

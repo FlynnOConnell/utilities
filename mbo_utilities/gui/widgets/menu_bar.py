@@ -125,6 +125,10 @@ def draw_process_status_indicator(parent: Any):
     from mbo_utilities.gui.widgets.progress_bar import _get_active_progress_items
     progress_items = _get_active_progress_items(parent)
 
+    # in-process jobs (ROI traces, etc.) count the same as spawned ones —
+    # a click has to show up somewhere or the user cannot tell it landed
+    all_procs = [*all_procs, *pm.get_jobs()]
+
     # categorize processes
     running_procs = [p for p in all_procs if p.is_alive()]
     completed_procs = [p for p in all_procs if not p.is_alive() and p.status == "completed"]

@@ -6,9 +6,9 @@ Signal Quality tabs delegate to ``PreviewDataWidget``, Run to the pipelines
 package, Cloud to ``gui/_cloud.py`` — so these classes are only the seam
 between a tab and its panel.
 
-Manual ROI labelling is deliberately not here: it hangs its own top and left
-edge windows off the figure (``gui/manual_roi.py``), the way masknmf's
-``ClassificationVis`` does.
+Manual ROI labelling is split: its controls and trace viewer hang off the
+figure's top edge (``gui/manual_roi.py``), while its ROI table is the ROIs
+tab here, beside Preview and Signal Quality.
 
 Tab order is ``priority``; the viewer draws them in that order.
 """
@@ -24,6 +24,7 @@ from mbo_utilities.gui.widgets._base import Widget
 __all__ = [
     "CloudTabWidget",
     "PreviewTabWidget",
+    "RoiTableTabWidget",
     "RunTabWidget",
     "SignalQualityTabWidget",
 ]
@@ -125,6 +126,41 @@ class RunTabWidget(Widget):
             "##RunContent", imgui.ImVec2(0, 0), imgui.ChildFlags_.none
         ):
             draw_run_tab(self.parent)
+
+
+class RoiTableTabWidget(Widget):
+    """The ROIs tab: the manual-ROI table, with its per-row trace actions.
+
+    The panel itself is built by ``PreviewDataWidget.sync_manual_roi`` when
+    the menu entry is switched on; the ROI *controls* stay in the top edge
+    window, so only the table lives here.
+    """
+
+    name = "ROIs"
+    tab_label = "ROIs"
+    placement = "tab"
+    # hidden when either Manual ROI Labeling or its ROI-table section is off
+    toggle_key = "manual_roi.table"
+    priority = 45
+
+    @classmethod
+    def is_supported(cls, parent: Any) -> bool:
+        return True
+
+    def tab_disabled(self) -> str | None:
+        if getattr(self.parent, "manual_roi", None) is None:
+            return "Enable Widgets > Manual ROI Labeling to draw ROIs."
+        return None
+
+    def draw(self) -> None:
+        roi = getattr(self.parent, "manual_roi", None)
+        if roi is None:
+            imgui.text_disabled("Manual ROI Labeling is off.")
+            return
+        with imgui_ctx.begin_child(
+            "##RoiTableContent", imgui.ImVec2(0, 0), imgui.ChildFlags_.none
+        ):
+            roi.draw_table()
 
 
 class CloudTabWidget(Widget):
