@@ -32,7 +32,7 @@ from imgui_bundle import (
     icons_fontawesome_6 as fa,
 )
 
-from mbo_utilities.gui._imgui_helpers import set_tooltip
+from mbo_utilities.gui._imgui_helpers import fit_width, set_tooltip
 
 __all__ = ["draw_biohpc_tab"]
 
@@ -1092,10 +1092,58 @@ def _panel(parent: Any) -> _BioHpcPanel:
     return panel
 
 
-def draw_biohpc_tab(parent: Any) -> None:
+def draw_biohpc_content(parent: Any) -> None:
     """Render the BioHPC login gate, or the Lab4 workbench once signed in."""
     panel = _panel(parent)
     if panel.authenticated:
         panel.draw_authenticated()
     else:
         panel.draw_login()
+
+
+# the name the tab bar used before BioHPC moved into a popup
+draw_biohpc_tab = draw_biohpc_content
+
+POPUP_ID = "BioHPC###biohpc_popup"
+
+
+def draw_biohpc_popup(parent: Any) -> None:
+    """The BioHPC workbench as a closable floating window.
+
+    Opened from ``Widgets > BioHPC`` (``parent._show_biohpc_popup = True``);
+    the window's own close button clears the flag. Not modal, so the viewer
+    stays usable while a transfer or job is being set up.
+    """
+    if not getattr(parent, "_show_biohpc_popup", False):
+        return
+    io = imgui.get_io()
+    w = min(hello_imgui.em_size(48), io.display_size.x * 0.85)
+    h = min(hello_imgui.em_size(44), io.display_size.y * 0.85)
+    imgui.set_next_window_size(imgui.ImVec2(w, h), imgui.Cond_.first_use_ever)
+    imgui.set_next_window_pos(
+        imgui.get_main_viewport().get_center(),
+        imgui.Cond_.first_use_ever,
+        pivot=imgui.ImVec2(0.5, 0.5),
+    )
+    opened, keep_open = imgui.begin(
+        POPUP_ID, True, flags=imgui.WindowFlags_.no_saved_settings
+    )
+    parent._show_biohpc_popup = bool(keep_open)
+    if opened:
+        # horizontal scrollbar: over-wide content scrolls, never clips
+        with imgui_ctx.begin_child(
+            "##BioHpcContent",
+            imgui.ImVec2(0, 0),
+            imgui.ChildFlags_.none,
+            imgui.WindowFlags_.horizontal_scrollbar,
+        ):
+            try:
+                with fit_width():
+                    draw_biohpc_content(parent)
+            except Exception as e:
+                imgui.push_text_wrap_pos(
+                    imgui.get_cursor_pos_x() + imgui.get_content_region_avail().x
+                )
+                imgui.text_colored(imgui.ImVec4(1.0, 0.3, 0.3, 1.0), f"Error: {e}")
+                imgui.pop_text_wrap_pos()
+    imgui.end()

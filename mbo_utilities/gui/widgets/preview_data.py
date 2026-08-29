@@ -67,6 +67,8 @@ from mbo_utilities.gui._stats import (
     refresh_zstats,
 )
 from mbo_utilities.gui._help_viewer import draw_help_popup
+from mbo_utilities.gui._biohpc import draw_biohpc_popup
+from mbo_utilities.gui._imgui_helpers import fit_width
 from mbo_utilities.gui._metadata_editor import draw_metadata_popup
 from mbo_utilities.gui._options_popup import draw_options_popup
 
@@ -562,6 +564,10 @@ class PreviewDataWidget(EdgeWindow):
         # Set Metadata popup — driven by File menu and Shift+M shortcut
         # (see gui/_metadata_editor.draw_metadata_popup).
         self._show_metadata_popup = False
+        # Widgets menu: the manual ROI widget while it is on (see
+        # gui/manual_roi.attach_roi_widget) and the BioHPC popup request
+        self.manual_roi = None
+        self._show_biohpc_popup = False
 
         # Directories
         save_as_dir = get_last_dir("save_as")
@@ -1216,6 +1222,7 @@ class PreviewDataWidget(EdgeWindow):
         draw_keybinds_popup(self)
         draw_help_popup(self)
         draw_options_popup(self)
+        draw_biohpc_popup(self)
         try:
             from mbo_utilities.gui.widgets.isoview_crop import draw_window as _draw_iso_crop_window
             _draw_iso_crop_window(self)
@@ -1263,7 +1270,10 @@ class PreviewDataWidget(EdgeWindow):
 
         draw_menu_bar(self)
         t1 = time.perf_counter()
-        self._viewer.draw()
+        # wrap text at the panel edge everywhere the viewer draws directly;
+        # each tab's child re-applies it (imgui wraps per window)
+        with fit_width():
+            self._viewer.draw()
         t2 = time.perf_counter()
         menu_ms = (t1 - t0) * 1000
         draw_ms = (t2 - t1) * 1000
@@ -1309,7 +1319,8 @@ class PreviewDataWidget(EdgeWindow):
         """Draw preview section using modular UI widgets."""
         imgui.dummy(imgui.ImVec2(0, 5))
         with imgui_ctx.begin_child("##PreviewChild", imgui.ImVec2(0, 0), imgui.ChildFlags_.none):
-            draw_all_widgets(self, self._widgets)
+            with fit_width():
+                draw_all_widgets(self, self._widgets)
 
     def compute_zstats(self):
         """Compute z-stats for all graphics."""
@@ -1326,6 +1337,10 @@ class PreviewDataWidget(EdgeWindow):
 
         cleanup_pipelines(self)
         cleanup_all_widgets(self._widgets)
+        if getattr(self, "manual_roi", None) is not None:
+            from mbo_utilities.gui.manual_roi import detach_roi_widget
+
+            detach_roi_widget(self)
 
         self._file_dialog = None
         self._folder_dialog = None

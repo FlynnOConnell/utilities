@@ -2,7 +2,8 @@
 
 Renders the Preview / Signal Quality / Run tab bar by delegating to
 the parent PreviewDataWidget, which owns the actual state and draw
-methods.
+methods. A "ROIs" tab joins them while the manual ROI widget is on
+(``Widgets > ROIs``); BioHPC lives in a popup off the same menu.
 """
 
 from __future__ import annotations
@@ -10,6 +11,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from imgui_bundle import imgui, imgui_ctx
+
+from mbo_utilities.gui._imgui_helpers import fit_width
 
 from . import BaseViewer
 
@@ -52,7 +55,8 @@ class TimeSeriesViewer(BaseViewer):
                 imgui.push_style_var(imgui.StyleVar_.frame_padding, imgui.ImVec2(4, 3))
                 try:
                     with imgui_ctx.begin_child("##StatsContent", imgui.ImVec2(0, 0), imgui.ChildFlags_.none):
-                        self.parent.draw_stats_section()
+                        with fit_width():
+                            self.parent.draw_stats_section()
                 finally:
                     imgui.pop_style_var(2)
                 imgui.end_tab_item()
@@ -76,7 +80,8 @@ class TimeSeriesViewer(BaseViewer):
                     with imgui_ctx.begin_child(
                         "##RunContent", imgui.ImVec2(0, 0), imgui.ChildFlags_.none
                     ):
-                        draw_run_tab(self.parent)
+                        with fit_width():
+                            draw_run_tab(self.parent)
                 finally:
                     imgui.pop_style_var(2)
                 imgui.end_tab_item()
@@ -101,31 +106,30 @@ class TimeSeriesViewer(BaseViewer):
                             "Install with: uv pip install mbo_utilities"
                         )
 
-            if imgui.begin_tab_item("BioHPC")[0]:
-                imgui.push_style_var(imgui.StyleVar_.window_padding, imgui.ImVec2(8, 8))
-                imgui.push_style_var(imgui.StyleVar_.frame_padding, imgui.ImVec2(4, 3))
-                try:
-                    from mbo_utilities.gui._biohpc import draw_biohpc_tab
-                    # horizontal scrollbar: over-wide content scrolls, never clips
-                    with imgui_ctx.begin_child(
-                        "##BioHpcContent",
-                        imgui.ImVec2(0, 0),
-                        imgui.ChildFlags_.none,
-                        imgui.WindowFlags_.horizontal_scrollbar,
-                    ):
-                        try:
-                            draw_biohpc_tab(self.parent)
-                        except Exception as e:
-                            imgui.push_text_wrap_pos(
-                                imgui.get_cursor_pos_x()
-                                + imgui.get_content_region_avail().x
-                            )
-                            imgui.text_colored(
-                                imgui.ImVec4(1.0, 0.3, 0.3, 1.0), f"Error: {e}"
-                            )
-                            imgui.pop_text_wrap_pos()
-                finally:
-                    imgui.pop_style_var(2)
-                imgui.end_tab_item()
+            # the manual ROI widget's table, present only while the widget
+            # is on (Widgets > ROIs); its tools sit in the top edge panel
+            roi = getattr(self.parent, "manual_roi", None)
+            if roi is not None:
+                # lazy: manual_roi pulls in masknmf, only needed once it is on
+                from mbo_utilities.gui.manual_roi import MIN_TAB_WIDTH
+
+                roi_flags = imgui.TabItemFlags_.none
+                if roi.focus_tab:
+                    # one-shot programmatic focus (menu toggle, --widget manualroi)
+                    roi_flags = imgui.TabItemFlags_.set_selected
+                    roi.focus_tab = False
+                if imgui.begin_tab_item("ROIs", None, roi_flags)[0]:
+                    imgui.push_style_var(imgui.StyleVar_.window_padding, imgui.ImVec2(8, 8))
+                    imgui.push_style_var(imgui.StyleVar_.frame_padding, imgui.ImVec2(4, 3))
+                    try:
+                        with imgui_ctx.begin_child(
+                            "##RoiContent", imgui.ImVec2(0, 0), imgui.ChildFlags_.none
+                        ):
+                            with fit_width("ROI table", min_width=MIN_TAB_WIDTH) as shown:
+                                if shown:
+                                    roi.draw_tab()
+                    finally:
+                        imgui.pop_style_var(2)
+                    imgui.end_tab_item()
 
             imgui.end_tab_bar()

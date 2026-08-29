@@ -490,7 +490,8 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
     """Create fastplotlib ImageWidget with an optional side widget.
 
     `widget` names which one to attach: "preview" (PreviewDataWidget),
-    "manualroi" (manual ROI drawing), or "none". True/False are the legacy
+    "manualroi" (the same with the manual ROI widget already turned on - the
+    Widgets > ROIs menu toggle), or "none". True/False are the legacy
     spellings of "preview"/"none".
 
     `figure_kwargs_override` replaces the auto-selected canvas/size dict (used by
@@ -644,7 +645,7 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
     # Attach the requested side widget
     if isinstance(widget, bool) or widget is None:
         widget = "preview" if widget else "none"
-    if widget == "preview":
+    if widget in ("preview", "manualroi"):
         from mbo_utilities.gui.widgets.preview_data import PreviewDataWidget
 
         gui = PreviewDataWidget(
@@ -657,10 +658,14 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
         add_gui = getattr(iw.figure, "add_gui", None)
         if add_gui is not None:
             add_gui(gui)
-    elif widget == "manualroi":
-        from mbo_utilities.gui.manual_roi import ManualRoiWidget
+        # the manual ROI widget is a Widgets-menu toggle; start with it on
+        # when asked for, or when this data already has annotations beside
+        # it. attach_roi_widget logs (never raises) if it cannot be built.
+        from mbo_utilities.gui.manual_roi import attach_roi_widget, labels_path
 
-        ManualRoiWidget(iw, data_array.source_path)
+        src = data_array.source_path
+        if widget == "manualroi" or (src is not None and labels_path(src).exists()):
+            attach_roi_widget(gui, focus=widget == "manualroi")
     elif widget != "none":
         raise ValueError(
             f"unknown widget {widget!r}, expected one of: preview, manualroi, none"
@@ -1437,8 +1442,9 @@ def run_gui(
         ROI index(es) to display. None shows all ROIs for raw files.
     widget : bool or str, default True
         Side widget to attach: ``"preview"`` (PreviewDataWidget, the default),
-        ``"manualroi"`` (manual ROI drawing) or ``"none"``. ``True``/``False``
-        are the legacy spellings of ``"preview"``/``"none"``.
+        ``"manualroi"`` (the same with the manual ROI widget turned on - the
+        ``Widgets > ROIs`` menu toggle) or ``"none"``. ``True``/``False`` are
+        the legacy spellings of ``"preview"``/``"none"``.
     metadata_only : bool, default False
         If True, only show metadata inspector (no image viewer).
     select_only : bool, default False
