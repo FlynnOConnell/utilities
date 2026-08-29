@@ -20,6 +20,9 @@ __all__ = [
     "draw_boxed_label",
     "draw_checkbox_grid",
     "draw_toolbar_row",
+    "fit_edge_window",
+    "fit_label",
+    "fit_width",
     "fmt_multivalue",
     "fmt_value",
     "selected_button_style",
@@ -100,6 +103,20 @@ def draw_toolbar_row(items: list) -> None:
             imgui.same_line(0, inner)
             imgui.set_next_item_width(width)
             draw()
+
+
+def fit_edge_window(window, min_size: int = 30) -> None:
+    """Resize a top/bottom edge window to fit the content just drawn.
+
+    Call last in the window's draw function, holding the ``ImguiWindow``
+    returned by ``figure.add_imgui_window``. Pairs with ``draw_toolbar_row``:
+    when a row wraps, the window grows so the extra line is not clipped, and
+    shrinks back when it unwraps.
+    """
+    pad = imgui.get_style().window_padding.y
+    needed = max(int(min_size), int(imgui.get_cursor_pos_y() + 2 * pad))
+    if window.size is not None and abs(window.size - needed) > 1:
+        window.size = needed
 
 
 def push_font_safe(font) -> bool:
@@ -469,6 +486,71 @@ def set_tooltip(
         imgui.text_unformatted(tooltip)
         imgui.pop_text_wrap_pos()
         imgui.end_tooltip()
+
+
+@contextmanager
+def fit_width(title: str | None = None, min_width: float = 0.0):
+    """Keep everything drawn inside the block within the available width.
+
+    Two behaviours, always preferring the first:
+
+    - **wrap**: a text wrap position is pushed at the content region's right
+      edge, so every ``imgui.text`` / ``text_colored`` / ``text_disabled``
+      call inside wraps onto new lines instead of clipping. (Pair with
+      ``draw_toolbar_row`` for rows of controls, which wrap the same way.)
+    - **collapse**: when the region is narrower than ``min_width`` px the
+      block is collapsed to one placeholder line (``▸ title``, tooltip says
+      to widen the panel) and the context yields ``False`` so the caller
+      skips its body.
+
+    ::
+
+        with fit_width("ROI tools", min_width=320) as shown:
+            if shown:
+                ...
+
+    imgui keeps the wrap position per window, so a ``begin_child`` inside
+    the block starts unwrapped again: put a ``fit_width`` inside each child
+    that draws text. ``min_width=0`` (the default) never collapses.
+    """
+    avail = imgui.get_content_region_avail().x
+    if min_width > 0 and avail < min_width:
+        label = fit_label(f"▸ {title or 'panel'}", avail)
+        imgui.text_disabled(label)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                f"{title or 'this panel'} needs about {int(min_width)} px; "
+                "widen the panel to show it"
+            )
+        yield False
+        return
+    imgui.push_text_wrap_pos(0.0)  # 0 = wrap at the window's right edge
+    try:
+        yield True
+    finally:
+        imgui.pop_text_wrap_pos()
+
+
+def fit_label(text: str, max_width: float | None = None) -> str:
+    """``text`` shortened with an ellipsis so it fits ``max_width`` px
+    (default: the remaining content width) on one line.
+
+    For the things text-wrapping cannot reach - button captions, headers,
+    tab and table labels. Returns ``text`` unchanged when it already fits.
+    """
+    if max_width is None:
+        max_width = imgui.get_content_region_avail().x
+    if imgui.calc_text_size(text).x <= max_width:
+        return text
+    ellipsis = "…"
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if imgui.calc_text_size(text[:mid] + ellipsis).x <= max_width:
+            lo = mid
+        else:
+            hi = mid - 1
+    return (text[:lo].rstrip() + ellipsis) if lo else ellipsis
 
 
 def text_wrapped_cell(text: str, color: "ImVec4 | None" = None) -> None:

@@ -861,6 +861,17 @@ class MboNDViewer:
         return len(self._dim_names)
 
     @property
+    def dim_names(self) -> tuple[str, ...]:
+        """resolved reference dim names for the slider axes, in slider order.
+
+        These are the names the wrapped ``NDWidget.indices`` is keyed by —
+        display labels when the arrays provide them, else the canonical
+        per-rank letters. Pass one to ``iw.indices[...]`` or match against
+        ``find_slider_name`` to locate a specific axis (e.g. z).
+        """
+        return tuple(self._dim_names)
+
+    @property
     def slider_dims(self) -> list[str]:
         """positional letters, vendored-compatible (``'t' in iw.slider_dims``
         gates the legacy window-funcs path in preview_data)"""
