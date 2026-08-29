@@ -1,12 +1,12 @@
 """Offscreen tests for the manual ROI drawing GUI.
 
-``ManualRoiWidget`` (mbo_utilities/gui/manual_roi.py) hangs two imgui edge
-windows off a real ``MboNDViewer`` figure — controls on top, the ROI table on
-the left, the way masknmf's ``ClassificationVis`` lays them out — and paints
-masks into a uint16 label image. These tests pin the mask bookkeeping (fill,
-overlap rejection, delete + renumber), the pointer-event wiring through the
-real pygfx renderer, and that both imgui windows draw every frame without
-raising.
+``ManualRoiWidget`` (mbo_utilities/gui/manual_roi.py) hangs one imgui edge
+window off a real ``MboNDViewer`` figure — the controls plus a collapsible
+trace viewer, on top — and paints masks into a uint16 label image. Its ROI
+table is a tab inside ``PreviewDataWidget``. These tests pin the mask
+bookkeeping (fill, overlap rejection, delete + renumber), the pointer-event
+wiring through the real pygfx renderer, trace extraction, and that the panel
+draws every frame without raising.
 
 ``RENDERCANVAS_FORCE_OFFSCREEN=1`` must be set before *any* fastplotlib
 import in the process — tests/conftest.py does this for the whole suite.
@@ -15,6 +15,7 @@ import in the process — tests/conftest.py does this for the whole suite.
 from __future__ import annotations
 
 import os
+import time
 
 os.environ.setdefault("RENDERCANVAS_FORCE_OFFSCREEN", "1")
 
@@ -577,7 +578,7 @@ class TestTraces:
         widget.add_roi(square(10, 10, 9))
         widget.add_roi(square(30, 10, 9))
         widget.quick_trace(1)
-        drain_trace(widget)
+        drain_trace(widget, 1)
         assert widget.trace_open
         assert widget.trace_roi == 1
 
@@ -607,11 +608,105 @@ class TestTraces:
         widget.add_roi(square(10, 10, 9))
         widget.add_roi(square(30, 10, 9))
         widget.quick_trace(1)
-        drain_trace(widget)
+        drain_trace(widget, 1)
         assert widget.traces
         # delete renumbers, so an index-keyed cache is no longer valid
         widget.delete_roi(0)
         assert widget.traces == {}
+
+
+class TestTraceJobs:
+    """Every click has to show up in the process manager, pass or fail."""
+
+    def _manager(self):
+        from mbo_utilities.gui.widgets.process_manager import get_process_manager
+
+        return get_process_manager()
+
+    def test_a_click_creates_a_job(self, widget):
+        pm = self._manager()
+        before = {j.job_id for j in pm.get_jobs()}
+        widget.add_roi(square(10, 10, 9))
+        widget.quick_trace(0)
+        new = [j for j in pm.get_jobs() if j.job_id not in before]
+        assert len(new) == 1
+        assert new[0].task_type == "roi_trace"
+        assert "ROI 1" in new[0].description
+        drain_trace(widget)
+        assert new[0].status == "completed"
+        assert new[0].progress == 1.0
+        assert "frames" in new[0].status_message
+
+    def test_two_rois_extract_at_once(self, widget):
+        pm = self._manager()
+        before = {j.job_id for j in pm.get_jobs()}
+        widget.add_roi(square(4, 4, 9))
+        widget.add_roi(square(30, 4, 9))
+        widget.quick_trace(0)
+        widget.quick_trace(1)
+        new = [j for j in pm.get_jobs() if j.job_id not in before]
+        assert len(new) == 2, "one job per click, not one at a time"
+        drain_trace(widget, 0)
+        drain_trace(widget, 1)
+        assert {0, 1} <= set(widget.traces)
+
+    def test_a_failure_is_reported_not_swallowed(self, widget):
+        pm = self._manager()
+        before = {j.job_id for j in pm.get_jobs()}
+        widget.add_roi(square(10, 10, 9))
+        widget._start_trace(0, "boom", lambda: 1 / 0)
+        job = next(j for j in pm.get_jobs() if j.job_id not in before)
+        for _ in range(500):
+            widget._poll_trace()
+            if not job.is_alive():
+                break
+            time.sleep(0.01)
+        assert job.status == "error"
+        assert "ZeroDivisionError" in job.status_message
+        assert "failed" in widget.status
+        assert 0 not in widget.traces
+
+    def test_the_status_button_counts_jobs(self, widget):
+        pm = self._manager()
+        widget.add_roi(square(10, 10, 9))
+        widget.quick_trace(0)
+        # menu_bar folds local jobs in with spawned processes so the click
+        # is visible in the header without opening the console
+        assert any(j.task_type == "roi_trace" for j in pm.get_jobs())
+        drain_trace(widget)
+
+
+class TestTraceViewer:
+    def test_the_cursor_follows_the_viewer(self, widget):
+        widget.iw.current_index = {"t": 3}
+        assert widget.current_frame() == 3
+
+    def test_dragging_the_cursor_scrubs_the_movie(self, widget):
+        widget.set_frame(4)
+        assert dict(widget.iw.current_index)["t"] == 4
+        assert widget.current_frame() == 4
+
+    def test_the_frame_is_clamped_to_the_movie(self, widget):
+        widget.set_frame(9999)
+        assert widget.current_frame() == 5  # the fixture movie is 6 frames
+        widget.set_frame(-5)
+        assert widget.current_frame() == 0
+
+    def test_a_finished_trace_opens_the_viewer(self, widget):
+        assert not widget.trace_open
+        widget.add_roi(square(10, 10, 9))
+        widget.quick_trace(0)
+        drain_trace(widget)
+        assert widget.trace_open
+        assert widget.trace_roi == 0
+
+    def test_traced_rois_lists_what_can_be_plotted(self, widget):
+        widget.add_roi(square(4, 4, 9))
+        widget.add_roi(square(30, 4, 9))
+        assert widget.traced_rois() == []
+        widget.quick_trace(1)
+        drain_trace(widget, 1)
+        assert widget.traced_rois() == [1]
 
 
 class TestPipelineTraceExtraction:
@@ -694,36 +789,38 @@ class TestSorting:
 
 
 class TestImguiWindows:
-    def test_controls_on_top_table_on_the_left(self, widget):
-        # ClassificationVis's split: every ROI control in the top edge
-        # window, the ROI table in a side one. The right edge belongs to
-        # PreviewDataWidget and the bottom to the NDWidget sliders, so the
-        # table takes the left.
-        from mbo_utilities.gui.manual_roi import PANEL_LOCATION, TABLE_LOCATION
+    def test_only_the_top_edge_is_claimed(self, widget):
+        # the controls take the top; the table is a tab in
+        # PreviewDataWidget, so no side edge is reserved for it
+        from mbo_utilities.gui.manual_roi import PANEL_LOCATION
 
-        assert (PANEL_LOCATION, TABLE_LOCATION) == ("top", "left")
+        assert PANEL_LOCATION == "top"
         windows = widget.iw.figure.imgui_windows
         assert windows.get(PANEL_LOCATION) is not None
-        assert windows.get(TABLE_LOCATION) is not None
+        assert windows.get("left") is None
         assert windows.get("right") is None  # PreviewDataWidget's edge
 
-    def test_close_gives_both_edges_back(self, widget):
-        from mbo_utilities.gui.manual_roi import PANEL_LOCATION, TABLE_LOCATION
+    def test_close_gives_the_edge_back(self, widget):
+        from mbo_utilities.gui.manual_roi import PANEL_LOCATION
 
         widget.close()
-        windows = widget.iw.figure.imgui_windows
-        assert windows.get(PANEL_LOCATION) is None
-        assert windows.get(TABLE_LOCATION) is None
+        assert widget.iw.figure.imgui_windows.get(PANEL_LOCATION) is None
 
-    def test_table_window_follows_its_toggle(self, widget):
-        from mbo_utilities.gui.manual_roi import TABLE_LOCATION
+    def test_the_panel_grows_for_the_trace_viewer(self, widget):
+        from mbo_utilities.gui.manual_roi import (
+            PANEL_HEIGHT,
+            PANEL_LOCATION,
+            TRACE_HEIGHT,
+        )
 
-        # an empty reserved panel would be worse than no panel, so the
-        # window itself comes and goes with the subwidget toggle
-        widget.sync_table_window(False)
-        assert widget.iw.figure.imgui_windows.get(TABLE_LOCATION) is None
-        widget.sync_table_window(True)
-        assert widget.iw.figure.imgui_windows.get(TABLE_LOCATION) is not None
+        window = widget.iw.figure.imgui_windows[PANEL_LOCATION]
+        assert window.size == PANEL_HEIGHT
+        widget.trace_open = True
+        widget._sync_panel_height()
+        assert window.size == PANEL_HEIGHT + TRACE_HEIGHT
+        widget.trace_open = False
+        widget._sync_panel_height()
+        assert window.size == PANEL_HEIGHT
 
     def test_windows_draw_without_raising(self, widget):
         for i in range(4):
@@ -751,26 +848,24 @@ def drain_projections(widget, timeout=10.0):
     raise AssertionError(f"projections never landed: {widget._loader.error}")
 
 
-def drain_trace(widget, timeout=60.0):
-    """Run the real async trace job to completion and return its entry."""
+def drain_trace(widget, roi=0, timeout=60.0):
+    """Wait for the ROI's trace job to land and return its entry."""
     import time
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         widget._poll_trace()
-        if not widget._trace_loader.busy:
-            break
+        if roi in widget.traces:
+            return widget.traces[roi]
         time.sleep(0.01)
-    assert not widget._trace_loader.busy, "trace job timed out"
-    assert widget._trace_loader.error is None, widget._trace_loader.error
-    return widget.traces[widget.trace_roi]
+    raise AssertionError(f"trace never landed: {widget.status}")
 
 
 def draw_frames(widget, n=4):
     """Render n frames with both ROI panels guarded; returns their tracebacks."""
     import traceback
 
-    from mbo_utilities.gui.manual_roi import PANEL_LOCATION, TABLE_LOCATION
+    from mbo_utilities.gui.manual_roi import PANEL_LOCATION
 
     errors = []
 
@@ -784,11 +879,7 @@ def draw_frames(widget, n=4):
         return call
 
     figure = widget.iw.figure
-    for location, draw in (
-        (PANEL_LOCATION, widget.draw_panel),
-        (TABLE_LOCATION, widget.draw_table),
-    ):
-        figure.imgui_windows[location]._update_calls = [guard(draw)]
+    figure.imgui_windows[PANEL_LOCATION]._update_calls = [guard(widget.draw_panel)]
     for _ in range(n):
         figure.canvas.draw()
     return errors
@@ -866,13 +957,13 @@ class TestWidgetAttach:
             iw.close()
 
 
-    def test_roi_panels_render_beside_the_preview_tabs(self):
-        """Both edge windows draw, and the preview tab bar is untouched."""
+    def test_roi_panel_on_top_and_table_in_the_preview_tabs(self):
+        """The controls take the top edge; the table joins the tab bar."""
         from imgui_bundle import imgui
 
         import mbo_utilities.gui.viewers.time_series as ts
         from mbo_utilities.arrays.numpy import NumpyArray
-        from mbo_utilities.gui.manual_roi import PANEL_LOCATION, TABLE_LOCATION
+        from mbo_utilities.gui.manual_roi import PANEL_LOCATION
         from mbo_utilities.gui.run_gui import _create_image_widget
         from mbo_utilities.gui.widgets.preview_data import PreviewDataWidget
 
@@ -889,25 +980,41 @@ class TestWidgetAttach:
         roi = gui.manual_roi
         roi.add_roi(square(10, 10, 20))
         assert iw.figure.imgui_windows[PANEL_LOCATION] is not None
-        assert iw.figure.imgui_windows[TABLE_LOCATION] is not None
+        assert iw.figure.imgui_windows["left"] is None
 
-        seen = []
+        seen, errors = [], []
         real = imgui.begin_tab_item
+        force = [True]
 
         def spy(label, *args, **kwargs):
             seen.append(label)
+            # imgui only runs the body of the selected tab, so force ROIs once
+            if label == "ROIs" and force[0]:
+                force[0] = False
+                return real(label, None, imgui.TabItemFlags_.set_selected)
             return real(label, *args, **kwargs)
 
+        original = roi.draw_table
+
+        def guarded():
+            try:
+                original()
+            except Exception as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+                raise
+
         ts.imgui.begin_tab_item = spy
+        roi.draw_table = guarded
         try:
-            errors = draw_frames(roi, 4)
+            panel_errors = draw_frames(roi, 4)
         finally:
             ts.imgui.begin_tab_item = real
             iw.close()
 
-        assert not errors, f"ROI panel raised: {errors[0]}"
+        assert not panel_errors, f"ROI panel raised: {panel_errors[0]}"
+        assert not errors, f"ROIs tab raised: {errors}"
         assert "Preview" in seen and "Run" in seen, "preview tabs must survive"
-        assert "ROI" not in seen, "ROI moved to the edge windows; no tab for it"
+        assert "ROIs" in seen, f"ROIs tab missing from the tab bar: {seen}"
 
 
 class TestWidgetSelection:
