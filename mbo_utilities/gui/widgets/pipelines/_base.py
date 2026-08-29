@@ -88,6 +88,40 @@ class PipelineWidget(ABC):
         """
         return True
 
+    # ------------------------------------------------------------------
+    # optional: trace extraction from externally supplied masks
+    # ------------------------------------------------------------------
+
+    #: whether :meth:`extract_traces` is implemented. The manual-ROI widget
+    #: offers "Extract trace" only for pipelines that set this.
+    extracts_traces: bool = False
+
+    @classmethod
+    def extract_traces(cls, movie: Any, labels: Any) -> dict | None:
+        """Extract one trace per mask, using this pipeline's own extraction.
+
+        Called with masks the user drew by hand rather than ones the
+        pipeline detected, so a pipeline only needs its extraction step,
+        not its detection step.
+
+        Parameters
+        ----------
+        movie
+            ``(T, Y, X)`` array-like; indexable by an int or a slice on the
+            first axis, as ``suite2p``'s extractor expects.
+        labels
+            ``(Y, X)`` uint16 label image; 0 is background, mask ``i`` is
+            ``i + 1``.
+
+        Returns
+        -------
+        dict or None
+            ``{"F": (n_masks, T) float32}`` plus whatever else the pipeline
+            produces (``"Fneu"`` for suite2p). None when the pipeline cannot
+            extract, which is the default.
+        """
+        return None
+
     def cleanup(self) -> None:
         """Clean up resources when widget is destroyed.
 

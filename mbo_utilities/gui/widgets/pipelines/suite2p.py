@@ -49,11 +49,57 @@ class Suite2pPipelineWidget(PipelineWidget):
 
     name = "Suite2p"
     install_command = "uv pip install mbo_utilities[all]"
+    extracts_traces = True
 
     @property
     def is_available(self) -> bool:
         """Check availability lazily to avoid slow imports at module load."""
         return HAS_SUITE2P and _check_lsp_available()
+
+    @classmethod
+    def extract_traces(cls, movie: Any, labels: Any) -> dict | None:
+        """Run suite2p's own extractor over hand-drawn masks.
+
+        Builds the `stat` dicts suite2p's mask builder expects straight
+        from a label image, so the ROIs skip detection and go into the
+        same weighted extraction — which also gives the surrounding
+        neuropil trace that a plain mask average cannot.
+        """
+        from suite2p.extraction.extract import extract_traces
+        from suite2p.extraction.masks import create_masks
+        import torch
+
+        labels = np.asarray(labels)
+        n_rois = int(labels.max())
+        if n_rois == 0:
+            return None
+        ly, lx = labels.shape
+
+        stats = []
+        for i in range(1, n_rois + 1):
+            ypix, xpix = np.nonzero(labels == i)
+            npix = int(ypix.size)
+            stats.append(
+                {
+                    "ypix": ypix.astype(np.int32),
+                    "xpix": xpix.astype(np.int32),
+                    # hand-drawn masks carry no per-pixel weight, so every
+                    # pixel counts equally and F is the plain mask mean
+                    "lam": np.ones(npix, np.float32),
+                    "npix": npix,
+                    "med": [int(np.median(ypix)), int(np.median(xpix))],
+                    "radius": float(np.sqrt(npix / np.pi)),
+                    # a label image cannot overlap, by construction
+                    "overlap": np.zeros(npix, bool),
+                }
+            )
+
+        cell_masks, neuropil_masks = create_masks(stats, ly, lx)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        f_cell, f_neuropil = extract_traces(
+            movie, cell_masks, neuropil_masks, device=device
+        )
+        return {"F": f_cell, "Fneu": f_neuropil}
 
     def __init__(self, parent: Any):
         super().__init__(parent)

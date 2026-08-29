@@ -29,8 +29,10 @@ from typing import Any
 import cv2
 import numpy as np
 import tifffile
-from imgui_bundle import imgui
+from imgui_bundle import icons_fontawesome_6 as fa, imgui, implot
 from masknmf.visualization.imgui import (
+    OUTLINE_PLACEMENT,
+    OUTLINE_PLACEMENTS,
     OUTLINE_WIDTH,
     SELECTED_ALPHA,
     UNLABEL_ALL,
@@ -39,6 +41,7 @@ from masknmf.visualization.imgui import (
     LabelSet,
     LabelStore,
     RoiOrder,
+    RowAction,
     StrokeDrawer,
     SummaryImageViewer,
     draw_filter_row,
@@ -55,6 +58,9 @@ from mbo_utilities.gui._imgui_helpers import selected_button_style, set_tooltip
 from mbo_utilities.gui.widgets.widget_toggles import sub_enabled
 
 __all__ = [
+    "COLOR_MODES",
+    "MAX_OUTLINE_WIDTH",
+    "OUTLINE_PLACEMENTS",
     "PANEL_HEIGHT",
     "PANEL_LOCATION",
     "PROJECTIONS",
@@ -67,14 +73,32 @@ __all__ = [
 SELECTED_OPACITY = SELECTED_ALPHA
 
 # the two edge windows, matching ClassificationVis's top panel / side table.
-# Both are smaller than its 150 / 360: the panel has three rows rather than
-# four (no movie transport) and the table three columns rather than six.
+# Four rows: tools, background, masks, labels. The table is narrower than its
+# 360 because these ROIs carry three columns rather than six.
 PANEL_LOCATION = "top"
-PANEL_HEIGHT = 115
+PANEL_HEIGHT = 140
 TABLE_LOCATION = "left"
 TABLE_WIDTH = 300
 
 COLUMNS = ("id", "label", "area")
+
+# how ROI fills and outlines are coloured
+COLOR_MODES = ("label + roi", "label", "roi")
+UNLABELED_COLOR = (0.62, 0.62, 0.62)
+
+# a thicker boundary than this swallows a small ROI whole
+MAX_OUTLINE_WIDTH = 6
+
+
+def _icon(name: str, fallback: str) -> str:
+    """FontAwesome glyph by constant name, or a plain-text stand-in."""
+    return getattr(fa, name, "") or fallback
+
+
+# the per-row action buttons: glyph only, so the column stays narrow, with
+# the name in the tooltip
+QUICK_TRACE_ICON = _icon("ICON_FA_BOLT", "~")
+EXTRACT_TRACE_ICON = _icon("ICON_FA_FLASK", "F")
 
 # background sources besides the live movie. Reduced over an evenly spaced
 # sample rather than every frame: this runs off a lazy array and only has to
@@ -141,8 +165,28 @@ class PlaneMovie:
             t, rows, cols = item
         else:
             t, rows, cols = item, slice(None), slice(None)
-        frame = np.asarray(self._array[self._key(t, rows, cols)])
-        return frame.reshape(frame.shape[-2:])
+        out = np.asarray(self._array[self._key(t, rows, cols)])
+        # a slice on t keeps the frame axis; suite2p's extractor batches
+        # with f_in[start:stop], so this has to stay 3D there
+        if isinstance(t, slice):
+            return out.reshape(-1, *out.shape[-2:])
+        return out.reshape(out.shape[-2:])
+
+
+def mask_trace(movie, mask: np.ndarray) -> np.ndarray:
+    """Mean of ``mask``'s pixels per frame, read over the mask's bbox only."""
+    rows, cols = np.nonzero(mask)
+    if not rows.size:
+        return np.zeros(0, np.float32)
+    y0, y1 = int(rows.min()), int(rows.max()) + 1
+    x0, x1 = int(cols.min()), int(cols.max()) + 1
+    window = mask[y0:y1, x0:x1]
+    n_pixels = int(window.sum())
+    out = np.empty(int(movie.shape[0]), np.float32)
+    for t in range(out.size):
+        block = np.asarray(movie[t, slice(y0, y1), slice(x0, x1)], np.float32)
+        out[t] = block[window].sum() / n_pixels
+    return out
 
 
 def compute_projections(movie, n_frames: int = PROJECTION_FRAMES) -> dict:
@@ -184,6 +228,9 @@ class ManualRoiWidget:
         # px per side of the mask boundary; masknmf's shared default, kept
         # here so it can be tuned per host
         self.outline_width = OUTLINE_WIDTH
+        self.outline_alpha = 1.0
+        self.placement_idx = OUTLINE_PLACEMENTS.index(OUTLINE_PLACEMENT)
+        self.color_mode_idx = 0
 
         # background: the viewer's own graphic, showing either the live movie
         # or one of the projections
@@ -197,12 +244,25 @@ class ManualRoiWidget:
         self._frozen_index: dict | None = None
         self._contours: list | None = None
 
+        # per-ROI traces, keyed by ROI index; see quick_trace / extract_trace
+        self.traces: dict[int, dict] = {}
+        self.trace_open = False
+        self.trace_roi = -1
+        self._trace_loader = AsyncLoad()
+        self._pending_trace: tuple[int, str] | None = None
+
         self.overlay = self.subplot.add_image(
             np.zeros((ny, nx, 4), np.uint8),
             name="manual_roi_overlay",
             alpha_mode="blend",
             offset=(0, 0, 1),
         )
+        # the overlay is literal uint8 RGBA, not data to be contrast-stretched.
+        # fastplotlib auto-ranges it off the initial all-zero array, giving
+        # vmin == vmax == 0, which saturates every non-zero channel to 255 —
+        # tab10 class colours all come out white, and only hues with a zero
+        # channel survive. Pin the full byte range instead.
+        self.overlay.vmin, self.overlay.vmax = 0, 255
         # keep the overlay out of picking so the tooltip still reports the
         # image intensity under the cursor
         for tile in self.overlay.world_object.children:
@@ -373,12 +433,16 @@ class ManualRoiWidget:
     def delete_roi(self, index: int):
         if not self.masks.delete(index):
             return
+        # deleting renumbers every ROI above it, so cached traces no longer
+        # belong to the indices that key them
+        self.traces.clear()
         self._resync()
         self.select_roi(min(index, self.n_rois - 1))
         self.status = f"deleted ROI {index + 1}"
 
     def clear(self):
         self.masks.clear()
+        self.traces.clear()
         self._resync()
         self.select_roi(-1)
         self.status = "cleared"
@@ -399,15 +463,33 @@ class ManualRoiWidget:
         self.order.rebuild()
         self.refresh_overlay()
 
+    @property
+    def color_mode(self) -> str:
+        return COLOR_MODES[self.color_mode_idx]
+
+    @property
+    def outline_placement(self) -> str:
+        return OUTLINE_PLACEMENTS[self.placement_idx]
+
     def _colors(self) -> np.ndarray:
-        """Class colour where labelled, identity colour otherwise."""
+        """One RGB per ROI, per the colour mode.
+
+        ``label`` gives every ROI in a class the same colour and greys the
+        unlabeled; ``roi`` gives each its own hue so neighbours stay apart
+        while drawing; ``label + roi`` does the first where a label exists
+        and the second where it does not.
+        """
+        mode = self.color_mode
         colors = np.zeros((max(self.n_rois, 1), 3), np.float32)
         for i in range(self.n_rois):
             label = int(self.classes.labels[i])
-            colors[i] = (
-                self.classes.color(label) if label >= 0
-                else _IDENTITY_COLORS[i % len(_IDENTITY_COLORS)]
-            )
+            identity = _IDENTITY_COLORS[i % len(_IDENTITY_COLORS)]
+            if mode == "roi":
+                colors[i] = identity
+            elif label >= 0:
+                colors[i] = self.classes.color(label)
+            else:
+                colors[i] = identity if mode == "label + roi" else UNLABELED_COLOR
         return colors
 
     def refresh_overlay(self):
@@ -421,8 +503,10 @@ class ManualRoiWidget:
             selected=self.selected,
             show_masks=self.show_masks,
             show_outlines=self.show_outlines,
-            edges=self.masks.edges(self.outline_width),
+            edges=self.masks.edges(self.outline_width, self.outline_placement),
             outline_width=self.outline_width,
+            outline_alpha=self.outline_alpha,
+            outline_placement=self.outline_placement,
         )
 
     # ------------------------------------------------------------------
@@ -551,6 +635,159 @@ class ManualRoiWidget:
                 }
             )
 
+    # ------------------------------------------------------------------
+    # traces
+    # ------------------------------------------------------------------
+
+    def trace_extractor(self):
+        """The pipeline "Extract trace" would run, or None."""
+        from mbo_utilities.gui.widgets.pipelines import get_trace_extractors
+
+        extractors = get_trace_extractors()
+        return extractors[0] if extractors else None
+
+    def trace_disabled(self, index: int) -> str | None:
+        """Why the trace actions cannot run for ``index``, or None."""
+        if self._trace_loader.busy:
+            return "a trace is already being extracted"
+        if self.plane_movie() is None:
+            return "no (T, Y, X) movie behind this view"
+        return None
+
+    def extract_disabled(self, index: int) -> str | None:
+        reason = self.trace_disabled(index)
+        if reason is not None:
+            return reason
+        if self.trace_extractor() is None:
+            return (
+                "no installed pipeline can extract traces.\n"
+                "Install one, e.g. uv pip install mbo_utilities[all]"
+            )
+        return None
+
+    def _start_trace(self, index: int, source: str, work):
+        self._pending_trace = (index, source)
+        self.trace_roi = index
+        self.trace_open = True
+        self._trace_loader.start(work, f"{source}: ROI {index + 1}...")
+
+    def quick_trace(self, index: int):
+        """Mean of the ROI's pixels per frame — no pipeline, just the mask."""
+        movie = self.plane_movie()
+        if movie is None or not 0 <= index < self.n_rois:
+            return
+        mask = self.masks.labels == index + 1
+        self._start_trace(
+            index,
+            "quick",
+            lambda: {"F": mask_trace(movie, mask)[None, :]},
+        )
+
+    def extract_trace(self, index: int):
+        """Hand the mask to a pipeline's own extractor (suite2p, say)."""
+        movie = self.plane_movie()
+        pipeline = self.trace_extractor()
+        if movie is None or pipeline is None or not 0 <= index < self.n_rois:
+            return
+        # one ROI at a time: the pipeline sees only this mask, so its
+        # neuropil ring is not carved up by the others
+        labels = (self.masks.labels == index + 1).astype(np.uint16)
+        self._start_trace(
+            index,
+            pipeline.name,
+            lambda: pipeline.extract_traces(movie, labels),
+        )
+
+    def _poll_trace(self):
+        result = self._trace_loader.poll()
+        if result is None or self._pending_trace is None:
+            return
+        index, source = self._pending_trace
+        self._pending_trace = None
+        traces = {k: np.asarray(v, np.float32) for k, v in result.items()}
+        self.traces[index] = {"source": source, **traces}
+        self.status = f"{source} trace for ROI {index + 1}"
+
+    def draw_traces(self):
+        """Popup plot of the traces computed for one ROI."""
+        if not self.trace_open:
+            return
+        em = imgui.get_font_size()
+        imgui.set_next_window_size(
+            imgui.ImVec2(40 * em, 22 * em), imgui.Cond_.first_use_ever
+        )
+        opened, self.trace_open = imgui.begin(
+            f"ROI {self.trace_roi + 1} trace###roi_trace",
+            self.trace_open,
+            flags=imgui.WindowFlags_.no_saved_settings,
+        )
+        if not opened:
+            imgui.end()
+            return
+        entry = self.traces.get(self.trace_roi)
+        if self._trace_loader.busy:
+            imgui.text_colored(_LOADING_COLOR, self._trace_loader.status)
+        elif self._trace_loader.error:
+            imgui.text_colored(imgui.ImVec4(1.0, 0.4, 0.4, 1.0), self._trace_loader.error)
+        elif entry is None:
+            imgui.text_disabled("no trace yet")
+        else:
+            imgui.text_disabled(f"source: {entry['source']}")
+            imgui.same_line(0, 12)
+            if imgui.small_button("save npz"):
+                self.save_trace(self.trace_roi)
+            size = imgui.get_content_region_avail()
+            if implot.begin_plot("##roi_trace_plot", imgui.ImVec2(size.x, size.y)):
+                implot.setup_axes(
+                    "frame",
+                    "fluorescence (a.u.)",
+                    implot.AxisFlags_.auto_fit.value,
+                    implot.AxisFlags_.auto_fit.value,
+                )
+                for name in ("F", "Fneu"):
+                    values = entry.get(name)
+                    if values is None:
+                        continue
+                    trace = np.asarray(values, np.float64).reshape(-1)
+                    x = np.arange(trace.size, dtype=np.float64)
+                    implot.plot_line(name, x, trace)
+                implot.end_plot()
+        imgui.end()
+
+    def save_trace(self, index: int):
+        entry = self.traces.get(index)
+        if entry is None:
+            return
+        out = self._output_path(f"roi{index + 1}_trace.npz")
+        arrays = {k: v for k, v in entry.items() if k != "source"}
+        try:
+            np.savez(out, source=np.array(entry["source"]), **arrays)
+        except OSError as error:
+            self.status = f"trace save failed: {error}"
+            return
+        self.status = f"saved {out.name}"
+
+    def _row_actions(self) -> tuple[RowAction, ...]:
+        return (
+            RowAction(
+                QUICK_TRACE_ICON,
+                "Quick trace — average this ROI's pixels over time",
+                self.quick_trace,
+                self.trace_disabled,
+            ),
+            RowAction(
+                EXTRACT_TRACE_ICON,
+                self._extract_tooltip(),
+                self.extract_trace,
+                self.extract_disabled,
+            ),
+        )
+
+    def _extract_tooltip(self) -> str:
+        pipeline = self.trace_extractor()
+        which = pipeline.name if pipeline is not None else "a pipeline"
+        return f"Extract trace — run this ROI's mask through {which}"
+
     def export_image(self, key: str, array):
         """Write one summary image beside the data, as the Full FOV's export."""
         out = self._output_path(f"summary_{key.replace(' ', '_')}.tif")
@@ -629,6 +866,7 @@ class ManualRoiWidget:
         self.show_bg = True
         self.bg_alpha = 1.0
         self.apply_background()
+        self.trace_open = False
         self.summary.close()
         self.summary.cleanup()
         for location in (PANEL_LOCATION, TABLE_LOCATION):
@@ -713,12 +951,13 @@ class ManualRoiWidget:
         if imgui.button("keybinds"):
             self.keybinds_open = True
 
-    def _draw_overlay_row(self):
+    def _draw_background_row(self):
         changed_bg, self.show_bg = imgui.checkbox("##bg-on", self.show_bg)
         imgui.same_line(0, 6)
-        sources = self.bg_sources
         imgui.set_next_item_width(110)
-        changed_src, index = imgui.combo("##bg-source", self.bg_source_idx, sources)
+        changed_src, index = imgui.combo(
+            "##bg-source", self.bg_source_idx, self.bg_sources
+        )
         if changed_src:
             self.set_bg_source(index)
         if imgui.is_item_hovered():
@@ -739,23 +978,72 @@ class ManualRoiWidget:
         if changed_bg or changed_bga:
             self.apply_background()
 
-        imgui.same_line(0, 20)
-        masks_changed, self.show_masks = imgui.checkbox("masks", self.show_masks)
+    def _draw_mask_row(self):
+        show_masks, self.show_masks = imgui.checkbox("masks", self.show_masks)
         imgui.same_line(0, 4)
         imgui.text_disabled("(m)")
         imgui.same_line(0, 12)
-        imgui.set_next_item_width(75)
-        opacity_changed, self.opacity = imgui.slider_float(
-            "mask opacity", self.opacity, 0.05, 1.0, "%.2f"
-        )
+        imgui.set_next_item_width(70)
+        fill, self.opacity = imgui.slider_float("fill", self.opacity, 0.05, 1.0, "%.2f")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Opacity of the mask interiors.")
+
         imgui.same_line(0, 20)
-        outlines_changed, self.show_outlines = imgui.checkbox(
+        show_outlines, self.show_outlines = imgui.checkbox(
             "outlines", self.show_outlines
         )
         imgui.same_line(0, 4)
         imgui.text_disabled("(o)")
-        if masks_changed or outlines_changed or opacity_changed:
+        imgui.same_line(0, 12)
+        imgui.set_next_item_width(70)
+        width, self.outline_width = imgui.slider_int(
+            "px", self.outline_width, 1, MAX_OUTLINE_WIDTH
+        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Outline thickness. The overlay is one texel per data pixel, "
+                "so 1 px is the thinnest a line can be drawn."
+            )
+        imgui.same_line(0, 8)
+        imgui.set_next_item_width(80)
+        placement, self.placement_idx = imgui.combo(
+            "##placement", self.placement_idx, list(OUTLINE_PLACEMENTS)
+        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Which side of the boundary the outline sits on.\n"
+                "outer:  on the background just outside the mask — costs no\n"
+                "        mask pixel, so 1-3 px structures keep every pixel\n"
+                "inner:  on the mask's own outermost pixels\n"
+                "center: straddles the boundary, eating a pixel each way"
+            )
+        imgui.same_line(0, 12)
+        imgui.set_next_item_width(70)
+        line, self.outline_alpha = imgui.slider_float(
+            "line", self.outline_alpha, 0.05, 1.0, "%.2f"
+        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Opacity of the outlines, independent of the fill.")
+
+        imgui.same_line(0, 20)
+        imgui.set_next_item_width(100)
+        color, self.color_mode_idx = imgui.combo(
+            "color by", self.color_mode_idx, list(COLOR_MODES)
+        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "label:       one colour per class, unlabeled grey\n"
+                "label + roi: class colour where labelled, a unique hue otherwise\n"
+                "roi:         a unique hue per ROI"
+            )
+        if show_masks or fill or show_outlines or width or placement or line or color:
             self.refresh_overlay()
+
+    def _draw_status(self):
+        if self._loader.busy:
+            imgui.text_colored(_LOADING_COLOR, self._loader.status)
+        else:
+            imgui.text_disabled(self._loader.error or self.status)
 
     def _draw_labels_row(self):
         if self.n_rois:
@@ -777,6 +1065,7 @@ class ManualRoiWidget:
     def draw_panel(self):
         """Top edge window: every ROI control, in ClassificationVis's order."""
         self._poll_projections()
+        self._poll_trace()
         self.drop_stale_projections()
         self._follow_viewer()
         self.handle_keys()
@@ -784,16 +1073,17 @@ class ManualRoiWidget:
         if sub_enabled("manual_roi", "tools"):
             self._draw_tools_row()
         if sub_enabled("manual_roi", "overlay"):
-            self._draw_overlay_row()
+            self._draw_background_row()
             imgui.same_line(0, 20)
-        if self._loader.busy:
-            imgui.text_colored(_LOADING_COLOR, self._loader.status)
+            self._draw_status()
+            self._draw_mask_row()
         else:
-            imgui.text_disabled(self._loader.error or self.status)
+            self._draw_status()
         if sub_enabled("manual_roi", "labels"):
             self._draw_labels_row()
 
         self.summary.draw()
+        self.draw_traces()
         self.keybinds_open = draw_keybinds_popup(
             KEYBINDS, self.keybinds_open, "ROI keys"
         )
@@ -812,4 +1102,5 @@ class ManualRoiWidget:
             self.scroll_to_selection,
             table_id="manual_rois",
             on_select=self.select_roi,
+            actions=self._row_actions(),
         )

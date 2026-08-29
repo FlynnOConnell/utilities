@@ -151,6 +151,20 @@ def any_pipeline_available() -> bool:
     return any(p.is_available for p in _PIPELINE_CLASSES)
 
 
+def get_trace_extractors() -> list[type[PipelineWidget]]:
+    """Installed pipelines that can extract traces from supplied masks.
+
+    See :meth:`PipelineWidget.extract_traces`; used by the manual-ROI
+    widget's "Extract trace" action.
+    """
+    _register_pipelines()
+    return [
+        p
+        for p in _PIPELINE_CLASSES
+        if p.extracts_traces and _is_pipeline_available(p)
+    ]
+
+
 def _active_array(parent: Any) -> Any:
     """Return the currently-loaded array (or ``None``).
 
@@ -353,6 +367,7 @@ __all__ = [
     "draw_suite2p_settings_panel",
     "get_available_pipelines",
     "get_pipeline_names",
+    "get_trace_extractors",
     "is_ready",
     "start_preload",
 ]
