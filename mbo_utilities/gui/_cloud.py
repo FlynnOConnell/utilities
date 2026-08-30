@@ -3,7 +3,7 @@
 A thin adapter over the ``imgui_cloud`` package, which owns the whole workflow
 (sign-in, upload, provisioning, teardown) and is usable on its own:
 
-    pip install imgui_cloud
+    uv pip install git+https://github.com/FlynnOConnell/imgui_cloud.git
     imgui-cloud gui
 
 This file only bridges the viewer to it: it hands over the path of whatever is
@@ -20,7 +20,7 @@ from imgui_bundle import imgui
 
 __all__ = ["draw_cloud_tab"]
 
-_INSTALL_HINT = "uv pip install imgui_cloud"
+_INSTALL_HINT = "uv pip install git+https://github.com/FlynnOConnell/imgui_cloud.git"
 
 
 def _dir_for(fpath) -> str:
