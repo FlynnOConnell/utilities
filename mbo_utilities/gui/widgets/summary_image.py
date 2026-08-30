@@ -460,6 +460,8 @@ class SummaryImageViewer(Widget):
     def _draw_toolbar(self, keys: list[str], md: dict) -> str:
         imgui.set_next_item_width(140)
         img_changed, new_idx = imgui.combo("Image", self._selected, list(keys))
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("left / right arrows: previous / next image")
         if img_changed:
             self._selected = new_idx
             self._reset_view()
@@ -717,6 +719,14 @@ class SummaryImageViewer(Widget):
             imgui.end()
             return
 
+        if imgui.is_window_focused(imgui.FocusedFlags_.root_and_child_windows) and not imgui.get_io().want_text_input:
+            from mbo_utilities.gui._keyboard import claim_arrow_keys
+
+            claim_arrow_keys()
+            step = int(imgui.is_key_pressed(imgui.Key.right_arrow)) - int(imgui.is_key_pressed(imgui.Key.left_arrow))
+            if step:
+                self._selected = (self._selected + step) % len(keys)
+                self._reset_view()
         key = self._draw_toolbar(keys, md)
         arr = md[key]
         self._draw_contrast_panel(key, arr)

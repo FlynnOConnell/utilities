@@ -217,12 +217,23 @@ def rebind_space_to_playback(parent: Any) -> None:
         parent._space_rebound = True
 
 
+# frame on which a popup used the arrow keys for itself (see claim_arrow_keys);
+# the viewer leaves T / Z alone on that frame and the next, whatever the draw order
+_arrows_claimed = -2
+
+
+def claim_arrow_keys():
+    """Keep the viewer from also stepping T / Z on this frame's arrow presses."""
+    global _arrows_claimed
+    _arrows_claimed = imgui.get_frame_count()
+
+
 def handle_arrow_keys(parent: Any):
     """Handle arrow key navigation for T and Z dimensions."""
     io = imgui.get_io()
 
-    # skip arrow keys when typing in text fields
-    if io.want_text_input:
+    # skip arrow keys when typing in text fields, or when a popup took them
+    if io.want_text_input or imgui.get_frame_count() - _arrows_claimed <= 1:
         return
 
     if not parent.image_widget or not parent.image_widget.data:
