@@ -114,6 +114,7 @@ WIDGET_REGISTRY: tuple[WidgetEntry, ...] = (
             SubWidget("overlay", "Overlay controls"),
             SubWidget("labels", "Label editor"),
             SubWidget("table", "ROI table", tooltip="The ROIs tab in this panel."),
+            SubWidget("traces", "Traces", tooltip="The Traces tab: one ROI's F / Fneu."),
         ),
     ),
     WidgetEntry(

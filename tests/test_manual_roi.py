@@ -23,7 +23,6 @@ os.environ.setdefault("RENDERCANVAS_FORCE_OFFSCREEN", "1")
 
 import numpy as np
 import pytest
-import tifffile
 
 
 def _offscreen_selected() -> bool:
@@ -143,26 +142,15 @@ class TestMasks:
         assert alpha[9, 15] == 255
         assert not ((widget.labels > 0) & (alpha == 255)).any()
 
-    @pytest.mark.parametrize("placement", ["inner", "center"])
-    def test_the_other_placements_eat_into_the_mask(self, widget, placement):
-        from masknmf.visualization.imgui import OUTLINE_PLACEMENTS
-
-        widget.add_roi(square(10, 10, 9))
-        widget.selected = -1
-        widget.placement_idx = OUTLINE_PLACEMENTS.index(placement)
-        widget.refresh_overlay()
-        alpha = widget.overlay.data.value[..., 3]
-        assert ((widget.labels > 0) & (alpha == 255)).any()
-
     def test_a_tiny_roi_keeps_its_pixels(self, widget):
         """A 3x3 structure: `center`/`inner` leave one pixel, `outer` all nine."""
-        from masknmf.visualization.imgui import OUTLINE_PLACEMENTS
+        from masknmf.visualization.imgui import OUTLINE_PLACEMENTS, outline_labels
 
         widget.add_roi([(4.0, 6.0), (6.0, 6.0), (6.0, 8.0), (4.0, 8.0)])
         assert widget.counts == [9]
         kept = {}
         for placement in OUTLINE_PLACEMENTS:
-            outline = widget.edges(1, placement)
+            outline = outline_labels(widget.labels, 1, placement)
             kept[placement] = 9 - int(((outline > 0) & (widget.labels > 0)).sum())
         assert kept == {"outer": 9, "center": 1, "inner": 1}
 
@@ -182,19 +170,14 @@ class TestMasks:
         assert alpha[widget.labels == 1].max() > alpha[widget.labels == 2].max()
 
     def test_only_the_selected_roi_gets_a_white_rim(self, widget):
-        from masknmf.visualization.imgui import selected_rim
+        from masknmf.visualization.imgui import OUTLINE_PLACEMENT, OUTLINE_WIDTH, selected_rim
 
         widget.add_roi(square(2, 2, 9))
         widget.add_roi(square(20, 20, 9))
         widget.selected = 0
         widget.refresh_overlay()
         rgb = widget.overlay.data.value[..., :3]
-        rims = [
-            selected_rim(
-                widget.labels == i, widget.outline_width, widget.outline_placement
-            )
-            for i in (1, 2)
-        ]
+        rims = [selected_rim(widget.labels == i, OUTLINE_WIDTH, OUTLINE_PLACEMENT) for i in (1, 2)]
         assert (rgb[rims[0]] == 255).all(axis=1).any()
         assert not (rgb[rims[1]] == 255).all(axis=1).any()
 
@@ -421,207 +404,12 @@ class TestMaskAppearance:
         """
         assert (widget.overlay.vmin, widget.overlay.vmax) == (0, 255)
 
-    def test_outlines_are_one_pixel_by_default(self, widget):
-        from masknmf.visualization.imgui import OUTLINE_WIDTH
-
-        assert widget.outline_width == OUTLINE_WIDTH == 1
+    def test_outlines_are_one_pixel(self, widget):
         widget.add_roi(square(10, 10, 20))
         widget.select_roi(-1)
         alpha = widget.overlay.data.value[..., 3]
         # one row across the ROI hits the left and right boundary once each
         assert int((alpha[20] == 255).sum()) == 2
-
-    @pytest.mark.parametrize("width, band", [(1, 2), (3, 6), (5, 10)])
-    def test_the_width_slider_thickens_the_outline(self, widget, width, band):
-        widget.add_roi(square(10, 10, 20))
-        widget.select_roi(-1)
-        widget.outline_width = width
-        widget.refresh_overlay()
-        alpha = widget.overlay.data.value[..., 3]
-        assert int((alpha[20] == 255).sum()) == band
-
-    def test_line_opacity_is_independent_of_the_fill(self, widget):
-        widget.add_roi(square(10, 10, 20))
-        widget.select_roi(-1)
-        widget.opacity = 0.3
-        widget.outline_alpha = 0.6
-        widget.refresh_overlay()
-        alpha = widget.overlay.data.value[..., 3]
-        edges = widget.edges() > 0
-        interior = (widget.labels == 1) & ~edges
-        assert int(alpha[edges].max()) == int(255 * 0.6)
-        assert int(alpha[interior].max()) == int(255 * 0.3)
-
-    def test_color_modes(self, widget):
-        from mbo_utilities.annotation import class_color
-        from mbo_utilities.gui.manual_roi import COLOR_MODES, UNLABELED_COLOR
-
-        for i in range(3):
-            widget.add_roi(square(2 + 14 * i, 2, 9))
-        widget.store.add_label_name("soma")
-        label(widget, 0, 0)
-        label(widget, 1, 0)  # same group, ROI 2 left unlabeled
-
-        widget.color_mode_idx = COLOR_MODES.index("label")
-        colors = widget._colors()
-        assert np.allclose(colors[0], colors[1])  # one colour per group
-        assert np.allclose(colors[0], class_color(0), atol=1 / 255)  # byte-exact
-        assert np.allclose(colors[2], UNLABELED_COLOR)
-
-        widget.color_mode_idx = COLOR_MODES.index("label + roi")
-        colors = widget._colors()
-        assert np.allclose(colors[0], colors[1])
-        assert not np.allclose(colors[2], UNLABELED_COLOR)  # its own hue
-
-        widget.color_mode_idx = COLOR_MODES.index("roi")
-        colors = widget._colors()
-        assert not np.allclose(colors[0], colors[1])  # every ROI distinct
-
-    def test_grouped_colors_survive_to_the_overlay(self, widget):
-        from mbo_utilities.annotation import class_color
-        from mbo_utilities.gui.manual_roi import COLOR_MODES
-
-        widget.add_roi(square(4, 4, 12))
-        widget.add_roi(square(30, 4, 12))
-        widget.add_roi(square(4, 30, 12))
-        widget.store.add_label_name("a")
-        widget.store.add_label_name("b")
-        label(widget, 0, 0)
-        label(widget, 2, 0)
-        label(widget, 1, 1)
-        widget.color_mode_idx = COLOR_MODES.index("label")
-        widget.select_roi(-1)
-        rgb = widget.overlay.data.value[..., :3]
-        first = rgb[widget.labels == 1][0]
-        second = rgb[widget.labels == 2][0]
-        third = rgb[widget.labels == 3][0]
-        assert np.array_equal(first, third)  # same class, same colour
-        assert not np.array_equal(first, second)
-        expected = np.array([int(round(c * 255)) for c in class_color(0)], np.uint8)
-        assert np.array_equal(first, expected)
-
-
-class TestBackground:
-    """The bg half of ClassificationVis's overlay row, over the live viewer."""
-
-    def test_sources_are_the_movie_plus_projections(self, widget):
-        assert widget.bg_sources == ["movie", "mean", "max", "std"]
-
-    def test_show_and_opacity_drive_the_viewer_graphic(self, widget):
-        widget.show_bg = False
-        widget.apply_background()
-        assert not widget.iw.graphics[0].visible
-        widget.show_bg = True
-        widget.bg_alpha = 0.4
-        widget.apply_background()
-        assert widget.iw.graphics[0].visible
-        assert widget.iw.graphics[0].alpha == pytest.approx(0.4)
-
-    def test_b_is_bound_to_the_background(self, widget):
-        from mbo_utilities.gui.manual_roi import KEYBINDS
-
-        assert ("b", "toggle background") in KEYBINDS
-
-    def test_movie_is_the_plane_on_screen(self, widget):
-        movie = widget.movie()
-        assert movie.shape == (6, 64, 64)
-        assert movie[0].shape == (64, 64)
-        assert movie[1, 0:8, 0:4].shape == (8, 4)
-        block = movie[1:4]
-        assert block.shape == (3, 64, 64)
-        assert np.allclose(block[0], movie[1])
-
-    def test_projections_reduce_over_time(self, widget):
-        from mbo_utilities.gui.manual_roi import compute_projections
-
-        movie = widget.movie()
-        projections = compute_projections(movie)
-        assert set(projections) == {"mean", "max", "std"}
-        stack = np.stack([np.asarray(movie[t]) for t in range(movie.shape[0])])
-        assert np.allclose(projections["mean"], stack.mean(axis=0), atol=1e-5)
-        assert np.allclose(projections["max"], stack.max(axis=0), atol=1e-5)
-
-    def test_picking_a_projection_freezes_the_graphic(self, widget):
-        widget._projections = drain_projections(widget)
-        widget.set_bg_source(1)  # mean
-        assert np.allclose(
-            widget.iw.graphics[0].data.value, widget._projections["mean"]
-        )
-        widget.set_bg_source(0)  # back to the live movie
-        assert not np.allclose(
-            widget.iw.graphics[0].data.value, widget._projections["mean"]
-        )
-
-    def test_scrubbing_hands_the_graphic_back_to_the_movie(self, widget):
-        widget._projections = drain_projections(widget)
-        widget.set_bg_source(2)
-        assert widget.bg_source_idx == 2
-        # the NDWidget repaints the image on any slider move, so the frozen
-        # projection is gone and the combo has to follow it
-        widget.iw.indices["t"] = 3
-        widget._follow_viewer()
-        assert widget.bg_source_idx == 0
-        assert widget._frozen_index is None
-
-    def test_a_new_plane_drops_the_cached_projections(self, widget):
-        widget._projections = drain_projections(widget)
-        assert widget._projection_key == (0, 0)
-        widget._projection_key = (7, 0)  # as if reduced from another plane
-        widget.drop_stale_projections()
-        assert widget._projections == {}
-        assert widget._projection_key is None
-
-    def test_close_hands_the_graphic_back(self, widget):
-        widget._projections = drain_projections(widget)
-        widget.set_bg_source(1)
-        widget.show_bg = False
-        widget.apply_background()
-        widget.close()
-        assert widget.iw.graphics[0].visible
-        assert not np.allclose(
-            widget.iw.graphics[0].data.value, widget._projections["mean"]
-        )
-
-
-class TestSummaryViewer:
-    """The shared SummaryImageViewer, wired up as "Open full FOV"."""
-
-    def test_open_populates_images_movie_and_highlight(self, widget):
-        widget.add_roi(square(10, 10, 20))
-        widget._projections = drain_projections(widget)
-        widget.select_roi(0)
-        widget.open_full_fov()
-        assert widget.summary.is_open
-        assert set(widget.summary.images) == {"current frame", "mean", "max", "std"}
-        assert widget.summary._movies["movie"].shape == (6, 64, 64)
-        assert widget.summary._highlight == widget.selected_bbox()
-
-    def test_selected_bbox_bounds_the_roi(self, widget):
-        widget.add_roi(square(10, 12, 9))
-        widget.select_roi(0)
-        assert widget.selected_bbox() == (12, 10, 10, 10)
-        widget.select_roi(-1)
-        assert widget.selected_bbox() is None
-
-    def test_roi_contours_outline_every_roi(self, widget):
-        for i in range(3):
-            widget.add_roi(square(2 + 14 * i, 2, 9))
-        contours = widget.roi_contours()
-        assert len(contours) == 3
-        assert all(c.ndim == 2 and c.shape[1] == 2 for c in contours)
-        # cached, and dropped when the masks change
-        assert widget.roi_contours() is contours
-        widget.delete_roi(0)
-        assert len(widget.roi_contours()) == 2
-
-    def test_export_writes_the_shown_image(self, widget, tmp_path):
-        widget.fpath = tmp_path / "movie.tif"
-        image = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
-        widget.export_image("mean", image)
-        written = tifffile.imread(tmp_path / "summary_mean.tif")
-        assert np.array_equal(written, image)
-        assert "summary_mean.tif" in widget.status
-
 
 class TestImguiWindows:
     def test_registers_the_top_panel_only(self, widget):
@@ -786,15 +574,6 @@ class TestZPlanes:
         assert not zwidget.stroke
         assert not zwidget.stroke_line.visible
 
-    def test_contours_and_projections_follow_the_plane(self, zwidget):
-        zwidget.add_roi(square(10, 10, 9))
-        assert len(zwidget.roi_contours()) == 1
-        zwidget._projections = drain_projections(zwidget)
-        assert zwidget._projection_key == (0, 0)
-        zwidget.iw.indices["z"] = 1
-        assert zwidget.roi_contours() == []
-        zwidget.drop_stale_projections()
-        assert zwidget._projections == {}
 
 
 def pump(widget, seconds: float = 30.0):
@@ -810,45 +589,28 @@ def pump(widget, seconds: float = 30.0):
 
 
 class TestTraces:
-    """Quick traces (ROI button, pixel click), pipeline extraction and per-ROI
-    pipeline runs go through the movie contract ``arr[t, c, z, y, x]`` on the
-    viewer's own array, off the draw thread."""
+    """Quick traces and run outputs both land in ``traces`` per ROI, for the
+    Traces tab; quick traces run off the draw thread as process-manager jobs."""
 
     def test_row_actions_are_icon_only(self, widget):
-        from mbo_utilities.gui.manual_roi import (
-            EXTRACT_TRACE_ICON,
-            QUICK_TRACE_ICON,
-            RUN_ICON,
-        )
+        from mbo_utilities.gui.manual_roi import RUN_ICON, TRACE_ICON
 
         actions = widget.row_actions
-        assert [a.icon for a in actions] == [RUN_ICON, QUICK_TRACE_ICON, EXTRACT_TRACE_ICON]
-        # icons only, with the name carried by the hover text
+        assert [a.icon for a in actions] == [RUN_ICON, TRACE_ICON]
         assert all(len(a.icon) <= 2 for a in actions)
         assert actions[0].tooltip.startswith("Run")
         assert actions[1].tooltip.startswith("Quick trace")
-        assert actions[2].tooltip.startswith("Extract trace")
 
-    def test_quick_trace_plots_the_roi_mean(self, widget):
+    def test_quick_trace_is_the_roi_mean(self, widget):
         widget.add_roi(square(10, 10, 9))
         widget.quick_trace(0)
         pump(widget)
-        assert widget.traces is not None and widget.traces.visible
-        # a floating window, not an edge window: the viewer's edges stay as they were
-        assert widget.iw.figure.imgui_windows["top"] is widget.tools_window
-        assert widget.iw.figure.imgui_windows.get("right") is None
-        y = widget.traces.traces["ROI 0"]
+        entry = widget.traces[0]
+        assert entry["source"] == "quick"
         data = np.asarray(widget.iw.data[0])
-        expected = data[:, widget.labels == 1].mean(axis=1)
-        np.testing.assert_allclose(y, expected, rtol=1e-5)
-
-    def test_quick_trace_replaces_by_name(self, widget):
-        widget.add_roi(square(10, 10, 9))
-        widget.quick_trace(0)
-        pump(widget)
-        widget.quick_trace(0)
-        pump(widget)
-        assert list(widget.traces.traces) == ["ROI 0"]
+        np.testing.assert_allclose(entry["F"], data[:, widget.labels == 1].mean(axis=1), rtol=1e-5)
+        assert widget.trace_roi == 0
+        assert widget.focus_traces
 
     def test_two_rois_trace_at_once(self, widget):
         widget.add_roi(square(4, 4, 9))
@@ -857,85 +619,76 @@ class TestTraces:
         widget.quick_trace(1)
         assert len(widget._trace_threads) == 2, "one thread per click, not one at a time"
         pump(widget)
-        assert set(widget.traces.traces) == {"ROI 0", "ROI 1"}
+        assert set(widget.traces) == {0, 1}
 
-    def test_clicking_background_traces_the_pixel(self, widget):
-        widget.add_roi(square(10, 10, 9))
-        click(widget, 40, 40)
-        pump(widget)
-        assert widget.selected == -1
-        y = widget.traces.traces["px (40, 40) z1"]
-        data = np.asarray(widget.iw.data[0])
-        np.testing.assert_allclose(y, data[:, 40, 40], rtol=1e-5)
+    def test_trace_uses_the_rois_plane(self, zwidget):
+        zwidget.iw.indices["z"] = 2
+        zwidget.add_roi(square(10, 10, 9))
+        zwidget.iw.indices["z"] = 0
+        zwidget.quick_trace(0)
+        pump(zwidget)
+        data = np.asarray(zwidget.iw.data[0])
+        expected = data[:, 2][:, zwidget.store.labels[2] == 1].mean(axis=1)
+        np.testing.assert_allclose(zwidget.traces[0]["F"], expected, rtol=1e-5)
 
-    def test_clicking_an_roi_does_not_trace_a_pixel(self, widget):
-        widget.add_roi(square(10, 10, 9))
-        click(widget, 15, 15)
-        pump(widget)
-        assert widget.selected == 0
-        assert widget.traces is None
-
-    def test_pixel_trace_can_be_switched_off(self, widget):
-        widget.pixel_traces = False
-        click(widget, 40, 40)
-        pump(widget)
-        assert widget.traces is None
-
-    def test_actions_are_disabled_without_a_movie(self, widget, monkeypatch):
+    def test_disabled_without_a_movie(self, widget, monkeypatch):
         monkeypatch.setattr(widget, "movie", lambda z=None: None)
         widget.add_roi(square(10, 10, 9))
         assert "movie" in widget.trace_disabled(0)
-        assert "movie" in widget.extract_disabled(0)
         widget.quick_trace(0)
-        assert not widget.trace_busy
+        assert not widget.trace_busy and widget.traces == {}
 
-    def test_extract_is_disabled_without_a_pipeline(self, widget, monkeypatch):
-        monkeypatch.setattr(widget, "trace_extractor", lambda: None)
+    def test_a_click_is_a_process_manager_job(self, widget):
+        from mbo_utilities.gui.widgets.process_manager import get_process_manager
+
+        pm = get_process_manager()
+        before = {j.job_id for j in pm.get_jobs()}
         widget.add_roi(square(10, 10, 9))
-        assert widget.trace_disabled(0) is None  # quick trace still works
-        assert "no installed pipeline" in widget.extract_disabled(0)
-
-    def test_extract_trace_lands_every_returned_trace(self, widget, monkeypatch):
-        class Fake:
-            name = "fake"
-
-            @staticmethod
-            def extract_traces(movie, labels):
-                n = int(movie.shape[0])
-                return {"F": np.ones((1, n)), "Fneu": np.zeros((1, n))}
-
-        monkeypatch.setattr(widget, "trace_extractor", lambda: Fake)
-        widget.add_roi(square(10, 10, 9))
-        widget.extract_trace(0)
+        widget.quick_trace(0)
+        new = [j for j in pm.get_jobs() if j.job_id not in before]
+        assert len(new) == 1
+        assert new[0].task_type == "roi_trace"
+        assert "ROI 0" in new[0].description
         pump(widget)
-        assert set(widget.traces.traces) == {"ROI 0 F (fake)", "ROI 0 Fneu (fake)"}
-        assert widget.traces.traces["ROI 0 F (fake)"].shape == (6,)
+        assert new[0].status == "completed"
+        assert "frames" in new[0].status_message
 
-    def test_deleting_an_roi_drops_cached_traces(self, widget):
+    def test_a_failure_is_reported_not_swallowed(self, widget, monkeypatch):
+        import mbo_utilities.gui.manual_roi as mr
+        from mbo_utilities.gui.widgets.process_manager import get_process_manager
+
+        monkeypatch.setattr(mr, "roi_trace", lambda *a, **k: 1 / 0)
+        pm = get_process_manager()
+        before = {j.job_id for j in pm.get_jobs()}
+        widget.add_roi(square(10, 10, 9))
+        widget.quick_trace(0)
+        job = next(j for j in pm.get_jobs() if j.job_id not in before)
+        pump(widget)
+        assert job.status == "error"
+        assert "ZeroDivisionError" in job.status_message
+        assert "failed" in widget.status
+        assert widget.traces == {}
+
+    def test_deleting_an_roi_drops_the_traces(self, widget):
         widget.add_roi(square(10, 10, 9))
         widget.add_roi(square(30, 10, 9))
         widget.quick_trace(1)
         pump(widget)
-        assert widget.traces.traces
-        # delete renumbers, so a name-keyed panel is no longer valid
         widget.delete_roi(0)
-        assert widget.traces.traces == {}
+        assert widget.traces == {}
 
-    def test_trace_panel_draws_and_hides(self, widget):
-        widget.add_roi(square(10, 10, 9))
+    def test_selecting_a_traced_roi_shows_it(self, widget):
+        widget.add_roi(square(4, 4, 9))
+        widget.add_roi(square(30, 4, 9))
         widget.quick_trace(0)
+        widget.quick_trace(1)
         pump(widget)
-        errors = draw_frames(widget, 3)
-        assert not errors, errors[0]
-        assert widget.traces.draw_count >= 1
-        widget.traces.hide()
-        n = widget.traces.draw_count
-        widget.iw.figure.canvas.draw()
-        assert widget.traces.draw_count == n  # hidden panels draw nothing
-        widget.close()
-        assert widget.traces is None
+        widget.select_roi(0)
+        assert widget.trace_roi == 0
+        widget.select_roi(1)
+        assert widget.trace_roi == 1
 
-    def test_run_roi_writes_outputs_beside_the_data(self, tmp_path):
+    def test_run_outputs_land_beside_the_data_and_in_traces(self, tmp_path):
         from mbo_utilities.gui._ndviewer import MboNDViewer
         from mbo_utilities.gui.manual_roi import ManualRoiWidget
 
@@ -954,10 +707,15 @@ class TestTraces:
             assert F.shape == (1, 6)
             np.testing.assert_allclose(F[0], data[:, w.labels == 2].mean(axis=1), rtol=1e-5)
             assert np.load(out / "roi_indices.npy").tolist() == [1]
-            # everything listed, under the shared tag
+            assert list(w.traces) == [1]
+            assert w.traces[1]["source"] == "rois_roi0001"
+            np.testing.assert_allclose(w.traces[1]["F"], F[0])
+            assert "Fneu" in w.traces[1]
+            assert w.trace_roi == 1 and w.focus_traces
             w.run_in_view()
             pump(w)
             assert np.load(tmp_path / "rois_manual" / "F.npy").shape == (2, 6)
+            assert set(w.traces) == {0, 1}
         finally:
             iw.close()
 
@@ -967,73 +725,62 @@ class TestTraces:
         assert "no data path" in widget.run_status
         assert not widget._run_job.busy
 
+    def test_load_run_traces_reads_any_output_dir(self, tmp_path):
+        from mbo_utilities.gui.manual_roi import load_run_traces
 
-class TestTraceJobs:
-    """Every click has to show up in the process manager, pass or fail."""
-
-    def _manager(self):
-        from mbo_utilities.gui.widgets.process_manager import get_process_manager
-
-        return get_process_manager()
-
-    def test_a_click_creates_a_job(self, widget):
-        pm = self._manager()
-        before = {j.job_id for j in pm.get_jobs()}
-        widget.add_roi(square(10, 10, 9))
-        widget.quick_trace(0)
-        new = [j for j in pm.get_jobs() if j.job_id not in before]
-        assert len(new) == 1
-        assert new[0].task_type == "roi_trace"
-        assert "ROI 0" in new[0].description
-        pump(widget)
-        assert new[0].status == "completed"
-        assert new[0].progress == 1.0
-        assert "frames" in new[0].status_message
-
-    def test_two_rois_extract_at_once(self, widget):
-        pm = self._manager()
-        before = {j.job_id for j in pm.get_jobs()}
-        widget.add_roi(square(4, 4, 9))
-        widget.add_roi(square(30, 4, 9))
-        widget.quick_trace(0)
-        widget.quick_trace(1)
-        new = [j for j in pm.get_jobs() if j.job_id not in before]
-        assert len(new) == 2, "one job per click, not one at a time"
-        pump(widget)
-        assert {"ROI 0", "ROI 1"} <= set(widget.traces.traces)
-
-    def test_a_failure_is_reported_not_swallowed(self, widget):
-        pm = self._manager()
-        before = {j.job_id for j in pm.get_jobs()}
-        widget.add_roi(square(10, 10, 9))
-        widget._start_trace("boom", lambda: 1 / 0)
-        job = next(j for j in pm.get_jobs() if j.job_id not in before)
-        pump(widget)
-        assert job.status == "error"
-        assert "ZeroDivisionError" in job.status_message
-        assert "failed" in widget.status
-        assert widget.traces.traces == {}
+        assert load_run_traces(tmp_path) == {}
+        np.save(tmp_path / "F.npy", np.arange(12, dtype=np.float32).reshape(2, 6))
+        np.save(tmp_path / "roi_indices.npy", np.array([4, 7]))
+        traces = load_run_traces(tmp_path)
+        assert set(traces) == {4, 7}
+        assert traces[7]["F"].tolist() == list(range(6, 12))
+        assert "Fneu" not in traces[7]
+        assert traces[7]["source"] == tmp_path.name
 
 
-class TestTraceCursor:
+class TestTracesTab:
     def test_the_cursor_follows_the_viewer(self, widget):
         widget.iw.indices["t"] = 3
         assert widget.current_frame() == 3
-        widget._trace_panel()
-        draw_frames(widget, 1)
-        assert widget.traces.frame_marker == 3
 
-    def test_dragging_the_cursor_scrubs_the_movie(self, widget):
-        panel = widget._trace_panel()
-        panel.on_scrub(4)
+    def test_scrubbing_moves_the_viewer(self, widget):
+        widget.set_frame(4)
         assert widget.iw.indices["t"] == 4
-        assert widget.current_frame() == 4
-
-    def test_the_frame_is_clamped_to_the_movie(self, widget):
         widget.set_frame(9999)
-        assert widget.current_frame() == 5  # the fixture movie is 6 frames
+        assert widget.current_frame() == 5
         widget.set_frame(-5)
         assert widget.current_frame() == 0
+
+    def test_tab_is_disabled_until_a_trace_lands(self, widget):
+        from mbo_utilities.gui.widgets.tabs import RoiTracesTabWidget
+
+        class Host:
+            manual_roi = None
+
+        host = Host()
+        tab = RoiTracesTabWidget(host)
+        assert "Manual ROI" in tab.tab_disabled()
+        host.manual_roi = widget
+        assert "No traces" in tab.tab_disabled()
+        widget.add_roi(square(10, 10, 9))
+        widget.quick_trace(0)
+        pump(widget)
+        assert tab.tab_disabled() is None
+        assert tab.wants_focus() and not tab.wants_focus()
+
+    def test_draw_traces_does_not_raise(self, widget):
+        widget.add_roi(square(10, 10, 9))
+        widget.quick_trace(0)
+        pump(widget)
+        real = widget.draw_panel
+
+        def panel():
+            real()
+            widget.draw_traces()
+
+        widget.draw_panel = panel
+        errors = draw_frames(widget, 3)
+        assert not errors, errors[0]
 
 
 class TestPipelineTraceExtraction:
@@ -1115,18 +862,6 @@ class TestSorting:
         order.rebuild()
         areas = np.asarray(widget.counts)[order.order]
         assert list(areas) == sorted(areas, reverse=True)
-
-
-def drain_projections(widget, timeout=10.0):
-    """Run the real async reduce to completion and return its result."""
-    widget.request_projections()
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        widget._poll_projections()
-        if widget._projections:
-            return widget._projections
-        time.sleep(0.01)
-    raise AssertionError(f"projections never landed: {widget._loader.error}")
 
 
 def draw_frames(widget, n=4):
@@ -1365,6 +1100,7 @@ class TestWidgetAttach:
 
         assert not panel_errors, f"ROI panel raised: {panel_errors[0]}"
         assert "ROIs" in seen, f"ROIs tab missing from tab bar: {seen}"
+        assert "Traces" in seen, f"Traces tab missing from tab bar: {seen}"
         assert "Preview" in seen and "Run" in seen, "preview tabs must survive"
         assert ran, "ROI tab body never drew"
         assert not errors, f"ROI tab raised: {errors}"

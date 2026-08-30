@@ -109,43 +109,45 @@ def _index_len(key, n: int) -> int | None:
     return len(np.asarray(key).reshape(-1))
 
 
+_RANK_DIMS = {2: "YX", 3: "TYX", 4: "TZYX", 5: "TCZYX"}
+
+
+def movie_dims(arr) -> tuple[str, ...]:
+    """Axis names of ``arr``: its own ``dims`` when they match its rank and
+    name Y and X, else the canonical letters for that rank."""
+    nd = getattr(arr, "ndim", None)
+    nd = int(np.ndim(arr) if nd is None else nd)
+    dims = tuple(str(d).upper() for d in (getattr(arr, "dims", None) or ()))
+    if len(dims) == nd and {"Y", "X"} <= set(dims):
+        return dims
+    if nd not in _RANK_DIMS:
+        raise ValueError(f"movie source must be 2-5D, got ndim={nd}")
+    return tuple(_RANK_DIMS[nd])
+
+
 class PlaneMovie:
     """``(T, Y, X)`` view over one channel / z-plane of any indexable array.
 
-    ``movie[t, y, x]`` is forwarded as ``arr[t, c, z, y, x]`` (rank-adjusted
-    for 4-D ``TZYX``, 3-D ``TYX`` and 2-D ``YX`` arrays), the result is
-    coerced to numpy and reshaped to what numpy indexing would give, so
-    consumers never see a backend's squeeze quirks. This is the whole
-    contract the ROI pipeline, masknmf compression and the viewer's quick
+    ``movie[t, y, x]`` is forwarded to the array by axis name (``arr.dims``,
+    or T/C/Z/Y/X by rank), other axes pinned at ``z`` / ``c`` / 0, and the
+    result is coerced to numpy and reshaped to what numpy indexing would
+    give, so consumers never see a backend's squeeze quirks. This is the
+    whole contract the ROI pipeline, masknmf compression and the viewer's
     traces rely on: if the array slices in y and x, everything here works.
     """
 
     def __init__(self, arr, z: int = 0, c: int = 0):
-        nd = getattr(arr, "ndim", None)
-        nd = int(np.ndim(arr) if nd is None else nd)
-        if nd not in (2, 3, 4, 5):
-            raise ValueError(f"movie source must be 2-5D, got ndim={nd}")
         self.arr = arr
+        self.dims = movie_dims(arr)
         self.z = int(z)
         self.c = int(c)
-        shape = tuple(int(s) for s in arr.shape)
-        if nd == 5:
-            nt, nc, nz, ny, nx = shape
-        elif nd == 4:
-            nt, nz, ny, nx = shape
-            nc = 1
-        elif nd == 3:
-            nt, ny, nx = shape
-            nc = nz = 1
-        else:
-            ny, nx = shape
-            nt = nc = nz = 1
+        size = dict(zip(self.dims, (int(s) for s in arr.shape)))
+        nt, nc, nz = size.get("T", 1), size.get("C", 1), size.get("Z", 1)
         if not 0 <= self.z < nz:
             raise IndexError(f"z={z} out of range for {nz} plane(s)")
         if not 0 <= self.c < nc:
             raise IndexError(f"c={c} out of range for {nc} channel(s)")
-        self._nd = nd
-        self.shape = (nt, ny, nx)
+        self.shape = (nt, size["Y"], size["X"])
         self.nz, self.nc = nz, nc
         self.ndim = 3
 
@@ -157,13 +159,8 @@ class PlaneMovie:
         return self.shape[0]
 
     def _full_key(self, t, y, x):
-        if self._nd == 5:
-            return (t, self.c, self.z, y, x)
-        if self._nd == 4:
-            return (t, self.z, y, x)
-        if self._nd == 3:
-            return (t, y, x)
-        return (y, x)
+        axes = {"T": t, "C": self.c, "Z": self.z, "Y": y, "X": x}
+        return tuple(axes.get(d, 0) for d in self.dims)
 
     def __getitem__(self, key):
         if not isinstance(key, tuple):
@@ -177,8 +174,8 @@ class PlaneMovie:
             t = np.asarray(t).reshape(-1)
         nt, ny, nx = self.shape
         want = tuple(n for n in (_index_len(t, nt), _index_len(y, ny), _index_len(x, nx)) if n is not None)
-        if self._nd == 2 and not (isinstance(t, (int, np.integer)) or _index_len(t, 1) == 1):
-            raise IndexError("a 2-D source has a single frame")
+        if "T" not in self.dims and not (isinstance(t, (int, np.integer)) or _index_len(t, 1) == 1):
+            raise IndexError("a source without a time axis has a single frame")
         out = np.asarray(self.arr[self._full_key(t, y, x)])
         return out.reshape(want)
 
@@ -200,13 +197,7 @@ def as_movie(source, z: int = 0, c: int = 0) -> PlaneMovie:
 
 
 def _source_nz(arr) -> int:
-    nd = getattr(arr, "ndim", None)
-    nd = int(np.ndim(arr) if nd is None else nd)
-    if nd == 5:
-        return int(arr.shape[2])
-    if nd == 4:
-        return int(arr.shape[1])
-    return 1
+    return int(dict(zip(movie_dims(arr), arr.shape)).get("Z", 1))
 
 
 # ---------------------------------------------------------------------------

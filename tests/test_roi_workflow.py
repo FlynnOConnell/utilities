@@ -394,3 +394,23 @@ def test_demix_seeded_with_masks(tmp_path, store):
     # second call reuses the cached PMD (no recompression)
     out2 = rw.demix_rois(plane, store, [0], settings=_MNMF, tag="d2")
     assert np.load(out2 / "ops.npy", allow_pickle=True).item()["roi_workflow"]["compression_seconds"] == 0.0
+
+
+def test_plane_movie_resolves_axes_by_name():
+    from mbo_utilities.roi_workflow import PlaneMovie, movie_dims
+
+    class Named:
+        def __init__(self, data, dims):
+            self.data, self.dims, self.shape, self.ndim = data, dims, data.shape, data.ndim
+
+        def __getitem__(self, key):
+            return self.data[key]
+
+    data = np.arange(2 * 3 * 4 * 5, dtype=np.float32).reshape(3, 2, 4, 5)
+    arr = Named(data, ("Z", "T", "Y", "X"))
+    assert movie_dims(arr) == ("Z", "T", "Y", "X")
+    movie = PlaneMovie(arr, z=2)
+    assert movie.shape == (2, 4, 5) and movie.nz == 3
+    np.testing.assert_array_equal(movie[1], data[2, 1])
+    np.testing.assert_array_equal(movie[:, 1:3, 0], data[2, :, 1:3, 0])
+    assert movie_dims(data) == ("T", "Z", "Y", "X")
