@@ -1148,7 +1148,6 @@ def demix_rois(
     seed order and the ``demixing_results.hdf5`` holds the final footprints.
     """
     logger = logger or log.get("roi_workflow")
-    import copy
 
     import masknmf
 
@@ -1213,12 +1212,7 @@ def demix_rois(
             sigma=max(2.0, 0.3 * fs),
             device=dev,
         )
-    cfg = copy.copy(s.demixing)
-    # the ring/background model downsamples the field by this factor; keep
-    # at least a few pixels per side so small fields (crops, tests) work
-    cfg.background_downsampling_factor = max(
-        1, min(int(cfg.background_downsampling_factor), min(ly, lx) // 4)
-    )
+    cfg = _runner.clamp_background_downsampling(s.demixing, ly, lx, logger)
     logger.info(f"roi_workflow: masknmf demixing seeded with {K} ROIs on plane z={z} ({dev})")
     demixer = masknmf.SignalDemixer(pmd, device=dev, frame_batch_size=s.runtime.frame_batch_size)
     demixer.initialize_signals(is_custom=True, spatial_footprints=a0, c_nonneg=True)
@@ -1363,8 +1357,6 @@ def discover_rois(
     }
 
     if engine == "masknmf":
-        import copy
-
         import masknmf
         from masknmf.demixing import NoSignalsDetectedError
 
@@ -1398,10 +1390,7 @@ def discover_rois(
                 sigma=max(2.0, 0.3 * fs),
                 device=dev,
             )
-        cfg = copy.copy(s.demixing)
-        cfg.background_downsampling_factor = max(
-            1, min(int(cfg.background_downsampling_factor), min(h, w) // 4)
-        )
+        cfg = _runner.clamp_background_downsampling(s.demixing, h, w, logger)
         logger.info(
             f"roi_workflow: masknmf discovery in ({y0}:{y1}, {x0}:{x1}) on plane z={z} ({dev})"
         )

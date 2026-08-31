@@ -84,6 +84,12 @@ def _convert_range_to_slice(k):
     return k
 
 
+def _is_full_slice(k) -> bool:
+    """True for ``slice(None)``; safe for array keys, where ``k != slice(None)``
+    would return an array."""
+    return isinstance(k, slice) and k == slice(None)
+
+
 def _extract_tiff_plane_number(name: str) -> int | None:
     """Extract plane number from filename like 'plane01.tiff' or 'plane14_stitched.tif'."""
     match = re.search(r"plane(\d+)", name, re.IGNORECASE)
@@ -1377,6 +1383,14 @@ class ScanImageArray(TiffReaderMixin, RoiFeatureMixin, ReductionMixin, PhaseCorr
                 )
             else:
                 out = out.reshape(len(frames), nc, nz, out.shape[-2], out.shape[-1])
+
+        # y/x are read in full (process_rois stitches whole frames), so crop
+        # them here; without this a (t, y, x) key silently returned full frames
+        if not (_is_full_slice(y_key) and _is_full_slice(x_key)):
+            if isinstance(out, tuple):
+                out = tuple(x[:, :, :, y_key, x_key] for x in out)
+            else:
+                out = out[:, :, :, y_key, x_key]
 
         # squeeze integer-indexed dimensions. accept numpy integer scalars
         # too — bare `int` check left np.int64 (returned by

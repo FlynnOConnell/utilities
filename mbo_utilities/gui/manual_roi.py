@@ -7,7 +7,7 @@ gated by its Widgets-menu subwidget toggle - sits over a status row, and
 three tabs in the right-hand widget (``widgets/tabs.py``) hold the combined
 ROI table, the trace viewer, and the run browser. The table, label set,
 stroke capture, overlay compositing and theme are the shared widgets from
-``masknmf.visualization.imgui``.
+``mbo_utilities.gui.imgui``.
 
 Arm "Add ROI" (a), drag a closed stroke around a cell, release and the
 enclosed pixels become a mask. ROIs live in a ``RoiLabelStore``: one
@@ -45,27 +45,27 @@ from typing import Any
 
 import cv2
 import numpy as np
-from fastplotlib.ui import ImguiWindow
 from imgui_bundle import (
     imgui,
     imgui_ctx,
     icons_fontawesome_6 as fa,
     implot,
-    portable_file_dialogs as pfd,
 )
-from masknmf.visualization.imgui import (
+from mbo_utilities.gui.imgui import (
     UNLABEL_ALL,
     LabelSet,
     RoiOrder,
     RowAction,
     StrokeDrawer,
     SummaryImageViewer,
-    draw_filter_row,
     draw_label_editor,
+    draw_label_filter,
     draw_progress,
+    draw_range_filter,
     draw_roi_table,
 )
 from mbo_utilities import log
+from mbo_utilities.gui._top_strip import TopPanel, TopStrip
 from mbo_utilities.annotation import UNLABELED, LabelsZarr, RoiLabelStore
 from mbo_utilities.arrays.features import find_slider_name
 from mbo_utilities.gui._imgui_helpers import (
@@ -101,7 +101,6 @@ from mbo_utilities.gui.roi_runs import (
     registry_path,
     run_dir_complete,
     save_run_registry,
-    scan_run_dirs,
     set_color,
 )
 from mbo_utilities.gui.widgets.process_manager import get_process_manager
@@ -130,11 +129,24 @@ __all__ = [
 ]
 
 PANEL_LOCATION = "top"
-PANEL_HEIGHT = 228
+# height the ROI / Traces bodies ask the top strip for (the strip adds the
+# menu row and its tab bar on top of this)
+PANEL_HEIGHT = 200
 
 # below these widths the panel / tabs collapse to a placeholder line
 MIN_PANEL_WIDTH = 260
 MIN_TAB_WIDTH = 150
+
+# Traces tab columns: (name, stretch weight, hidden by default). The order is
+# the sort-key order in draw_trace_table, so only ever append.
+TRACE_COLUMNS = (
+    ("roi", 1.6, False),
+    ("source", 1.8, False),
+    ("frames", 1.0, True),
+    ("mean", 1.0, False),
+    ("peak", 1.0, True),
+    ("snr", 1.0, False),
+)
 
 MIN_ROI_PIXELS = 9
 MIN_REGION_SIDE = 4
@@ -154,7 +166,7 @@ KEYBINDS = (
     ("esc", "stop drawing, else clear the region"),
     ("ctrl+z", "undo the last drawn ROI"),
     ("delete", "delete the selected ROI / discard the selected derived one"),
-    ("up / down", "previous / next row in view"),
+    ("up / down", "previous / next trace on the Traces panel, else ROI in view"),
     ("u", "next unlabeled ROI"),
     ("f", "center the shown ROI; labeling then advances"),
     ("1-9", "label the selected ROI (drawn or derived), then advance"),
@@ -216,12 +228,17 @@ def labels_path(fpath) -> Path:
 
 
 def roi_widgets_available() -> bool:
-    """True when masknmf's shared imgui widgets import."""
+    """True when the shared imgui widgets import."""
     try:
-        import masknmf.visualization.imgui  # noqa: F401
+        import mbo_utilities.gui.imgui  # noqa: F401
     except Exception:
         return False
     return True
+
+
+def _cleared_note(cleared) -> str:
+    """Status tail naming the filters a selection had to drop to show itself."""
+    return f" · cleared the {', '.join(cleared)} filter" + ("s" if len(cleared) > 1 else "") if cleared else ""
 
 
 class _PlaneOrder(RoiOrder):
@@ -251,6 +268,22 @@ class _PlaneOrder(RoiOrder):
         self.pos = int(hits[0]) if len(hits) else int(
             min(self.pos, max(len(self.order) - 1, 0))
         )
+
+    def hidden_by(self, item: int) -> list:
+        out = super().hidden_by(item)
+        if self.plane is not None and int(self.planes[item]) != self.plane:
+            out.append("plane")
+        if self.source is not None and int(self.sources[item]) != self.source:
+            out.append("source")
+        return out
+
+    def clear_filter(self, name: str):
+        if name == "plane":
+            self.plane = None
+        elif name == "source":
+            self.source = None
+        else:
+            super().clear_filter(name)
 
     def next_unlabeled(self) -> bool:
         # only drawn rows can take a label, so u never lands on a derived one
@@ -283,10 +316,17 @@ class ManualRoiWidget:
     runs : dict, optional
         State from :meth:`park_runs` of the previous widget (how loaded
         runs, traces and live background work survive an off/on toggle).
+    strip : TopStrip, optional
+        The figure's shared top strip to hang the ROI and Traces panels off.
+        Omit to own one (standalone use).
+    host : PreviewDataWidget, optional
+        The widget that owns the viewer's display settings; the trace plot
+        follows its window function. Omit when running standalone.
     """
 
-    def __init__(self, iw, fpath=None, label_names=(), store=None, runs=None):
+    def __init__(self, iw, fpath=None, label_names=(), store=None, runs=None, strip=None, host=None):
         self.iw = iw
+        self.host = host
         self.figure = iw.figure
         self.fpath = Path(fpath) if fpath is not None else None
         self.logger = log.get("gui.manual_roi")
@@ -377,32 +417,29 @@ class ManualRoiWidget:
         self.trace_sel: set[tuple] = set()  # trace-table keys to plot
         self._trace_stats: dict[tuple, tuple] = {}
         self._trace_display: dict[tuple, tuple] = {}
+        # one entry: the last windowed line, so panning does not recompute it
+        self._trace_window_cache: dict[tuple, np.ndarray] = {}
         self.correct_neuropil = True
         self._trace_sort = (0, True)
         self._trace_fit = True
         self._plot_key = None
-
-        # top-panel tab <-> right-bar tab sync
-        self.top_tab = "roi"
-        self.focus_top: str | None = None
-        self._focus_right: str | None = None
-        self._right_tab_now = ""
-        self._right_tab_last = ""
-        self._sync_hold = 0
 
         self.process = PROCESSES[0]
         self.run_tag = "manual"
         self.manager = RoiRunManager()
         self._registry_extra: list[dict] = []
         self._restoring = False
-        self._disk_runs: list[dict] | None = None
-        self._run_dir_dialog = None
 
-        self.tools_window = iw.figure.add_imgui_window(
-            ImguiWindow(update_call=self.draw_panel),
-            location=PANEL_LOCATION,
-            size=PANEL_HEIGHT,
-            title="ROIs",
+        # the top edge is shared (menu row, Signal Quality plot, these two
+        # panels); standalone use — tests, a bare viewer — gets its own strip
+        self._own_strip = strip is None
+        self.tools_window = TopStrip(iw.figure) if self._own_strip else strip
+        self.tools_window.add_hook(self._frame)
+        self.tools_window.register(
+            TopPanel("roi", "ROI", self._draw_roi_panel, PANEL_HEIGHT, "rois", 10)
+        )
+        self.tools_window.register(
+            TopPanel("traces", "Traces", self.draw_traces, PANEL_HEIGHT, "traces", 11)
         )
 
         self._closed = False
@@ -449,9 +486,11 @@ class ManualRoiWidget:
             self.summary.cleanup()
         except Exception:
             self.logger.debug("summary viewer cleanup failed", exc_info=True)
-        self._run_dir_dialog = None
-        if self.figure.imgui_windows.get(PANEL_LOCATION) is self.tools_window:
-            self.figure.remove_imgui_window(PANEL_LOCATION)
+        self.tools_window.remove_hook(self._frame)
+        self.tools_window.unregister("roi")
+        self.tools_window.unregister("traces")
+        if self._own_strip:
+            self.tools_window.close()
         self.tools_window = None
 
     def park_runs(self) -> dict:
@@ -747,14 +786,15 @@ class ManualRoiWidget:
         else:
             record = self.store.rois[self.selected]
             self._note_buf = record.note
-            self.order.goto(self.selected)
-            self.status = f"ROI {self.selected}: {record.area} px"
+            cleared = self.order.reveal(self.selected)
+            self.status = f"ROI {self.selected}: {record.area} px" + _cleared_note(cleared)
             if self.zdim is not None and record.z != self.z:
                 self.iw.indices[self.zdim] = record.z
             if any(record.uid in ts.data for ts in self.trace_sets.values()):
                 self.trace_uid = record.uid
             if self.follow:
                 self._center_on(*self._feather(self.selected)[:2])
+        self._sync_trace_sel()
         self.refresh_overlay()
         self.refresh_derived_overlay()
 
@@ -770,22 +810,61 @@ class ManualRoiWidget:
         self.scroll_to_selection = True
         s = self.derived[si]
         row = self._row_index.get((si, k))
-        if row is not None:
-            self.order.goto(row)
+        cleared = self.order.reveal(row) if row is not None else []
         stat_row = s.result.stat[k]
         npix = int(stat_row.get("npix", len(stat_row["ypix"])))
         tail = " · promoted" if (s.name, k) in self._promoted else ""
-        self.status = f"{s.name} row {k}: {npix} px{tail}"
+        self.status = f"{s.name} row {k}: {npix} px{tail}" + _cleared_note(cleared)
         if self.zdim is not None and s.result.z != self.z:
             self.iw.indices[self.zdim] = s.result.z
         if self.follow:
             self._center_on(stat_row["ypix"], stat_row["xpix"])
+        self._sync_trace_sel()
         self.refresh_overlay()
         self.refresh_derived_overlay()
 
     def step(self, delta: int):
+        """Up / down: the next or previous trace while the Traces panel is
+        up, else the next or previous ROI. Either way the image, both tables
+        and the trace plot land on the same ROI."""
+        if self.top_tab == "traces" and self.step_trace(delta):
+            return
         if self.order.step(delta):
             self.select_row(self.order.current)
+
+    def step_trace(self, delta: int) -> bool:
+        """Move to the next / previous row of the trace table, in the order
+        the table shows, and select the ROI behind it."""
+        rows = self._sorted_trace_rows()
+        if not rows:
+            return False
+        at = next((i for i, key in enumerate(rows) if key in self.trace_sel), None)
+        if at is None:
+            pos = 0 if delta > 0 else len(rows) - 1
+        else:
+            pos = int(np.clip(at + delta, 0, len(rows) - 1))
+        self.select_trace(rows[pos])
+        return True
+
+    def select_trace(self, key):
+        """Plot just this trace and select the ROI behind it."""
+        self.trace_sel = {key}
+        self._trace_fit = True
+        origin, name, k = key
+        if origin == "uid":
+            index = self.store.uid_index(k)
+            if index is not None:
+                self.trace_uid = k
+                self.select_roi(index)
+        else:
+            hit = self._set_by_name(name)
+            if hit is not None:
+                self.select_derived(hit[0], k)
+
+    def toggle_trace(self, key):
+        """Add / remove one trace from the plotted set (ctrl+click)."""
+        (self.trace_sel.discard if key in self.trace_sel else self.trace_sel.add)(key)
+        self._trace_fit = True
 
     def next_unlabeled(self):
         if self.order.next_unlabeled():
@@ -1377,6 +1456,9 @@ class ManualRoiWidget:
         uid = record.uid
         mask = self.store.labels[record.z] == (index + 1)
         weights = feather_mask(mask)
+        # traces taken at different binnings live on different time bases;
+        # record it so the table can say so
+        averaged = int(getattr(self.host, "frame_average", 1) or 1)
         description = f"quick trace - ROI {index}"
         job = get_process_manager().start_job("roi_trace", description)
         self.status = f"{description} started"
@@ -1390,7 +1472,8 @@ class ManualRoiWidget:
                 self._trace_results.put((uid, None, str(error)))
                 return
             job.done(f"{y.size} frames")
-            self._trace_results.put((uid, {"F": np.asarray(y, np.float32)}, None))
+            entry = {"F": np.asarray(y, np.float32), "frame_average": averaged}
+            self._trace_results.put((uid, entry, None))
 
         thread = threading.Thread(target=run, name=f"roi-trace-{index}", daemon=True)
         self._trace_threads.append(thread)
@@ -1595,7 +1678,6 @@ class ManualRoiWidget:
             self.focus_traces = True
             self.status = f"ROI {index}: {entry['F'].size} frames"
         for run, payload in self.manager.poll(get_process_manager()):
-            self._disk_runs = None
             if run.error is not None:
                 self._run_error = f"{run.description} failed: {run.error}"
                 continue
@@ -1622,10 +1704,18 @@ class ManualRoiWidget:
             run.loaded = bool(loaded)
             if outs and loaded == len(outs):
                 self._run_error = None
-                self.logger.info(f"roi run done: {', '.join(d.name for d in outs)}")
-                self.status = f"done: {', '.join(d.name for d in outs)}"
+                names = ", ".join(d.name for d in outs)
+                took = run.job.elapsed_str() if run.job is not None else ""
+                self.logger.info(f"roi run done: {names}" + (f" in {took}" if took else ""))
+                self.status = f"done: {names}"
+                # the run browser is gone: its timing and outputs belong on the
+                # job, which the status button and process console already show
+                if run.job is not None:
+                    run.job.status_message = f"{names} · {took}"
             elif not outs:
                 self.status = f"{run.description}: nothing written"
+                if run.job is not None:
+                    run.job.status_message = "nothing written"
 
     # ------------------------------------------------------------------
     # keys
@@ -1680,68 +1770,70 @@ class ManualRoiWidget:
     # imgui: top panel
     # ------------------------------------------------------------------
 
-    def draw_panel(self):
-        """Top edge window: a ROI tab (control cards over a status row, each
-        card gated by its Widgets-menu subwidget toggle) and a Traces tab.
-        Its tab selection follows the right bar's ROIs / Traces tabs and
-        vice versa."""
+    # the top strip's tab selection is the widget's; these keep the old
+    # attribute names working for callers and tests
+    @property
+    def top_tab(self) -> str | None:
+        return self.tools_window.active
+
+    @property
+    def focus_top(self) -> str | None:
+        return self.tools_window._focus
+
+    @focus_top.setter
+    def focus_top(self, key: str | None):
+        if key is not None:
+            self.tools_window.focus(key)
+
+    @property
+    def _right_tab_now(self) -> str:
+        return self.tools_window._right_now
+
+    @_right_tab_now.setter
+    def _right_tab_now(self, name: str):
+        self.tools_window.report_right_tab(name)
+
+    @property
+    def _focus_right(self) -> str | None:
+        return self.tools_window._right_focus
+
+    @_focus_right.setter
+    def _focus_right(self, name: str | None):
+        self.tools_window._right_focus = name
+
+    def _frame(self):
+        """Per-frame work the strip runs whatever tab is on top: background
+        jobs, keyboard handling, and our own floating windows."""
         self._poll_jobs()
         self.handle_keys()
         if self.focus_traces:
             self.focus_traces = False
-            self.focus_top = "traces"
-        focus_top, self.focus_top = self.focus_top, None
-        # the right-bar tab bodies report themselves as they draw; a fresh
-        # report means the user switched over there
-        if self._right_tab_now and self._right_tab_now != self._right_tab_last:
-            self._right_tab_last = self._right_tab_now
-            pair = {"rois": "roi", "traces": "traces"}.get(self._right_tab_now)
-            if (
-                pair is not None and pair != self.top_tab and focus_top is None
-                and imgui.get_frame_count() >= self._sync_hold
-            ):
-                focus_top = pair
-        top_before = self.top_tab
-        with fit_width("ROI tools", min_width=MIN_PANEL_WIDTH) as shown:
-            if shown and imgui.begin_tab_bar("##roi_panel_tabs"):
-                active = None
-                flags = imgui.TabItemFlags_.set_selected if focus_top == "roi" else 0
-                if imgui.begin_tab_item("ROI", None, flags)[0]:
-                    active = "roi"
-                    h = max(imgui.get_content_region_avail().y - em(1.8), em(6))
-                    cards = [self._draw_navigate_card]
-                    if sub_enabled("manual_roi", "tools"):
-                        cards.append(self._draw_draw_card)
-                    if sub_enabled("manual_roi", "overlay"):
-                        cards.append(self._draw_view_card)
-                    if sub_enabled("manual_roi", "labels"):
-                        cards.append(self._draw_labels_card)
-                    if sub_enabled("manual_roi", "process"):
-                        cards.append(self._draw_process_card)
-                    for i, draw in enumerate(cards):
-                        if i:
-                            imgui.same_line(0, em(0.6))
-                        draw(h)
-                    self._draw_status()
-                    imgui.end_tab_item()
-                flags = imgui.TabItemFlags_.set_selected if focus_top == "traces" else 0
-                if imgui.begin_tab_item("Traces", None, flags)[0]:
-                    active = "traces"
-                    self.draw_traces()
-                    imgui.end_tab_item()
-                imgui.end_tab_bar()
-                if active is not None:
-                    self.top_tab = active
-        if self.top_tab != top_before:
-            counterpart = {"roi": "rois", "traces": "traces"}[self.top_tab]
-            if self._right_tab_last != counterpart:
-                self._focus_right = counterpart
-                # the right bar may redraw its old tab before it follows;
-                # ignore those reports instead of yanking the top back
-                self._sync_hold = imgui.get_frame_count() + 3
+            self.tools_window.focus("traces")
         self.summary.draw()
         self._draw_help_popup()
         self._draw_keybinds_popup()
+
+    def _draw_roi_panel(self):
+        """The ROI panel: control cards over a status row, each card gated by
+        its Widgets-menu subwidget toggle."""
+        with fit_width("ROI tools", min_width=MIN_PANEL_WIDTH) as shown:
+            if not shown:
+                return
+            h = max(imgui.get_content_region_avail().y - em(1.8), em(6))
+            cards = [self._draw_navigate_card]
+            if sub_enabled("manual_roi", "tools"):
+                cards.append(self._draw_draw_card)
+            if sub_enabled("manual_roi", "overlay"):
+                cards.append(self._draw_view_card)
+            if sub_enabled("manual_roi", "labels"):
+                cards.append(self._draw_labels_card)
+            if sub_enabled("manual_roi", "process"):
+                cards.append(self._draw_process_card)
+            for i, draw in enumerate(cards):
+                if i:
+                    imgui.same_line(0, em(0.6))
+                draw(h)
+            self._draw_status()
 
     def _draw_navigate_card(self, h: float):
         with card("##nav", "NAVIGATE", h):
@@ -2061,17 +2153,24 @@ class ManualRoiWidget:
             if changed:
                 self.order.plane = self.z if on else None
                 changed_any = True
-            imgui.same_line(0, 12)
+        half = max((imgui.get_content_region_avail().x - em(0.5)) / 2, em(6))
+        if draw_label_filter(self.order, self.classes, "_roi", half):
+            changed_any = True
+        set_tooltip("Filter by label", show_mark=False)
+        imgui.same_line(0, em(0.5))
         names = ["all", "drawn", *(s.name for s in self.derived)]
         current = 0 if self.order.source is None else self.order.source + 1
-        imgui.set_next_item_width(120)
+        imgui.set_next_item_width(-1)
         changed, sel = imgui.combo("##source_filter", min(current, len(names) - 1), names)
+        set_tooltip("Filter by source: drawn by hand, or a loaded run", show_mark=False)
         if changed:
             self.order.source = None if sel == 0 else sel - 1
             changed_any = True
+        if draw_range_filter(self.order, "_roi"):
+            changed_any = True
+        imgui.text(f"{len(self.order.order)}/{self.order.n_items} in view")
         if changed_any:
             self.order.rebuild()
-        draw_filter_row(self.order, self.classes, "_roi")
 
         footer = 2 * imgui.get_frame_height_with_spacing() + 12
         with imgui_ctx.begin_child("##roi_table", imgui.ImVec2(0, -footer)):
@@ -2172,31 +2271,106 @@ class ManualRoiWidget:
     # imgui: traces tab
     # ------------------------------------------------------------------
 
-    def _trace_target(self):
-        """``(header, [(label, key), ...])`` for the shown ROI, or None."""
+    def _lines_for_uid(self, uid):
+        """``(header, [(label, key), ...])`` for one ROI uid, or None."""
+        lines = [
+            (name, ("uid", name, uid))
+            for name, ts in self.trace_sets.items()
+            if ts.visible and uid in ts.data
+        ]
+        if not lines:
+            return None
+        index = self.store.uid_index(uid)
+        header = f"ROI {index}" if index is not None else f"uid {uid}"
+        return header, lines
+
+    def _selection_trace_keys(self) -> list[tuple]:
+        """Trace-table keys of the selection; empty when it has none."""
         if self.selected_derived is not None:
             si, k = self.selected_derived
             s = self.derived[si]
-            if self._derived_entry(s.result, k) is not None:
-                return f"{s.name} row {k}", [(s.name, ("row", s.name, k))]
-        candidates = []
-        if self.selected >= 0:
-            candidates.append(self.store.rois[self.selected].uid)
-        candidates.append(self.trace_uid)
+            if self._derived_entry(s.result, k) is None:
+                return []
+            return [("row", s.name, k)]
+        if self.selected < 0:
+            return []
+        got = self._lines_for_uid(self.store.rois[self.selected].uid)
+        return [] if got is None else [key for _label, key in got[1]]
+
+    def _sync_trace_sel(self):
+        """Point the plotted set at the selection, so the trace in the top
+        panel is the ROI the image is showing. A multi-row (ctrl+click)
+        selection that already covers it is left alone."""
+        keys = set(self._selection_trace_keys())
+        if keys and self.trace_sel & keys:
+            return
+        if self.trace_sel != keys:
+            self.trace_sel = keys
+            self._trace_fit = True
+
+    def _trace_target(self):
+        """``(header, [(label, key), ...])`` for the shown ROI, or None.
+
+        With something selected this is that ROI's traces and nothing else:
+        the plot must never show an ROI the image is not showing. Only with
+        no selection does it fall back to the last trace collected, then to
+        any set that has one.
+        """
+        if self.selected_derived is not None or self.selected >= 0:
+            keys = self._selection_trace_keys()
+            if not keys:
+                return None
+            if self.selected_derived is not None:
+                si, k = self.selected_derived
+                return f"{self.derived[si].name} row {k}", [(self.derived[si].name, keys[0])]
+            return self._lines_for_uid(self.store.rois[self.selected].uid)
+        candidates = [self.trace_uid]
         for ts in self.trace_sets.values():
             if ts.data:
                 candidates.append(next(iter(ts.data)))
         for uid in candidates:
-            lines = [
-                (name, ("uid", name, uid))
-                for name, ts in self.trace_sets.items()
-                if ts.visible and uid in ts.data
-            ]
-            if lines:
-                index = self.store.uid_index(uid)
-                header = f"ROI {index}" if index is not None else f"uid {uid}"
-                return header, lines
+            got = self._lines_for_uid(uid)
+            if got is not None:
+                return got
         return None
+
+    def _binning_tag(self, key) -> str:
+        """`` x10`` when a trace was taken at a different frame averaging than
+        the data now shows — those traces are on another time base."""
+        entry = self._trace_entry(key)
+        taken = int((entry or {}).get("frame_average", 1) or 1)
+        now = int(getattr(self.host, "frame_average", 1) or 1)
+        return f" x{taken}" if taken != now and taken > 1 else ""
+
+    def _window_spec(self) -> tuple[str, int]:
+        """``(projection, size)`` of the viewer's window function.
+
+        The preview trace gets the same window the image does, so what the
+        plot shows is what the frame on screen shows.
+        """
+        host = self.host
+        if host is None:
+            return "mean", 1
+        try:
+            return str(host.proj), max(1, int(host.window_size))
+        except Exception:
+            return "mean", 1
+
+    def _windowed(self, y):
+        """``y`` under the viewer's rolling window; the raw array at size 1."""
+        proj, size = self._window_spec()
+        if y is None or size <= 1 or y.size < size:
+            return y
+        cached = self._trace_window_cache.get((id(y), proj, size))
+        if cached is not None:
+            return cached
+        pad = (size - 1) // 2, size // 2
+        padded = np.pad(y, pad, mode="edge")
+        view = np.lib.stride_tricks.sliding_window_view(padded, size)
+        func = {"max": np.max, "std": np.std}.get(proj, np.mean)
+        out = np.ascontiguousarray(func(view, axis=-1), np.float32)
+        self._trace_window_cache = {(id(y), proj, size): out}
+        return out
 
     def _display(self, key) -> tuple:
         """Cached ``(trace, neuropil)`` display arrays for one trace key."""
@@ -2245,8 +2419,14 @@ class ManualRoiWidget:
 
     def _plot_lines(self):
         """``(header, [(label, key), ...])``: the checked trace-table rows,
-        else whatever the current selection points at."""
-        if self.trace_sel:
+        else whatever the current selection points at.
+
+        When the checked rows are exactly the selection's own traces — which
+        is what selecting an ROI leaves behind — the plot is titled after the
+        ROI rather than counted, so it reads as "this is what the image is
+        showing".
+        """
+        if self.trace_sel and self.trace_sel != set(self._selection_trace_keys()):
             lines = []
             for key in sorted(self.trace_sel):
                 if self._trace_entry(key) is None:
@@ -2277,8 +2457,10 @@ class ManualRoiWidget:
             self._trace_stats.clear()
             self._trace_fit = True
         imgui.same_line(0, 14)
+        proj, size = self._window_spec()
+        window = f" · {proj} {size}" if size > 1 else ""
         imgui.text_disabled(
-            f"{header}, frame {self.current_frame()} · "
+            f"{header}, frame {self.current_frame()}{window} · "
             "drag pans, scroll zooms, double-click fits"
         )
         height = max(imgui.get_content_region_avail().y - 4, 60.0)
@@ -2303,10 +2485,10 @@ class ManualRoiWidget:
                 y, yneu = self._display(tkey)
                 if y is None:
                     continue
-                implot.plot_line(label, y)
+                implot.plot_line(label, self._windowed(y))
                 if yneu is not None:
                     implot.push_colormap(_fneu_colormap())
-                    implot.plot_line(f"{label} Fneu", yneu)
+                    implot.plot_line(f"{label} Fneu", self._windowed(yneu))
                     implot.pop_colormap()
             if self.tdim is not None:
                 moved, frame = implot.drag_line_x(0, float(self.current_frame()), _CURSOR_COLOR, 1.5)[:2]
@@ -2314,6 +2496,18 @@ class ManualRoiWidget:
                     self.set_frame(round(frame))
         finally:
             implot.end_plot()
+
+    def _sorted_trace_rows(self) -> list[tuple]:
+        """Trace-table keys in the order the table shows them, so stepping
+        with the arrows walks what the user sees."""
+        rows = self._trace_rows()
+        col, ascending = self._trace_sort
+
+        def sort_key(key):
+            return (self._trace_shown(key)[0], key[1], *self._trace_stat(key))[col]
+
+        rows.sort(key=sort_key, reverse=not ascending)
+        return rows
 
     def _trace_rows(self) -> list[tuple]:
         """``(origin, name, key)`` per listable trace: collected uid-keyed
@@ -2359,7 +2553,7 @@ class ManualRoiWidget:
         """The right bar's Traces tab: every collected trace with stats;
         click selects one, ctrl+click several — the selection is what the
         top panel plots."""
-        rows = self._trace_rows()
+        rows = self._sorted_trace_rows()
         if not rows:
             imgui.text_disabled(
                 f"No traces yet. Use {TRACE_ICON} on a row of the ROIs tab, or run a process."
@@ -2374,19 +2568,29 @@ class ManualRoiWidget:
         if imgui.small_button("clear"):
             self.trace_sel.clear()
             self._trace_fit = True
+        # stretch, not fit-to-content: the tab is a narrow column and
+        # fixed-width columns ran off its right edge. frames and peak start
+        # hidden — right-click the header to bring them back.
         flags = (
             imgui.TableFlags_.sortable | imgui.TableFlags_.row_bg
             | imgui.TableFlags_.borders_inner_h | imgui.TableFlags_.scroll_y
-            | imgui.TableFlags_.resizable | imgui.TableFlags_.sizing_fixed_fit
+            | imgui.TableFlags_.resizable | imgui.TableFlags_.hideable
+            | imgui.TableFlags_.sizing_stretch_prop
         )
         avail = imgui.get_content_region_avail()
-        if not imgui.begin_table("##trace_table", 6, flags, imgui.ImVec2(0, avail.y)):
+        if not imgui.begin_table("##trace_table", len(TRACE_COLUMNS), flags, imgui.ImVec2(0, avail.y)):
             return
         imgui.table_setup_scroll_freeze(0, 1)
-        imgui.table_setup_column("roi", imgui.TableColumnFlags_.default_sort)
-        for name in ("source", "frames", "mean", "peak", "snr"):
-            imgui.table_setup_column(name)
+        stretch = imgui.TableColumnFlags_.width_stretch
+        for i, (name, weight, hidden) in enumerate(TRACE_COLUMNS):
+            column_flags = stretch
+            if i == 0:
+                column_flags |= imgui.TableColumnFlags_.default_sort
+            if hidden:
+                column_flags |= imgui.TableColumnFlags_.default_hide
+            imgui.table_setup_column(name, column_flags, weight)
         imgui.table_headers_row()
+        set_tooltip("Right-click a header to show or hide columns", show_mark=False)
         specs = imgui.table_get_sort_specs()
         if specs is not None and specs.specs_dirty:
             if specs.specs_count > 0:
@@ -2395,13 +2599,6 @@ class ManualRoiWidget:
                     specs.specs.sort_direction == imgui.SortDirection.ascending,
                 )
             specs.specs_dirty = False
-        col, ascending = self._trace_sort
-
-        def sort_key(key):
-            stats = self._trace_stat(key)
-            return (self._trace_shown(key)[0], key[1], *stats)[col]
-
-        rows.sort(key=sort_key, reverse=not ascending)
         ctrl = imgui.get_io().key_ctrl
         for key in rows:
             origin, name, k = key
@@ -2415,151 +2612,15 @@ class ManualRoiWidget:
             )
             if clicked:
                 if ctrl:
-                    (self.trace_sel.discard if picked else self.trace_sel.add)(key)
+                    self.toggle_trace(key)
                 else:
-                    self.trace_sel = {key}
-                    if origin == "uid":
-                        index = self.store.uid_index(k)
-                        if index is not None:
-                            self.select_roi(index)
-                    else:
-                        hit = self._set_by_name(name)
-                        if hit is not None:
-                            self.select_derived(hit[0], k)
-                self._trace_fit = True
+                    self.select_trace(key)
             n, mean, peak, snr = self._trace_stat(key)
-            for text in (name, f"{n}", f"{mean:.1f}", f"{peak:.1f}", f"{snr:.1f}"):
-                imgui.table_next_column()
-                imgui.text(text)
+            source = name + self._binning_tag(key)
+            for text in (source, f"{n}", f"{mean:.1f}", f"{peak:.1f}", f"{snr:.1f}"):
+                if imgui.table_next_column():
+                    imgui.text(text)
         imgui.end_table()
-
-    # ------------------------------------------------------------------
-    # imgui: runs tab
-    # ------------------------------------------------------------------
-
-    def draw_runs(self):
-        """The Runs tab: active runs, finished runs, loaded sets, and run
-        dirs found on disk."""
-        if self._run_dir_dialog is not None and self._run_dir_dialog.ready():
-            result = self._run_dir_dialog.result()
-            self._run_dir_dialog = None
-            if result:
-                self.load_run(Path(result))
-        pm = get_process_manager()
-
-        section("Active")
-        active = self.manager.active
-        if not active:
-            imgui.text_disabled("nothing running")
-        spawned_info = (
-            {p.pid: p for p in pm.get_running()}
-            if any(r.pid is not None for r in active) else {}
-        )
-        for i, run in enumerate(active):
-            imgui.text(run.description)
-            info = run.job if run.job is not None else spawned_info.get(run.pid)
-            if info is not None:
-                imgui.progress_bar(info.progress, imgui.ImVec2(em(12), 0),
-                                   info.status_message or "")
-                imgui.same_line(0, em(0.6))
-                imgui.text_disabled(info.elapsed_str())
-            else:
-                imgui.text_disabled("starting")
-            if run.pid is not None:
-                imgui.same_line(0, em(0.6))
-                if imgui.small_button(f"kill##run{i}"):
-                    self.manager.stop(run, pm)
-
-        section("Done")
-        done = [r for r in self.manager.runs if r.finished]
-        if not done:
-            imgui.text_disabled("no finished runs yet")
-        for i, run in enumerate(done):
-            imgui.text(run.description)
-            if run.error:
-                imgui.same_line(0, em(0.6))
-                imgui.text_colored(to_vec4(THEME.err), run.error)
-            for out in run.out_dirs:
-                imgui.same_line(0, em(0.6))
-                already = any(s.result.path == out for s in self.derived)
-                if imgui.small_button(("reload" if already else "load") + f"##done{i}_{out.name}"):
-                    self.load_run(out)
-
-        section("Loaded sets")
-        if not self.derived:
-            imgui.text_disabled("no run outputs loaded")
-        for si, s in enumerate(list(self.derived)):
-            imgui.color_button(f"##set_chip{si}", to_vec4((*s.color, 1.0)),
-                               0, imgui.ImVec2(em(0.9), em(0.9)))
-            imgui.same_line(0, em(0.4))
-            imgui.text(f"{s.name} ({s.result.kind})")
-            n = len(s.result.stat)
-            promoted = sum(1 for name, _k in self._promoted if name == s.name)
-            settled = {k for name, k in self._promoted if name == s.name} | s.discarded
-            imgui.same_line(0, em(0.6))
-            imgui.text_disabled(
-                f"{n - len(settled)} new · {promoted} promoted · "
-                f"{len(s.discarded)} discarded"
-            )
-            imgui.same_line(0, em(0.6))
-            changed, s.visible = imgui.checkbox(f"visible##set{si}", s.visible)
-            if changed:
-                self._resync()
-                self.refresh_derived_overlay()
-            imgui.same_line(0, em(0.6))
-            if imgui.small_button(f"promote set##set{si}"):
-                self.promote_set(si)
-            imgui.same_line(0, em(0.4))
-            if imgui.small_button(f"restore discarded##set{si}"):
-                self.restore_discarded(si)
-            imgui.same_line(0, em(0.4))
-            if imgui.small_button(f"unload##set{si}"):
-                self.unload_set(si)
-
-        missing = [
-            (i, e) for i, e in enumerate(self._registry_extra)
-            if not run_dir_complete(Path(str(e["path"])))
-        ]
-        if missing:
-            section("Missing")
-            for i, e in missing:
-                imgui.text_disabled(Path(str(e["path"])).name)
-                imgui.same_line(0, em(0.6))
-                imgui.text_colored(to_vec4(THEME.err), "not on disk")
-                imgui.same_line(0, em(0.6))
-                if imgui.small_button(f"forget##miss{i}"):
-                    self._registry_extra.pop(i)
-                    self._save_registry()
-                    break
-
-        section("On disk")
-        if imgui.small_button("rescan"):
-            self._disk_runs = None
-        imgui.same_line(0, em(0.4))
-        if imgui.small_button("load run dir…") and self._run_dir_dialog is None:
-            start = str(labels_path(self.fpath).parent) if self.fpath is not None else str(Path.home())
-            self._run_dir_dialog = pfd.select_folder("Select run directory", start)
-        if self._disk_runs is None:
-            self._disk_runs = scan_run_dirs(self.fpath) if self.fpath is not None else []
-        if not self._disk_runs:
-            imgui.text_disabled("no run dirs beside the data")
-        base = labels_path(self.fpath).parent if self.fpath is not None else None
-        for i, row in enumerate(self._disk_runs):
-            path = row["path"]
-            try:
-                shown = str(path.relative_to(base)) if base is not None else path.name
-            except ValueError:
-                shown = path.name
-            if shown == ".":
-                shown = path.name
-            imgui.text(shown)
-            imgui.same_line(0, em(0.6))
-            imgui.text_disabled(f"{row['kind']}, {row['n_rois']} ROIs")
-            imgui.same_line(0, em(0.6))
-            already = any(s.result.path == path for s in self.derived)
-            if imgui.small_button(("reload" if already else "load") + f"##disk{i}"):
-                self.load_run(path)
-
 
 def attach_roi_widget(parent: Any, focus: bool = False) -> ManualRoiWidget | None:
     """Turn the ROI widget on for a ``PreviewDataWidget``; ROIs and runs from
@@ -2577,6 +2638,8 @@ def attach_roi_widget(parent: Any, focus: bool = False) -> ManualRoiWidget | Non
             label_names=DEFAULT_LABEL_NAMES,
             store=getattr(parent, "_manual_roi_store", None),
             runs=getattr(parent, "_manual_roi_runs", None),
+            strip=getattr(parent, "top_strip", None),
+            host=parent,
         )
     except Exception:
         parent.logger.warning("manual ROI widget unavailable", exc_info=True)

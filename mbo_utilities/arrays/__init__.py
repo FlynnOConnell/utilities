@@ -103,6 +103,10 @@ if TYPE_CHECKING:
         PhaseCorrectedView as PhaseCorrectedView,
         with_phasecorr as with_phasecorr,
     )
+    from mbo_utilities.arrays._average_view import (
+        FrameAveragedView as FrameAveragedView,
+        average_frames as average_frames,
+    )
     from mbo_utilities.arrays.mp4 import MP4Array as MP4Array
     from mbo_utilities.arrays.numpy import NumpyArray as NumpyArray
     from mbo_utilities.arrays.suite2p import (
@@ -151,6 +155,9 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     # phase correction (read-time wrapper)
     "PhaseCorrectedView": ("._phasecorr_view", "PhaseCorrectedView"),
     "with_phasecorr": ("._phasecorr_view", "with_phasecorr"),
+    # temporal frame averaging (read-time wrapper)
+    "FrameAveragedView": ("._average_view", "FrameAveragedView"),
+    "average_frames": ("._average_view", "average_frames"),
     # features subpackage
     "features": (".features", None),
     # ROI mixin
@@ -242,4 +249,7 @@ __all__ = [
     # Phase correction
     "PhaseCorrectedView",
     "with_phasecorr",
+    # Frame averaging
+    "FrameAveragedView",
+    "average_frames",
 ]

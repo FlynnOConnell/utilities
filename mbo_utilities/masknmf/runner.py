@@ -371,21 +371,76 @@ def _stage_compression(
     )
     strat = strat_cls(device=device, **kw)
     nframes = int(moco.shape[0])
-    if cfg.detrend and fs:
-        from masknmf.compression.preprocessing import MaximinSplineDetrend
-
-        strat.detrender = MaximinSplineDetrend(
-            num_frames=nframes,
-            num_knots=max(4, int(nframes / fs / 25)),
-            window=int(40 * fs),
-            sigma=max(2.0, 0.3 * fs),
-            device=device,
+    if cfg.detrend:
+        detrender = _spline_detrender(
+            nframes, fs, 40, 25, device, logger, "compression"
         )
+        if detrender is not None:
+            strat.detrender = detrender
     logger.info("masknmf: running PMD compression")
     pmd = strat.compress(moco)
     _export_atomic(pmd, pmd_path, prov)
     # reload so demixing always consumes the exact persisted decomposition
     return masknmf.PMDArray.from_hdf5(str(pmd_path)), time.time() - t0, key
+
+
+def _spline_detrender(
+    nframes: int, fs, window_seconds: float, knot_seconds: float, device: str,
+    logger=None, stage: str = "",
+):
+    """A ``MaximinSplineDetrend`` for this movie, or None when it is too short.
+
+    The detrender reflect-pads by half its window, and torch refuses a pad
+    wider than the axis, so a movie shorter than the window crashes rather
+    than degrading. High frame rates make that easy to hit — 40 s at 430 Hz is
+    17k frames — so short recordings just skip detrending.
+    """
+    if not fs:
+        return None
+    window = int(window_seconds * fs)
+    if window < 2 or nframes < 2 * window:
+        if logger is not None:
+            logger.info(
+                f"masknmf: {nframes} frames < 2x the {stage} detrend window "
+                f"({window} frames at fs={fs}); detrending disabled"
+            )
+        return None
+
+    from masknmf.compression.preprocessing import MaximinSplineDetrend
+
+    return MaximinSplineDetrend(
+        num_frames=nframes,
+        num_knots=max(4, int(nframes / fs / knot_seconds)),
+        window=window,
+        sigma=max(2.0, 0.3 * fs),
+        device=device,
+    )
+
+
+def clamp_background_downsampling(cfg, ly: int, lx: int, logger=None):
+    """A copy of ``cfg`` whose background downsampling fits an ``(ly, lx)`` field.
+
+    masknmf's ring/background model average-pools the field by this factor and
+    squeezes the result. Pooling is floor division, so a factor at or above a
+    side length collapses that axis to one pixel, the squeeze drops it, and
+    ``lowrank_background_svd`` raises ``IndexError: tuple index out of range``
+    on the reshape that follows. The default factor is 30, which any field
+    narrower than 30 px hits — an LBM strip, a drawn crop, a test movie. Keep
+    at least four pooled pixels on the short side.
+    """
+    import copy
+
+    want = max(1, min(int(cfg.background_downsampling_factor), min(int(ly), int(lx)) // 4))
+    if want == cfg.background_downsampling_factor:
+        return cfg
+    out = copy.copy(cfg)
+    out.background_downsampling_factor = want
+    if logger is not None:
+        logger.info(
+            f"masknmf: background downsampling {cfg.background_downsampling_factor} -> {want} "
+            f"for a {ly}x{lx} field"
+        )
+    return out
 
 
 def _stage_demixing(
@@ -401,6 +456,8 @@ def _stage_demixing(
 
     import masknmf
 
+    # before the provenance hash, so the cache key reflects what actually ran
+    cfg = clamp_background_downsampling(cfg, pmd.shape[1], pmd.shape[2], logger)
     prov = {"settings": _stage_hash(cfg, "do_demixing"), "input": upstream_key, "fs": fs}
     if action == "reuse" and upstream_computed:
         logger.info("masknmf: upstream stage recomputed; recomputing demixing")
@@ -424,18 +481,9 @@ def _stage_demixing(
     from masknmf.demixing import NoSignalsDetectedError
 
     t0 = time.time()
-    detrender = None
-    if fs:
-        from masknmf.compression.preprocessing import MaximinSplineDetrend
-
-        nframes = int(pmd.shape[0])
-        detrender = MaximinSplineDetrend(
-            num_frames=nframes,
-            num_knots=max(4, int(nframes / fs / 20)),
-            window=int(20 * fs),
-            sigma=max(2.0, 0.3 * fs),
-            device=device,
-        )
+    detrender = _spline_detrender(
+        int(pmd.shape[0]), fs, 20, 20, device, logger, "demixing"
+    )
 
     def _empty_cache():
         if device.startswith("cuda"):

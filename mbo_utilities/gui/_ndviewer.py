@@ -1100,9 +1100,36 @@ class MboNDViewer:
         vmax = getattr(g, "vmax", None)
         # _create_graphic re-fetches through the (now float-casting)
         # processor, carries cmap over, and rebinds the colorbar — but it
-        # also resets vmin/vmax, so restore the snapshot after
+        # also resets vmin/vmax and re-frames the camera, so snapshot both.
+        # The camera matters beyond losing the user's pan/zoom: show_object
+        # parks it at the new graphic's depth, which put it *on* the manual
+        # ROI overlays (they sit a unit in front of the image) and clipped
+        # them away for good — a gaussian sigma made the masks vanish.
+        subplot = ndg._nd_subplot.subplot
+        camera_state = None
+        with contextlib.suppress(Exception):
+            camera_state = subplot.camera.get_state()
+        # fastplotlib stacks graphics in z by the order they are added, so a
+        # delete + add sends the image to the FRONT slot and pushes anything
+        # added after it (the manual ROI overlays) behind — the masks vanish
+        # and never come back. Snapshot the stacking and restore it.
+        z_before = {id(gr): float(gr.offset[2]) for gr in subplot.graphics}
+        old_z = float(g.offset[2])
+
         with contextlib.suppress(Exception):
             run_sync(ndg._create_graphic())
+
+        new = ndg.graphic
+        with contextlib.suppress(Exception):
+            if new is not None:
+                new.offset = (*new.offset[:2], old_z)
+            for gr in subplot.graphics:
+                z = z_before.get(id(gr))
+                if z is not None and gr is not new:
+                    gr.offset = (*gr.offset[:2], z)
+        if camera_state is not None:
+            with contextlib.suppress(Exception):
+                subplot.camera.set_state(camera_state)
         cb = ndg.histogram_widget
         target = cb if cb is not None else ndg.graphic
         if target is not None and vmin is not None and vmax is not None:

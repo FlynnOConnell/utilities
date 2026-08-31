@@ -77,6 +77,39 @@ class WindowFunctionsWidget(Widget):
         if winsize_changed and new_winsize > 0 and new_winsize != parent.window_size:
             parent.window_size = new_winsize
 
+        self._draw_apply(parent)
+
+    @staticmethod
+    def _draw_apply(parent: Any) -> None:
+        """The checkbox that turns the window size into a pipeline step.
+
+        Ticking it bins the dataset itself by the current window size and
+        resets the size to 1, so the control above then applies a window
+        *over the averaged frames*. Everything downstream — traces, extract,
+        demix, save — reads the averaged array, so what you see is what gets
+        processed.
+        """
+        averaged = getattr(parent, "frame_average", 1)
+        locked = averaged > 1
+        changed, want = imgui.checkbox("Apply to dataset", locked)
+        set_tooltip(
+            "Average the dataset itself by the window size, the way scan-phase"
+            " correction is applied: the viewer, the ROI traces and any run"
+            " started from here all use the averaged frames. "
+            "The window size resets to 1, so it then applies on top."
+        )
+        if changed:
+            if want:
+                parent.frame_average = parent.window_size
+            else:
+                parent.frame_average = 1
+        if locked:
+            imgui.same_line(0, hello_imgui.em_size(0.5))
+            imgui.text_colored(
+                imgui.ImVec4(0.6, 0.8, 0.6, 1.0), f"{averaged} frames averaged"
+            )
+            set_tooltip("Untick to get the raw frames back.")
+
 
 class SpatialFunctionsWidget(Widget):
     """ui widget for spatial functions (gaussian blur, mean subtraction, colormap)."""

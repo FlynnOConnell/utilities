@@ -25,8 +25,9 @@ the imgui/pygfx shell; everything here imports numpy/zarr only.
 
 ## Abstraction seam with masknmf-toolbox
 
-masknmf's `masknmf/visualization/imgui/` README lists the shared-GUI-code
-candidates on its side (picking, selection wiring, panels). This package is
+The shared imgui widgets that used to come from `masknmf.visualization.imgui`
+(label set, ROI table, stroke capture, panels, summary popup) now live in
+`mbo_utilities/gui/imgui/`, so the viewer does not track a masknmf branch. This package is
 the counterpart on the mbo side, and the split here is drawn so a future
 shared package is a file move, not a refactor:
 

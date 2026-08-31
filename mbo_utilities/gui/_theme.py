@@ -137,3 +137,33 @@ def label_button(rgb):
 
 def danger_button(theme: Theme = THEME):
     return button_colors(theme.danger, theme.danger_hover)
+
+
+# status text and canvas overlay colours, as ImVec4 so draw code can use them
+# without going through the dataclass
+OK = to_vec4(THEME.ok)
+WARN = to_vec4(THEME.warn)
+ERROR = to_vec4(THEME.err)
+CODE = to_vec4(THEME.code)
+HINT = imgui.ImVec4(1.00, 0.85, 0.40, 1.0)
+HIGHLIGHT = imgui.ImVec4(1.00, 0.90, 0.20, 0.9)
+CONTOUR = imgui.ImVec4(0.20, 1.00, 0.40, 0.9)
+TEXT_ON_DARK = imgui.ImVec4(1.0, 1.0, 1.0, 1.0)
+TEXT_ON_LIGHT = imgui.ImVec4(0.0, 0.0, 0.0, 1.0)
+LUMA_LIGHT = 140  # 0-255 luma above which TEXT_ON_LIGHT is used
+
+
+def label_color(rgb, alpha: float = 1.0) -> imgui.ImVec4:
+    """Class colour tuple from ``LabelSet.color`` as an ImVec4."""
+    r, g, b = rgb[:3]
+    return imgui.ImVec4(r, g, b, alpha)
+
+
+def u32(color) -> int:
+    """Packed colour for draw-list calls."""
+    return imgui.color_convert_float4_to_u32(to_vec4(color))
+
+
+def text_on(luma: float) -> int:
+    """Packed overlay text colour that reads against a pixel of the given luma."""
+    return u32(TEXT_ON_LIGHT if luma > LUMA_LIGHT else TEXT_ON_DARK)

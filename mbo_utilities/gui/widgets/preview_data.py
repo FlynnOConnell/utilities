@@ -143,6 +143,22 @@ def _derive_suite2p_output_dir(fpath) -> str | None:
     return None
 
 
+def _base_5d(arr):
+    """Peel the viewer's display wrappers (`_ScrubTimingProxy`,
+    `_SqueezeSingletonDims`, a `FrameAveragedView`) back to the 5D array the
+    frame-averaging view should wrap."""
+    from mbo_utilities.arrays import FrameAveragedView
+    from mbo_utilities.gui.run_gui import _ScrubTimingProxy, _SqueezeSingletonDims
+
+    while True:
+        if isinstance(arr, _ScrubTimingProxy):
+            arr = arr._wrapped
+        elif isinstance(arr, (_SqueezeSingletonDims, FrameAveragedView)):
+            arr = arr._arr
+        else:
+            return arr
+
+
 class PreviewDataWidget(EdgeWindow):
     """
     Main GUI widget for data preview and processing.
@@ -168,8 +184,11 @@ class PreviewDataWidget(EdgeWindow):
     """
 
     # built on demand by sync_manual_roi() when the Widgets menu entry is on;
-    # owns the figure's top strip (controls) and the right-widget tabs
+    # registers its panels on the top strip and owns the right-widget tabs
     manual_roi = None
+
+    # the figure's top edge: menu row plus the registered full-width panels
+    top_strip = None
 
     def __init__(
         self,
@@ -651,9 +670,39 @@ class PreviewDataWidget(EdgeWindow):
         self._saveas_video_scalebar = False
         self._saveas_video_upscale = 0  # 0 = auto
 
+    def _init_top_strip(self):
+        """Claim the figure's top edge for the menu row.
+
+        The strip spans the canvas's full width, so it is also where the
+        panels that want that width register themselves — Manual ROI's ROI
+        and Traces cards, the Signal Quality plot.
+        """
+        from mbo_utilities.gui._top_strip import TopStrip
+
+        self.top_strip = TopStrip(
+            self.image_widget.figure, draw_menu=lambda: draw_menu_bar(self)
+        )
+
+    def _sync_top_panels(self) -> None:
+        """Register / drop the top panels this widget owns, per frame."""
+        from mbo_utilities.gui._top_strip import TopPanel
+        from mbo_utilities.gui.widgets.widget_toggles import widget_enabled
+
+        want = widget_enabled("signal_quality") and any(self._zstats_done)
+        if want and not self.top_strip.has("zstats"):
+            self.top_strip.register(
+                TopPanel(
+                    "zstats", "Signal Quality", self.draw_stats_plot,
+                    height=260, right_tab="signal_quality", priority=20,
+                )
+            )
+        elif not want:
+            self.top_strip.unregister("zstats")
+
     def _init_viewer(self):
         """Initialize the viewer based on data type."""
         from mbo_utilities.gui.viewers import get_viewer_class
+        self._init_top_strip()
         viewer_cls = get_viewer_class(self.image_widget.data[0])
         self._viewer = viewer_cls(self.image_widget, self.fpath, parent=self)
         self.logger.debug(f"Viewer: {self._viewer.name}")
@@ -922,6 +971,91 @@ class PreviewDataWidget(EdgeWindow):
     @auto_contrast_on_z.setter
     def auto_contrast_on_z(self, value: bool):
         self._auto_contrast_on_z = value
+
+    @property
+    def frame_average(self) -> int:
+        """Source frames averaged into each displayed frame (1 = off).
+
+        Unlike the window functions, which project over a sliding window for
+        display only, this is a step in the data pipeline: the array itself
+        is wrapped so every consumer — the display, the ROI traces, extract /
+        demix, the pipelines and the writers — sees the averaged frames, the
+        way ``fix_phase`` is baked in before anything downstream reads.
+        """
+        return self._frame_average
+
+    @frame_average.setter
+    def frame_average(self, value: int):
+        value = max(1, int(value))
+        source = self._frame_average_source or _base_5d(self.image_widget.data[0])
+        nt = int(source.shape[0]) if len(source.shape) == 5 else 1
+        value = min(value, max(nt, 1))
+        if value == self._frame_average:
+            return
+        self._apply_frame_average(source, value)
+
+    def _apply_frame_average(self, source, factor: int) -> None:
+        """Swap the viewer onto (or off) a ``FrameAveragedView`` of ``source``.
+
+        T changes, so this is the same swap File -> Open does — stale window
+        funcs and spatial closures dropped, indices reset, z-stats recomputed,
+        playback re-seeded — with one difference: the ROI store survives,
+        because masks are (Z, Y, X) and averaging only touches T.
+        """
+        from mbo_utilities.arrays import average_frames
+        from mbo_utilities.gui.manual_roi import attach_roi_widget, detach_roi_widget
+        from mbo_utilities.gui.run_gui import _squeeze_for_viewer
+
+        iw = self.image_widget
+        wrapped = _squeeze_for_viewer(average_frames(source, factor))
+
+        roi_was_on = getattr(self, "manual_roi", None) is not None
+        if roi_was_on:
+            try:
+                detach_roi_widget(self)  # keeps the store and parked runs
+            except Exception:
+                self.logger.debug("manual ROI teardown failed", exc_info=True)
+                self.manual_roi = None
+
+        # the window funcs and the spatial closure are bound to the old t-rank
+        self._window_size = 1
+        if hasattr(self, "_rebuild_spatial_func"):
+            self._rebuild_spatial_func()
+        for proc in getattr(iw, "_image_processors", []):
+            proc.window_funcs = None
+            proc.window_sizes = None
+            proc.window_order = None
+
+        iw.data[0] = wrapped
+        if iw.n_sliders > 0:
+            iw.indices = [0] * iw.n_sliders
+
+        self._frame_average = factor
+        self._frame_average_source = source if factor > 1 else None
+        self.shape = wrapped.shape
+        if len(self.shape) == 5:
+            self.nc, self.nz = self.shape[1], self.shape[2]
+        elif len(self.shape) == 4:
+            self.nc, self.nz = 1, self.shape[1]
+        else:
+            self.nc = self.nz = 1
+        self.set_context_info()
+        self._refresh_widgets()
+
+        try:
+            self._seed_playback_fps()
+        except Exception:
+            self.logger.debug("playback fps seed skipped", exc_info=True)
+        try:
+            self.refresh_zstats()
+        except Exception:
+            self.logger.debug("zstats refresh skipped", exc_info=True)
+
+        if roi_was_on:
+            attach_roi_widget(self)
+        self.logger.info(
+            f"frame averaging {'off' if factor == 1 else factor}: shape {self.shape}"
+        )
 
     @property
     def window_size(self) -> int:
@@ -1300,14 +1434,14 @@ class PreviewDataWidget(EdgeWindow):
         except Exception:
             self.logger.debug("raw projection refresh skipped", exc_info=True)
 
-        draw_menu_bar(self)
+        self._sync_top_panels()
         t1 = time.perf_counter()
         # wrap text at the panel edge everywhere the viewer draws directly;
         # each tab's child re-applies it (imgui wraps per window)
         with fit_width():
             self._viewer.draw()
         t2 = time.perf_counter()
-        menu_ms = (t1 - t0) * 1000
+        menu_ms = (t1 - t0) * 1000  # top-panel bookkeeping, the menu draws in the strip
         draw_ms = (t2 - t1) * 1000
         if gap_ms > 100 or menu_ms > 50 or draw_ms > 50:
             self.logger.debug(
@@ -1344,8 +1478,13 @@ class PreviewDataWidget(EdgeWindow):
                 self.image_widget.reset_vmin_vmax_frame()
 
     def draw_stats_section(self):
-        """Draw z-stats visualization."""
-        draw_stats_section(self)
+        """The Signal Quality tab: the metric table (the plot is the top
+        strip's ``Signal Quality`` panel, which has the width for it)."""
+        draw_stats_section(self, plot=False)
+
+    def draw_stats_plot(self):
+        """The Signal Quality top panel: the plot, full canvas width."""
+        draw_stats_section(self, table=False)
 
     def draw_preview_section(self):
         """Draw preview section using modular UI widgets."""
@@ -1370,6 +1509,10 @@ class PreviewDataWidget(EdgeWindow):
         cleanup_pipelines(self)
         cleanup_all_widgets(self._widgets)
         self.sync_manual_roi(False)
+        strip = getattr(self, "top_strip", None)
+        if strip is not None:
+            strip.close()
+            self.top_strip = None
 
         self._file_dialog = None
         self._folder_dialog = None

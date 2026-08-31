@@ -91,6 +91,17 @@ class RoiRun:
     loaded: bool = False
 
 
+def _raised_at(error: BaseException) -> str:
+    """`` (file.py:123)`` for the innermost frame of ``error``, or ""."""
+    import traceback
+
+    frames = traceback.extract_tb(error.__traceback__)
+    if not frames:
+        return ""
+    last = frames[-1]
+    return f" ({Path(last.filename).name}:{last.lineno})"
+
+
 class RoiRunManager:
     """Submit, poll and stop the ROI widget's background runs.
 
@@ -132,8 +143,9 @@ class RoiRunManager:
                     payload = fn(job)
             except Exception as error:  # noqa: BLE001 - reported on the job
                 self.logger.exception(f"{run.description} failed")
-                job.fail(f"{type(error).__name__}: {error}")
-                self._results.put((run, None, str(error)))
+                message = f"{type(error).__name__}: {error}{_raised_at(error)}"
+                job.fail(message)
+                self._results.put((run, None, message))
                 return
             job.done()
             self._results.put((run, payload, None))

@@ -325,7 +325,8 @@ def _reset_per_data_state(parent: Any) -> None:
     on every load, but the bound parent attributes persist unless
     explicitly cleared here. Without this, opening a new file leaves
     the previous file's gaussian sigma, projection mode, window size,
-    auto-contrast toggle, and mean-subtraction checkbox in place.
+    frame averaging, auto-contrast toggle, and mean-subtraction checkbox in
+    place.
 
     Mirror the defaults in `PreviewDataWidget._init_state` so a reload
     starts in the same state as initial launch.
@@ -339,6 +340,10 @@ def _reset_per_data_state(parent: Any) -> None:
     # window functions
     parent._proj = "mean"
     parent._window_size = 1
+    # frame averaging: off, and the un-averaged array it would restore is
+    # the old file's, so it goes too
+    parent._frame_average = 1
+    parent._frame_average_source = None
     # contrast / z-tracking
     parent._auto_contrast_on_z = False
     parent._last_z_idx = 0

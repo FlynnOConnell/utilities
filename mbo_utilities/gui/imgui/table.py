@@ -1,0 +1,285 @@
+from typing import Callable, NamedTuple, Optional, Sequence
+
+import numpy as np
+from imgui_bundle import imgui
+
+from mbo_utilities.gui import _theme as theme
+from mbo_utilities.gui.imgui.labels import UNLABELED
+
+FILTER_ALL = -2
+
+
+class RowAction(NamedTuple):
+    """
+    One icon button in the table's trailing actions column.
+
+    Parameters
+    ----------
+    icon : str
+        Glyph drawn on the button; the name belongs in ``tooltip``.
+    tooltip : str
+        Hover text.
+    on_click : Callable[[int], None]
+        Called with the ROI index on press.
+    disabled : Callable[[int], Optional[str]], optional
+        Why the action cannot run for that ROI; greys the button and replaces
+        the tooltip. ``None`` means available.
+    """
+
+    icon: str
+    tooltip: str
+    on_click: Callable[[int], None]
+    disabled: Optional[Callable[[int], Optional[str]]] = None
+
+
+class RoiOrder:
+    """Filter + stable sort over per-ROI columns; yields the visible index order."""
+
+    def __init__(self, columns: dict, labels: np.ndarray, n_items: int):
+        self.columns = columns
+        self.labels = labels
+        self.n_items = n_items
+        self.filter_label = FILTER_ALL
+        self.range_column: Optional[str] = None
+        self.range_limits = (0, 0)
+        self.sort_column = 0
+        self.ascending = True
+        self.order = np.arange(n_items)
+        self.pos = 0
+
+    def set_range_column(self, name: str):
+        self.range_column = name
+        values = self.columns[name]
+        self.range_limits = (0, int(np.max(values, initial=0)))
+
+    @property
+    def current(self) -> Optional[int]:
+        if len(self.order) == 0:
+            return None
+        return int(self.order[self.pos])
+
+    def rebuild(self):
+        current = self.current
+        mask = np.ones(self.n_items, dtype=bool)
+        if self.range_column is not None:
+            values = self.columns[self.range_column]
+            mask &= (values >= self.range_limits[0]) & (values <= self.range_limits[1])
+        if self.filter_label >= UNLABELED:
+            mask &= self.labels == self.filter_label
+        idx = np.flatnonzero(mask)
+        if self.sort_column:
+            # keys has no entry for column 0, the id, which is the natural order
+            keys = [self.labels, *self.columns.values()]
+            idx = idx[np.argsort(keys[self.sort_column - 1][idx], kind="stable")]
+        if not self.ascending:
+            idx = idx[::-1]
+        self.order = idx
+        hits = np.flatnonzero(self.order == current) if current is not None else ()
+        self.pos = int(hits[0]) if len(hits) else int(min(self.pos, max(len(idx) - 1, 0)))
+
+    def step(self, delta: int) -> bool:
+        if not len(self.order):
+            return False
+        self.pos = int(np.clip(self.pos + delta, 0, len(self.order) - 1))
+        return True
+
+    def goto(self, item: int) -> bool:
+        hits = np.flatnonzero(self.order == item)
+        if not len(hits):
+            return False
+        self.pos = int(hits[0])
+        return True
+
+    def hidden_by(self, item: int) -> list:
+        """Names of the filters that keep ``item`` out of the current view."""
+        out = []
+        if self.filter_label >= UNLABELED and int(self.labels[item]) != self.filter_label:
+            out.append("label")
+        if self.range_column is not None:
+            value = self.columns[self.range_column][item]
+            if not self.range_limits[0] <= value <= self.range_limits[1]:
+                out.append(self.range_column)
+        return out
+
+    def clear_filter(self, name: str):
+        if name == "label":
+            self.filter_label = FILTER_ALL
+        elif name == self.range_column:
+            self.set_range_column(self.range_column)
+
+    def reveal(self, item: int) -> list:
+        """Put ``item`` under the cursor, dropping whatever filters hide it.
+
+        Returns the filters cleared, so a caller that reveals a row the user
+        had filtered away can say which ones it undid.
+        """
+        cleared = self.hidden_by(item)
+        for name in cleared:
+            self.clear_filter(name)
+        if cleared:
+            self.rebuild()
+        self.goto(item)
+        return cleared
+
+    def next_unlabeled(self) -> bool:
+        """First unlabeled item after the cursor, wrapping."""
+        hits = np.flatnonzero(self.labels[self.order] < 0)
+        if not len(hits):
+            return False
+        after = hits[hits > self.pos]
+        self.pos = int(after[0] if len(after) else hits[0])
+        return True
+
+    def step_group(self, direction: int) -> bool:
+        """First item in view of the next/previous label class."""
+        if self.current is None:
+            return False
+        labels = self.labels[self.order]
+        values = np.unique(labels)
+        if len(values) < 2:
+            return False
+        i = int(np.flatnonzero(values == int(self.labels[self.current]))[0])
+        target = values[(i + direction) % len(values)]
+        self.pos = int(np.flatnonzero(labels == target)[0])
+        return True
+
+
+def draw_roi_table(
+    order: RoiOrder,
+    label_set,
+    column_names: Sequence[str],
+    formatters: dict,
+    scroll_to_current: bool,
+    table_id: str = "rois",
+    on_select: Optional[Callable[[int], None]] = None,
+    actions: Sequence[RowAction] = (),
+) -> bool:
+    """
+    Sortable, clipped ROI table. Returns the new scroll_to_current flag.
+
+    column_names[0] is the id column; "label" is drawn in its class colour.
+    `actions` adds a trailing, unsortable column of icon buttons per row. Buttons sit
+    over the row's selectable, so clicking one does not change the selection.
+    """
+    flags = (
+        imgui.TableFlags_.sortable
+        | imgui.TableFlags_.row_bg
+        | imgui.TableFlags_.resizable
+        | imgui.TableFlags_.scroll_y
+    )
+    avail = imgui.get_content_region_avail()
+    n_columns = len(column_names) + bool(actions)
+    if not imgui.begin_table(table_id, n_columns, flags, imgui.ImVec2(0, avail.y)):
+        return scroll_to_current
+    imgui.table_setup_scroll_freeze(0, 1)
+    imgui.table_setup_column(column_names[0], imgui.TableColumnFlags_.default_sort)
+    for name in column_names[1:]:
+        imgui.table_setup_column(name)
+    if actions:
+        imgui.table_setup_column(
+            "##actions",
+            imgui.TableColumnFlags_.no_sort | imgui.TableColumnFlags_.width_fixed,
+            len(actions) * imgui.get_font_size() * 2.0,
+        )
+    imgui.table_headers_row()
+
+    specs = imgui.table_get_sort_specs()
+    if specs is not None and specs.specs_dirty:
+        if specs.specs_count > 0:
+            order.sort_column = int(specs.specs.column_index)
+            order.ascending = specs.specs.sort_direction == imgui.SortDirection.ascending
+        specs.specs_dirty = False
+        order.rebuild()
+
+    clipper = imgui.ListClipper()
+    clipper.begin(len(order.order))
+    if scroll_to_current:
+        clipper.include_item_by_index(order.pos)
+    while clipper.step():
+        for row in range(clipper.display_start, clipper.display_end):
+            item = int(order.order[row])
+            imgui.table_next_row()
+            imgui.table_next_column()
+            sel_flags = imgui.SelectableFlags_.span_all_columns
+            if actions:
+                sel_flags |= imgui.SelectableFlags_.allow_overlap
+            clicked, _ = imgui.selectable(
+                f"{item}##row{row}", row == order.pos, sel_flags,
+            )
+            if clicked:
+                order.pos = row
+                if on_select is not None:
+                    on_select(item)
+            if row == order.pos and scroll_to_current:
+                imgui.set_scroll_here_y(0.5)
+                scroll_to_current = False
+            for name in column_names[1:]:
+                imgui.table_next_column()
+                if name == "label":
+                    label = int(label_set.labels[item])
+                    if label >= 0:
+                        imgui.text_colored(theme.label_color(label_set.color(label)), label_set.names[label])
+                    else:
+                        imgui.text("-")
+                else:
+                    imgui.text(formatters[name](item))
+            if actions:
+                imgui.table_next_column()
+                _draw_row_actions(actions, item, row)
+    imgui.end_table()
+    return scroll_to_current
+
+
+def _draw_row_actions(actions: Sequence[RowAction], item: int, row: int):
+    """Icon buttons for one row; `row` only keeps the imgui ids unique."""
+    for k, action in enumerate(actions):
+        if k:
+            imgui.same_line(0, 2)
+        reason = action.disabled(item) if action.disabled is not None else None
+        if reason is not None:
+            imgui.begin_disabled()
+        if imgui.small_button(f"{action.icon}##act{k}_{row}"):
+            action.on_click(item)
+        if reason is not None:
+            imgui.end_disabled()
+        if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
+            imgui.set_tooltip(reason or action.tooltip)
+
+
+def draw_label_filter(order: RoiOrder, label_set, id_suffix: str = "", width: float = -1) -> bool:
+    """The label filter combo on its own, so a caller can put another filter
+    beside it. Does not rebuild; returns True if the selection changed."""
+    names = ("all", "unlabeled", *label_set.names)
+    imgui.set_next_item_width(width)
+    changed, sel = imgui.combo(f"##filter{id_suffix}", order.filter_label + 2, list(names))
+    if changed:
+        order.filter_label = sel - 2
+    return changed
+
+
+def draw_range_filter(order: RoiOrder, id_suffix: str = "", width: float = -1) -> bool:
+    """The range slider for ``order.range_column``, or nothing when no column
+    is set. Does not rebuild; returns True if the limits changed."""
+    if order.range_column is None:
+        return False
+    values = order.columns[order.range_column]
+    imgui.set_next_item_width(width)
+    changed, lo, hi = imgui.drag_int_range2(
+        f"##range{id_suffix}",
+        order.range_limits[0], order.range_limits[1], 1, 0,
+        int(np.max(values, initial=0)),
+        f"{order.range_column} >= %d", f"{order.range_column} <= %d",
+    )
+    if changed:
+        order.range_limits = (lo, hi)
+    return changed
+
+
+def draw_filter_row(order: RoiOrder, label_set, id_suffix: str = "") -> bool:
+    """Label filter combo + optional range slider. Returns True if the view changed."""
+    changed_any = draw_label_filter(order, label_set, id_suffix)
+    changed_any |= draw_range_filter(order, id_suffix)
+    imgui.text(f"{len(order.order)}/{order.n_items} in view")
+    if changed_any:
+        order.rebuild()
+    return changed_any

@@ -71,6 +71,35 @@ _STALE_WARNED: set = set()
 _STALE_WARNED_MAX = 256
 
 
+def scale_frame_rate(metadata: dict, factor: float) -> dict:
+    """A copy of ``metadata`` retimed for ``factor`` source frames per frame.
+
+    Temporal binning (``FrameAveragedView``) divides the frame rate. Every
+    *registered* rate spelling is divided and every interval spelling
+    multiplied, rather than a hand-picked few: a single alias left claiming
+    the original rate makes ``resolve_effective_rate`` warn about a stale
+    alias, and anything reading ``fps`` or ``dt`` straight out of the dict
+    would silently get the pre-binning number.
+
+    Nested OME ``multiscales`` time scales are left alone; those describe the
+    file on disk, not this view.
+    """
+    factor = float(factor)
+    if factor == 1.0:
+        return dict(metadata)
+    out = dict(metadata)
+    for key, value in metadata.items():
+        entry = _RATE_PRECEDENCE.get(str(key).lower())
+        kind = entry[1] if entry else ("interval" if key == "_ome_time_scale" else None)
+        if kind is None:
+            continue
+        numeric = _rate_value(value)
+        if numeric is None:
+            continue
+        out[key] = numeric * factor if kind == "interval" else numeric / factor
+    return out
+
+
 def _rate_value(val: Any) -> float | None:
     """Numeric, non-zero, finite value or None."""
     if val is None or isinstance(val, bool):

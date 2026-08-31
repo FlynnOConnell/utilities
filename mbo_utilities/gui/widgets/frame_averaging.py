@@ -1,8 +1,11 @@
-"""
-frame averaging widget for piezo stacks.
+"""Frame averaging: what the temporal binning is currently doing.
 
-shows ui for toggling frame averaging on piezo stack data
-that has framesPerSlice > 1 and was not pre-averaged.
+Two unrelated kinds of averaging land here. The first is temporal binning of
+the dataset itself, armed from the Window Functions panel ("Apply to dataset")
+and applied by a ``FrameAveragedView``; this widget is its readout — how many
+source frames go into a frame, and what that did to the frame count and rate.
+The second is piezo ``framesPerSlice`` averaging, which collapses the repeats
+acquired at one z position and is a property of the reader.
 """
 
 from typing import Any
@@ -22,17 +25,52 @@ class FrameAveragingWidget(Widget):
 
     @classmethod
     def is_supported(cls, parent: Any) -> bool:
-        """show only for piezo arrays that can average frames."""
-        arrays = parent._get_data_arrays()
-        for arr in arrays:
-            # check if this is a PiezoArray with averaging capability
+        """Shown for any array with a time axis (the temporal-binning
+        readout), and for piezo arrays that can average their repeats."""
+        for arr in parent._get_data_arrays():
             if hasattr(arr, "frames_per_slice") and hasattr(arr, "can_average"):
                 return True
-        return False
+        shape = getattr(parent, "shape", None)
+        return bool(shape) and len(shape) >= 3 and shape[0] > 1
+
+    def _draw_temporal(self, parent: Any) -> None:
+        """What "Apply to dataset" in Window Functions is currently doing."""
+        factor = getattr(parent, "frame_average", 1)
+        imgui.spacing()
+        imgui.text_colored(imgui.ImVec4(0.8, 0.8, 0.2, 1.0), "Temporal Binning")
+        imgui.spacing()
+        if factor <= 1:
+            imgui.text_disabled("off")
+            set_tooltip(
+                "Set a window size in Window Functions and tick"
+                ' "Apply to dataset" to bin the data itself.'
+            )
+            return
+        source = getattr(parent, "_frame_average_source", None)
+        nt = int(parent.shape[0]) if getattr(parent, "shape", None) else 0
+        was = int(source.shape[0]) if source is not None else nt * factor
+        imgui.text_colored(
+            imgui.ImVec4(0.6, 0.8, 0.6, 1.0), f"{factor} frames averaged"
+        )
+        set_tooltip(
+            "Every frame here is the mean of this many source frames. It is a"
+            " pipeline step, so ROI traces and any run started from this"
+            " viewer use the averaged data too."
+        )
+        imgui.text(f"Frames: {was} -> {nt}")
+        fs = None
+        arrays = parent._get_data_arrays()
+        if arrays:
+            meta = getattr(arrays[0], "metadata", None) or {}
+            fs = meta.get("fs")
+        if isinstance(fs, (int, float)) and fs:
+            imgui.text(f"Rate: {fs * factor:.4g} -> {fs:.4g} Hz")
+            set_tooltip("Downstream code reads the binned rate, so windows stay in seconds.")
 
     def draw(self) -> None:
         """draw frame averaging controls."""
         parent = self.parent
+        self._draw_temporal(parent)
         arrays = parent._get_data_arrays()
 
         # find piezo arrays with averaging support

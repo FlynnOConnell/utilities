@@ -25,6 +25,7 @@ from .params import (
     get_voxel_size,
     normalize_resolution,
     normalize_metadata,
+    scale_frame_rate,
 )
 
 from .scanimage import (
@@ -106,6 +107,7 @@ __all__ = [
     "get_frames_per_volume",
     # parameter access
     "get_param",
+    "scale_frame_rate",
     "get_roi_info",
     "get_voxel_size",
     "get_z_step_size",

@@ -526,8 +526,15 @@ def _draw_axis_pick(parent: Any, spec: SummaryStatsSpec) -> None:
     imgui.separator()
 
 
-def draw_stats_section(parent: Any):
-    """Draw the summary-stats visualization section."""
+def draw_stats_section(parent: Any, *, table: bool = True, plot: bool = True):
+    """Draw the summary-stats section.
+
+    The two halves are drawn in different places: the table (with the header,
+    axis pick and graphic selector that steer it) sits in the Signal Quality
+    tab, the plot in the top strip's Signal Quality panel where it has the
+    canvas's full width. Both read the same state, so the row highlight and
+    the accent line still mark the same series position.
+    """
     if not any(parent._zstats_done):
         return
 
@@ -541,18 +548,19 @@ def draw_stats_section(parent: Any):
     is_single_zplane = n_stat == 1  # Single bar for 1 series point
     is_dual_zplane = n_stat == 2    # Grouped bars for 2 series points
 
-    if is_single_zplane or is_dual_zplane:
-        imgui.text_colored(
-            imgui.ImVec4(0.8, 1.0, 0.2, 1.0), "Signal Quality Summary"
-        )
-    else:
-        imgui.text_colored(
-            imgui.ImVec4(0.8, 1.0, 0.2, 1.0), f"{stat_label} Summary Stats"
-        )
+    if table:
+        if is_single_zplane or is_dual_zplane:
+            imgui.text_colored(
+                imgui.ImVec4(0.8, 1.0, 0.2, 1.0), "Signal Quality Summary"
+            )
+        else:
+            imgui.text_colored(
+                imgui.ImVec4(0.8, 1.0, 0.2, 1.0), f"{stat_label} Summary Stats"
+            )
 
-    # more than one series candidate -> let the user pick which drives the x-axis
-    if spec is not None and spec.both_series:
-        _draw_axis_pick(parent, spec)
+        # more than one series candidate -> pick which drives the x-axis
+        if spec is not None and spec.both_series:
+            _draw_axis_pick(parent, spec)
 
     # ROI selector — show a graphic only when it has a populated series.
     array_labels = [
@@ -569,7 +577,7 @@ def draw_stats_section(parent: Any):
         parent._selected_array = 0
 
     # only draw the selector when there are multiple graphics to choose between
-    if len(array_labels) > 1:
+    if table and len(array_labels) > 1:
         avail = imgui.get_content_region_avail().x
         xpos = 0
 
@@ -591,7 +599,7 @@ def draw_stats_section(parent: Any):
 
     # Caption the displayed group combo (it follows the sliders, snapped to
     # the nearest sampled tile/camera/etc.).
-    if spec is not None and spec.groups:
+    if table and spec is not None and spec.groups:
         sel = 0 if parent._selected_array >= len(stats_list) else parent._selected_array
         _, key = _series_for(parent, sel)
         caption = _combo_caption(spec, key or ())
@@ -603,7 +611,8 @@ def draw_stats_section(parent: Any):
     is_combined = has_combined and parent._selected_array == len(array_labels) - 1
 
     _draw_array_stats(
-        parent, stats_list, spec, is_single_zplane, is_dual_zplane, is_combined
+        parent, stats_list, spec, is_single_zplane, is_dual_zplane, is_combined,
+        table=table, plot=plot,
     )
 
 
@@ -668,7 +677,8 @@ def _combined_stats(parent, metrics) -> dict | None:
 
 
 def _draw_array_stats(
-    parent, stats_list, spec, is_single_zplane, is_dual_zplane, is_combined
+    parent, stats_list, spec, is_single_zplane, is_dual_zplane, is_combined,
+    *, table: bool = True, plot: bool = True,
 ):
     """Draw stats for the selected array (or combined) at the current combo."""
     from mbo_utilities.arrays.features import DEFAULT_METRICS
@@ -676,7 +686,8 @@ def _draw_array_stats(
     stat_label = spec.series.label if spec is not None and spec.series else "Z-Plane"
 
     if is_combined:
-        imgui.text("Stats for Combined graphics")
+        if table:
+            imgui.text("Stats for Combined graphics")
         stats = _combined_stats(parent, metrics)
         array_idx = None
     else:
@@ -696,37 +707,68 @@ def _draw_array_stats(
     z_vals = _z_axis_values(parent, array_idx, n)
     mean_vals = np.ascontiguousarray(mean_vals[:n])
 
+    # the current series position (1-based) drives the table-row highlight and
+    # the in-plot accent line, so the two halves stay in step
+    active_z = _active_stat(parent, spec)
     if is_single_zplane or is_dual_zplane:
-        _draw_simple_stats_table(stats, metrics, is_dual_zplane, array_idx, stat_label)
-        imgui.spacing()
-        imgui.separator()
-        imgui.spacing()
-        if is_combined:
-            _draw_signal_comparison_chart(parent, mean_vals, is_dual_zplane, stat_label)
-        else:
-            snr_vals = np.asarray(stats.get("snr", np.zeros(n)), dtype=np.float64)[:n]
-            _draw_signal_metrics_chart(
-                mean_vals, std_vals, snr_vals, is_dual_zplane, array_idx, stat_label
+        if table:
+            _draw_simple_stats_table(
+                stats, metrics, is_dual_zplane, array_idx, stat_label
             )
+        if table and plot:
+            _draw_half_separator()
+        if plot:
+            if is_combined:
+                _draw_signal_comparison_chart(
+                    parent, mean_vals, is_dual_zplane, stat_label
+                )
+            else:
+                snr_vals = np.asarray(stats.get("snr", np.zeros(n)), dtype=np.float64)[:n]
+                _draw_signal_metrics_chart(
+                    mean_vals, std_vals, snr_vals, is_dual_zplane, array_idx, stat_label
+                )
     else:
-        # Multi-point series: the current series position (1-based) drives the
-        # table-row highlight and the in-plot accent line.
-        active_z = _active_stat(parent, spec)
-        _draw_zplane_stats_table(
-            z_vals, stats, metrics, array_idx, active_z=active_z, stat_label=stat_label
-        )
-        imgui.spacing()
-        imgui.separator()
-        imgui.spacing()
-        if is_combined:
-            _draw_combined_zplane_plot(
-                parent, z_vals, stats_list, active_z=active_z, stat_label=stat_label
+        if table:
+            _draw_zplane_stats_table(
+                z_vals, stats, metrics, array_idx,
+                active_z=active_z, stat_label=stat_label,
             )
-        else:
-            _draw_zplane_signal_plot(
-                z_vals, mean_vals, std_vals, array_idx,
-                active_z=active_z, parent=parent, stat_label=stat_label,
-            )
+        if table and plot:
+            _draw_half_separator()
+        if plot:
+            if is_combined:
+                _draw_combined_zplane_plot(
+                    parent, z_vals, stats_list, active_z=active_z, stat_label=stat_label
+                )
+            else:
+                _draw_zplane_signal_plot(
+                    z_vals, mean_vals, std_vals, array_idx,
+                    active_z=active_z, parent=parent, stat_label=stat_label,
+                )
+
+
+PLOT_HEIGHT = 350
+MIN_PLOT_HEIGHT = 120
+
+
+def _plot_size(plot_width: float) -> imgui.ImVec2:
+    """Full width, and whatever height is left in the panel.
+
+    The plot fills its panel rather than sitting at a fixed height, so a
+    taller window gives the trace more room instead of blank space under it.
+    ``PLOT_HEIGHT`` is only the fallback for a panel that reports no room.
+    """
+    avail_y = imgui.get_content_region_avail().y
+    if avail_y <= 0:
+        return imgui.ImVec2(plot_width, PLOT_HEIGHT)
+    return imgui.ImVec2(plot_width, max(avail_y, MIN_PLOT_HEIGHT))
+
+
+def _draw_half_separator():
+    """The rule between the table and the plot, when one panel shows both."""
+    imgui.spacing()
+    imgui.separator()
+    imgui.spacing()
 
 
 def _draw_simple_stats_table(stats, metrics, is_dual_zplane, array_idx=None, stat_label="Z-Plane"):
@@ -846,7 +888,7 @@ def _draw_signal_comparison_chart(parent, mean_vals, is_dual_zplane, stat_label=
         ]
 
         if graphic_means_z1 and graphic_means_z2 and implot.begin_plot(
-            "Signal Comparison", imgui.ImVec2(plot_width, 350)
+            "Signal Comparison", _plot_size(plot_width)
         ):
             try:
                 style_seaborn_dark()
@@ -896,7 +938,7 @@ def _draw_signal_comparison_chart(parent, mean_vals, is_dual_zplane, stat_label=
         ]
 
         if graphic_means and implot.begin_plot(
-            "Signal Comparison", imgui.ImVec2(plot_width, 350)
+            "Signal Comparison", _plot_size(plot_width)
         ):
             try:
                 style_seaborn_dark()
@@ -951,7 +993,7 @@ def _draw_signal_metrics_chart(
 
     plot_width = imgui.get_content_region_avail().x
     if implot.begin_plot(
-        f"Signal Metrics {array_idx}", imgui.ImVec2(plot_width, 350)
+        f"Signal Metrics {array_idx}", _plot_size(plot_width)
     ):
         try:
             implot.setup_axes(
@@ -1041,7 +1083,7 @@ def _draw_combined_zplane_plot(
     pushed_bold = push_font_safe(getattr(parent, "_bold_font", None))
     if implot.begin_plot(
         "Z-Plane Plot (Combined)",
-        imgui.ImVec2(plot_width, 350),
+        _plot_size(plot_width),
         implot.Flags_.no_legend.value,
     ):
         try:
@@ -1143,7 +1185,7 @@ def _draw_zplane_signal_plot(
     )
     if implot.begin_plot(
         f"Z-Plane Signal {array_idx}",
-        imgui.ImVec2(plot_width, 350),
+        _plot_size(plot_width),
         implot.Flags_.no_legend.value,
     ):
         try:

@@ -486,6 +486,24 @@ class _ScrubTimingProxy:
         return getattr(self._wrapped, name)
 
 
+def _squeeze_for_viewer(arr):
+    """Wrap `arr` the way the viewer wants it: singleton non-spatial dims
+    dropped, then the scrub timer.
+
+    fastplotlib expects ndim == len(slider_dim_names) + 2, so any T/C/Z of
+    size 1 must be squeezed, not just C. Module level because anything that
+    swaps the viewer's array afterwards (frame averaging) has to reproduce
+    exactly this wrapping.
+    """
+    if not hasattr(arr, "shape") or len(arr.shape) != 5:
+        out = arr
+    elif any(arr.shape[i] == 1 for i in range(3)):
+        out = _SqueezeSingletonDims(arr)
+    else:
+        out = arr
+    return _ScrubTimingProxy(out)
+
+
 def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override=None):
     """Create fastplotlib ImageWidget with an optional side widget.
 
@@ -567,21 +585,6 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
         graphic_kwargs = {"vmin": 0, "vmax": 1000}
     else:
         graphic_kwargs = {"vmin": -100, "vmax": 4000}
-
-    def _squeeze_for_viewer(arr):
-        """drop every singleton non-spatial dim so fastplotlib's ndim-2
-        slider count matches get_slider_dims output.
-
-        fastplotlib expects ndim == len(slider_dim_names) + 2. any
-        T/C/Z with size 1 must be squeezed, not just C.
-        """
-        if not hasattr(arr, "shape") or len(arr.shape) != 5:
-            out = arr
-        elif any(arr.shape[i] == 1 for i in range(3)):
-            out = _SqueezeSingletonDims(arr)
-        else:
-            out = arr
-        return _ScrubTimingProxy(out)
 
     # Handle multi-ROI data (duck typing: check for roi_mode attribute)
     if hasattr(data_array, "roi_mode") and hasattr(data_array, "iter_rois"):
@@ -973,13 +976,13 @@ _curation_windows: list = []
 def _open_curation_gui(path):
     """Show masknmf's curation GUI (accept/reject + class labels) for the file.
 
-    CurationVis.from_hdf5 restores any saved iscell/class labels and autosaves
-    edits back into the hdf5. Does not run the event loop — a caller on an
-    already-running loop (File -> Open) just gets the extra window.
+    ``from_masknmf`` restores any labels saved in the ``<results>.labels.hdf5``
+    sidecar and autosaves edits back into it. Does not run the event loop — a
+    caller on an already-running loop (File -> Open) just gets the extra window.
     """
-    from masknmf.visualization.curation_vis import CurationVis
+    from masknmf.visualization.classification_vis import ClassificationVis
 
-    vis = CurationVis.from_hdf5(str(path))
+    vis = ClassificationVis.from_masknmf([str(path)])
     vis.show()
     _curation_windows.append(vis)
     return vis

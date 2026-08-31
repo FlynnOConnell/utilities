@@ -78,8 +78,8 @@ def _toggle_manual_roi(parent: Any, enabled: bool) -> None:
 WIDGET_REGISTRY: tuple[WidgetEntry, ...] = (
     WidgetEntry(
         key="preview",
-        label="Preview",
-        tooltip="The preview tab and the control panels stacked inside it.",
+        label="Image",
+        tooltip="The Image tab and the control panels stacked inside it.",
         subwidgets=(
             SubWidget("mesc_units", "MESc Units"),
             SubWidget("window_functions", "Window Functions"),
@@ -106,7 +106,7 @@ WIDGET_REGISTRY: tuple[WidgetEntry, ...] = (
         key="manual_roi",
         label="Manual ROI Labeling",
         tooltip="Freehand ROI drawing and labelling: control cards and the trace "
-                "plot in a top panel; table, traces, and runs in their own tabs.",
+                "plot in a top panel; the ROI and trace tables in their own tabs.",
         default=False,
         on_toggle=_toggle_manual_roi,
         subwidgets=(
@@ -116,7 +116,6 @@ WIDGET_REGISTRY: tuple[WidgetEntry, ...] = (
             SubWidget("process", "Process card"),
             SubWidget("table", "ROI table", tooltip="The ROIs tab in this panel."),
             SubWidget("traces", "Trace table", tooltip="The Traces tab: every collected trace with stats."),
-            SubWidget("runs", "Runs tab", tooltip="The Runs tab: active, finished, and on-disk runs."),
         ),
     ),
 )

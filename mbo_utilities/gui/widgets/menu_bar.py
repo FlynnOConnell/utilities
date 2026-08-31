@@ -19,7 +19,9 @@ from mbo_utilities.gui.widgets.widget_toggles import draw_widgets_menu
 
 
 def draw_menu_bar(parent: Any):
-    """Draw the menu bar within the current window/child scope."""
+    """Draw the menu row: the File / Widgets / Docs menus, then the process
+    status and Metadata Viewer buttons. Drawn in the figure's top strip
+    (``gui/_top_strip.py``), which spans the canvas's full width."""
     with imgui_ctx.begin_child(
         "menu",
         window_flags=imgui.WindowFlags_.menu_bar,
@@ -95,14 +97,20 @@ def draw_menu_bar(parent: Any):
                         "https://millerbrainobservatory.github.io/mbo_utilities/"
                     )
                 imgui.end_menu()
-        imgui.end_menu_bar()
+            # the strip spans the canvas, so the status and metadata buttons
+            # fit on the menu row instead of a second line under it
+            parent._clear_stale_progress()
+            draw_process_status_indicator(parent, in_menu_bar=True)
+            imgui.end_menu_bar()
 
-        # Draw process status indicator (consolidated)
-        parent._clear_stale_progress()
-        draw_process_status_indicator(parent)
+def draw_process_status_indicator(parent: Any, in_menu_bar: bool = False):
+    """Draw the compact, colour-coded process status button and the Metadata
+    Viewer button beside it.
 
-def draw_process_status_indicator(parent: Any):
-    """Draw compact process status indicator in top-left with color coding."""
+    A menu bar already lays its items out in a row, and a ``same_line`` there
+    puts the second button back on top of the first, so the caller says which
+    it is.
+    """
     # Import icons
     try:
         from imgui_bundle import icons_fontawesome as fa
@@ -203,7 +211,8 @@ def draw_process_status_indicator(parent: Any):
         imgui.set_tooltip("Click to view process console")
 
     # 2. Metadata Button
-    imgui.same_line()
+    if not in_menu_bar:
+        imgui.same_line()
     # Dark grey background
     imgui.push_style_color(imgui.Col_.button, imgui.ImVec4(0.2, 0.2, 0.2, 1.0))
     imgui.push_style_color(imgui.Col_.button_hovered, imgui.ImVec4(0.3, 0.3, 0.3, 1.0))
