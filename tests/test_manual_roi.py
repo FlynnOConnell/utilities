@@ -288,6 +288,55 @@ class TestSelection:
         widget.refresh_overlay()
         assert (before != widget.overlay.data.value).any()
 
+    def test_clicking_a_filtered_out_roi_clears_the_label_filter(self, widget):
+        """A click on the image always lands on the table cursor, so the row
+        highlights alongside the mask."""
+        from mbo_utilities.gui.imgui import FILTER_ALL
+
+        widget.add_roi(square(10, 10, 20))
+        widget.add_roi(square(40, 40, 15))
+        widget.store.add_label_name("a")
+        label(widget, 1, 0)
+        widget.order.filter_label = 0
+        widget.order.rebuild()
+        assert 0 not in widget.order.order
+        click(widget, 20, 20)
+        assert widget.selected == 0
+        assert widget.order.current == 0
+        assert widget.order.filter_label == FILTER_ALL
+
+    def test_clicking_a_drawn_roi_clears_the_source_filter(self, widget):
+        widget.add_roi(square(10, 10, 20))
+        widget._add_derived(make_result(widget, [disc(45, 45)]))
+        widget.order.source = 1  # the derived set only
+        widget.order.rebuild()
+        assert 0 not in widget.order.order
+        click(widget, 20, 20)
+        assert widget.selected == 0
+        assert widget.order.source is None
+        assert widget.order.current == 0
+
+    def test_clicking_a_derived_component_reveals_its_row(self, widget):
+        widget.add_roi(square(10, 10, 20))
+        widget._add_derived(make_result(widget, [disc(45, 45)]))
+        widget.order.source = 0  # drawn only
+        widget.order.rebuild()
+        click(widget, 45, 45)
+        assert widget.selected_derived == (0, 0)
+        assert widget.order.source is None
+        assert widget.order.current == widget._row_index[(0, 0)]
+
+    def test_selecting_a_visible_row_keeps_the_filters(self, widget):
+        widget.add_roi(square(10, 10, 20))
+        widget.add_roi(square(40, 40, 15))
+        widget.store.add_label_name("a")
+        label(widget, 1, 0)
+        widget.order.filter_label = 0
+        widget.order.rebuild()
+        widget.select_roi(1)
+        assert widget.order.filter_label == 0
+        assert widget.order.current == 1
+
     def test_overlays_are_not_pickable(self, widget):
         """the tooltip must keep reporting the image intensity, not our rgba"""
         for overlay in (widget.overlay, widget.derived_overlay):
@@ -473,7 +522,7 @@ class TestClassLabels:
         assert "cleared 3 labels" in widget.status
 
     def test_unlabel_all_has_its_own_return_value(self, widget):
-        from masknmf.visualization.imgui import UNLABEL_ALL, UNLABELED
+        from mbo_utilities.gui.imgui import UNLABEL_ALL, UNLABELED
 
         # the shared draw_label_buttons signals it out of band so callers
         # never assign -2 as if it were a class index
@@ -519,16 +568,22 @@ class TestMaskAppearance:
 
 class TestImguiWindows:
     def test_registers_the_top_panel_only(self, widget):
-        from mbo_utilities.gui.manual_roi import PANEL_HEIGHT, PANEL_LOCATION
+        from mbo_utilities.gui.manual_roi import PANEL_LOCATION
 
-        # the controls live in a top edge strip like ClassificationVis; the
-        # table is a tab of the host's right widget, not an edge window
+        # the controls are two panels on the shared top strip; the tables are
+        # tabs of the host's right widget, not edge windows of their own
         assert PANEL_LOCATION == "top"
-        assert PANEL_HEIGHT == 228
         windows = widget.iw.figure.imgui_windows
         assert windows["top"] is widget.tools_window
+        assert [p.key for p in widget.tools_window.panels] == ["roi", "traces"]
         assert windows.get("left") is None
         assert windows.get("right") is None
+
+    def test_closing_gives_the_panels_back(self, widget):
+        strip = widget.tools_window
+        widget.close()
+        assert [p.key for p in strip.panels] == []
+        assert strip.hooks == []
 
     def test_panel_draws_the_cards_and_popups(self, widget):
         from imgui_bundle import imgui
@@ -1406,6 +1461,86 @@ class TestTracesTab:
         widget.iw.figure.canvas.draw()
         assert not errors, errors[0]
 
+    def test_arrows_step_traces_on_the_traces_panel(self, widget):
+        """Up / down walk the trace table when it is what the top panel is
+        showing, and the ROI order otherwise."""
+        for i in range(3):
+            widget.add_roi(square(4 + 12 * i, 4, 9))
+            widget.quick_trace(i)
+        pump(widget)
+        rows = widget._sorted_trace_rows()
+        assert len(rows) == 3
+
+        widget.tools_window.active = "traces"
+        widget.select_trace(rows[0])
+        widget.step(1)
+        assert widget.trace_sel == {rows[1]}
+        assert widget.selected == 1, "the image follows the trace"
+        widget.step(-1)
+        assert widget.trace_sel == {rows[0]} and widget.selected == 0
+        widget.step(-1)  # clamps at the top
+        assert widget.trace_sel == {rows[0]}
+
+        widget.tools_window.active = "roi"
+        widget.select_roi(0)
+        widget.step(1)
+        assert widget.selected == 1
+
+    def test_selecting_an_roi_shows_its_trace(self, widget):
+        for i in range(2):
+            widget.add_roi(square(4 + 20 * i, 4, 9))
+            widget.quick_trace(i)
+        pump(widget)
+        widget.select_roi(0)
+        header, lines = widget._plot_lines()
+        assert header == "ROI 0"
+        widget.select_roi(1)
+        header, lines = widget._plot_lines()
+        assert header == "ROI 1", "the plot must follow the image"
+        assert widget.trace_sel == {key for _label, key in lines}
+
+    def test_a_traceless_roi_plots_nothing_rather_than_a_stale_trace(self, widget):
+        widget.add_roi(square(4, 4, 9))
+        widget.quick_trace(0)
+        pump(widget)
+        widget.add_roi(square(40, 40, 9))  # no trace of its own
+        widget.select_roi(1)
+        assert widget._plot_lines() is None
+
+    def test_ctrl_click_multi_selection_survives_reselecting_a_member(self, widget):
+        for i in range(2):
+            widget.add_roi(square(4 + 20 * i, 4, 9))
+            widget.quick_trace(i)
+        pump(widget)
+        rows = widget._sorted_trace_rows()
+        widget.select_trace(rows[0])
+        widget.toggle_trace(rows[1])
+        assert widget.trace_sel == set(rows)
+        widget.select_roi(0)
+        assert widget.trace_sel == set(rows), "selection already covers ROI 0"
+
+    def test_trace_columns_fit_the_narrow_tab(self, widget):
+        """The tab is a ~250px column, so the table stretches to it and the
+        two least useful columns start hidden instead of running off the
+        right edge."""
+        from mbo_utilities.gui.manual_roi import TRACE_COLUMNS
+
+        assert [c[0] for c in TRACE_COLUMNS] == [
+            "roi", "source", "frames", "mean", "peak", "snr"
+        ]
+        assert [c[0] for c in TRACE_COLUMNS if c[2]] == ["frames", "peak"]
+
+    def test_trace_sort_keys_line_up_with_the_columns(self, widget):
+        """draw_trace_table indexes one tuple by the clicked column index."""
+        from mbo_utilities.gui.manual_roi import TRACE_COLUMNS
+
+        widget.add_roi(square(10, 10, 9))
+        widget.quick_trace(0)
+        pump(widget)
+        key = widget._trace_rows()[0]
+        values = (widget._trace_shown(key)[0], key[1], *widget._trace_stat(key))
+        assert len(values) == len(TRACE_COLUMNS)
+
     def test_top_choice_survives_stale_right_reports(self, widget):
         # the right bar redraws its old tab for a frame or two after the top
         # switches; those reports must not yank the top back (the ping-pong
@@ -1435,18 +1570,6 @@ class TestTracesTab:
         assert not errors, errors[0]
         assert widget.top_tab == "roi"
         assert widget._focus_right == "rois"
-
-    def test_draw_runs_does_not_raise(self, widget):
-        widget._add_derived(make_result(widget, [disc(40, 40)], with_traces=True))
-        real = widget.draw_panel
-
-        def panel():
-            real()
-            widget.draw_runs()
-
-        widget.draw_panel = panel
-        errors = draw_frames(widget, 3)
-        assert not errors, errors[0]
 
 
 class TestPipelineTraceExtraction:
@@ -1534,7 +1657,7 @@ class TestSorting:
 
 
 def draw_frames(widget, n=4):
-    """Render n frames with the ROI panel guarded; returns its tracebacks.
+    """Render n frames with the top strip guarded; returns its tracebacks.
 
     A raise inside an imgui update call is swallowed by rendercanvas, so
     collect it off the guard rather than letting the draw look clean.
@@ -1543,9 +1666,30 @@ def draw_frames(widget, n=4):
 
     errors = []
 
+    strip = widget.tools_window
+
     def guarded(*_args):
         try:
-            widget.draw_panel()
+            strip.update()
+        except Exception:
+            errors.append(traceback.format_exc())
+
+    strip._update_calls[:] = [guarded]
+    for _ in range(n):
+        widget.iw.figure.canvas.draw()
+    return errors
+
+
+def draw_tab_frames(widget, n=2):
+    """Same as draw_frames for the ROIs tab body, which the tools window is
+    happy to host: it only needs to sit inside some imgui window."""
+    import traceback
+
+    errors = []
+
+    def guarded(*_args):
+        try:
+            widget.draw_tab()
         except Exception:
             errors.append(traceback.format_exc())
 
@@ -1586,6 +1730,83 @@ def drag(widget, size=60):
     for dx, dy in ((size, -size), (size, size), (-size, size), (-size, -size)):
         send(widget, "pointer_move", cx + dx, cy + dy)
     send(widget, "pointer_up", cx - size, cy - size)
+
+
+class TestOverlaySurvivesGraphicRebuild:
+    """A float-casting func (a gaussian sigma, a window projection) over
+    integer data makes the viewer recreate the image graphic. fastplotlib
+    stacks graphics in z by add order, so the rebuilt image took the front
+    slot and buried the ROI masks — and the camera re-frame parked the view
+    on top of them, so they never came back.
+    """
+
+    @staticmethod
+    def _roi_pixel(widget):
+        x, y = screen_pos(widget, 20, 20)
+        frame = np.asarray(widget.iw.figure.canvas.draw())[..., :3]
+        return frame[int(y), int(x)].tolist()
+
+    @pytest.fixture
+    def drawn(self):
+        """An ROI over INTEGER data: that is what makes a float-casting func
+        recreate the graphic in the first place."""
+        from mbo_utilities.gui._ndviewer import MboNDViewer
+        from mbo_utilities.gui.manual_roi import ManualRoiWidget
+
+        data = (np.random.default_rng(0).random((6, 64, 64)) * 100).astype(np.int16)
+        iw = MboNDViewer(data=data, figure_kwargs={"size": FIGURE_SIZE})
+        iw.show()
+        roi = ManualRoiWidget(iw, fpath=None)
+        roi.add_roi(square(10, 10, 20))
+        roi.opacity = 1.0
+        roi.refresh_overlay()
+        for _ in range(2):
+            iw.figure.canvas.draw()
+        assert np.asarray(iw._ndgraphics[0].graphic.data.value).dtype.kind in "bui"
+        yield roi
+        iw.close()
+
+    def test_the_mask_is_still_drawn_after_a_float_upgrade(self, drawn):
+        before = self._roi_pixel(drawn)
+        drawn.iw.spatial_func = lambda frame: frame  # what a gaussian does
+        for _ in range(2):
+            drawn.iw.figure.canvas.draw()
+        after = self._roi_pixel(drawn)
+        # the float texture can shift a channel by a quantisation step; being
+        # covered up swaps the overlay colour for a colormap one
+        assert max(abs(a - b) for a, b in zip(after, before)) <= 8, (
+            f"the ROI mask was covered up: {before} -> {after}"
+        )
+
+    def test_the_stacking_and_camera_survive(self, drawn):
+        iw = drawn.iw
+        subplot = drawn.subplot
+        z_before = {g.name: round(float(g.offset[2]), 3) for g in subplot.graphics}
+        camera_before = subplot.camera.get_state()
+
+        iw.spatial_func = lambda frame: frame
+        for _ in range(2):
+            iw.figure.canvas.draw()
+
+        z_after = {g.name: round(float(g.offset[2]), 3) for g in subplot.graphics}
+        for name, z in z_before.items():
+            assert z_after.get(name) == z, f"{name} moved in z"
+        assert round(float(subplot.camera.local.position[2]), 3) == round(
+            float(camera_before["position"][2]), 3
+        ), "the camera was re-framed"
+
+
+class TestRoiTab:
+    """The ROIs tab body: filters on one row, then the table."""
+
+    def test_tab_draws_with_drawn_and_derived_rows(self, widget):
+        widget.add_roi(square(10, 10, 20))
+        widget._add_derived(make_result(widget, [disc(45, 45)]))
+        widget.order.set_range_column("ok")
+        assert draw_tab_frames(widget) == []
+
+    def test_tab_draws_with_no_rois(self, widget):
+        assert draw_tab_frames(widget) == []
 
 
 class TestWidgetAttach:
@@ -1638,7 +1859,9 @@ class TestWidgetAttach:
             gui = self._preview(iw)
             assert gui is not None
             assert gui.manual_roi is None
-            assert iw.figure.imgui_windows.get("top") is None
+            # the strip stays for the menu row, with no ROI panels on it
+            assert iw.figure.imgui_windows["top"] is gui.top_strip
+            assert not gui.top_strip.has("roi")
         finally:
             iw.close()
 
@@ -1648,7 +1871,8 @@ class TestWidgetAttach:
             gui = self._preview(iw)
             assert gui is not None, "manualroi must keep PreviewDataWidget"
             assert gui.manual_roi is not None
-            assert iw.figure.imgui_windows["top"] is gui.manual_roi.tools_window
+            assert gui.manual_roi.tools_window is gui.top_strip
+            assert iw.figure.imgui_windows["top"] is gui.top_strip
             assert iw.figure.imgui_windows.get("left") is None
         finally:
             iw.close()
@@ -1666,7 +1890,7 @@ class TestWidgetAttach:
 
             gui.sync_manual_roi(False)
             assert gui.manual_roi is None
-            assert iw.figure.imgui_windows.get("top") is None
+            assert not gui.top_strip.has("roi")
             gui.sync_manual_roi(False)  # idempotent
 
             gui.sync_manual_roi(True)
@@ -1792,8 +2016,8 @@ class TestWidgetAttach:
         assert not panel_errors, f"ROI panel raised: {panel_errors[0]}"
         assert "ROIs" in seen, f"ROIs tab missing from tab bar: {seen}"
         assert "Traces" in seen, f"Traces tab missing from tab bar: {seen}"
-        assert "Runs" in seen, f"Runs tab missing from tab bar: {seen}"
-        assert "Preview" in seen and "Run" in seen, "preview tabs must survive"
+        assert "Runs" not in seen, "the Runs tab was removed"
+        assert "Image" in seen and "Run" in seen, "the other tabs must survive"
         assert ran, "ROI tab body never drew"
         assert not errors, f"ROI tab raised: {errors}"
         assert roi.focus_tab is False, "focus must be one-shot"

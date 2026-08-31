@@ -133,8 +133,10 @@ def test_submit_failure_lands_on_run_and_job(pm):
     mgr.submit(run, boom)
     (got, payload), = _drain(mgr, pm)
     assert got is run and payload is None
-    assert run.error == "boom"
-    assert run.job.status == "error" and "ValueError: boom" in run.job.error_details
+    # the message names the frame that raised, so a failure deep in a
+    # pipeline is diagnosable without opening the log
+    assert run.error.startswith("ValueError: boom (test_roi_runs.py:")
+    assert run.job.status == "error" and run.job.error_details == run.error
 
 
 def test_heavy_runs_serialize_on_the_gpu_lock(pm):

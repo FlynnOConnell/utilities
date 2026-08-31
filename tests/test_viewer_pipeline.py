@@ -214,6 +214,8 @@ class TestPerDataStateReset:
         ("_gaussian_sigma",     5.0,          0.0),
         ("_proj",               "max",        "mean"),
         ("_window_size",        10,           1),
+        ("_frame_average",      10,           1),
+        ("_frame_average_source", object(),   None),
         ("_auto_contrast_on_z", True,         False),
         ("_last_z_idx",         42,           0),
         ("_saveas_selected_roi", {1, 2, 3},   set()),

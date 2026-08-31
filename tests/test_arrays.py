@@ -1010,3 +1010,47 @@ def test_plane_color_layout_channels_are_not_zplanes():
     assert _plane_color_layout({"num_planes": 1, "num_color_channels": 2}, 2) == (1, 2)
     assert _plane_color_layout({"num_planes": 14}, 28) == (14, 2)
     assert _plane_color_layout({"num_color_channels": 2}, 28) == (14, 2)
+
+
+class TestScanImageYXCrop:
+    """ScanImageArray.__getitem__ must honour the y and x keys.
+
+    The page readers behind ``process_rois`` always return whole frames, so
+    the crop happens on the assembled block; when it was missing, ``arr[t,
+    c, z, y0:y1, x0:x1]`` silently returned full frames and callers that
+    trusted the shape (PlaneMovie, trace extraction) blew up on reshape.
+    """
+
+    @pytest.fixture
+    def fake_scan(self):
+        import logging
+
+        from mbo_utilities.arrays.tiff import SinglePlaneArray
+
+        data = np.arange(4 * 2 * 6 * 7, dtype=np.int16).reshape(4, 2, 6, 7)
+        arr = object.__new__(SinglePlaneArray)
+        arr.num_frames = 4
+        arr._num_color_channels = 2
+        arr._num_zplanes = 1
+        arr._target_dtype = None
+        arr.logger = logging.getLogger("test")
+        # process_rois returns (T, C*Z, Y, X), whole frames, as the real one does
+        arr.process_rois = lambda frames, chans: data[np.ix_(frames, chans)]
+        return arr, data
+
+    def test_slice_crop(self, fake_scan):
+        arr, data = fake_scan
+        got = arr[0:3, 0, 0, 1:5, 2:6]
+        assert got.shape == (3, 4, 4)
+        assert np.array_equal(got, data[0:3, 0, 1:5, 2:6])
+
+    def test_integer_yx_drops_axes(self, fake_scan):
+        arr, data = fake_scan
+        assert arr[1, 0, 0, 2, 3] == data[1, 0, 2, 3]
+        assert np.array_equal(arr[1, 0, 0, 2, :], data[1, 0, 2, :])
+
+    def test_full_slices_unchanged(self, fake_scan):
+        arr, data = fake_scan
+        got = arr[0:2, :, 0, :, :]
+        assert got.shape == (2, 2, 6, 7)
+        assert np.array_equal(got, data[0:2, :, :, :])

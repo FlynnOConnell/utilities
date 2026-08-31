@@ -270,3 +270,96 @@ def test_find_masknmf_run(tmp_path):
         params, outdir = find_masknmf_run(entry)
         assert outdir == str(tmp_path)
         assert MasknmfSettings.from_dict(params).demixing.maxiter == 55
+
+
+class TestBackgroundDownsampling:
+    """masknmf's ring/background model average-pools the field by
+    ``background_downsampling_factor`` and squeezes the result. Pooling floors,
+    so a factor at or above a side length collapses that axis, the squeeze
+    drops it, and ``lowrank_background_svd`` raises ``IndexError: tuple index
+    out of range``. The default is 30, which any narrow field hits.
+    """
+
+    @staticmethod
+    def _pooled(side: int, factor: int) -> int:
+        """avg_pool2d(kernel=factor, stride=factor) output length."""
+        return (side - factor) // factor + 1 if side >= factor else 0
+
+    def _clamp(self, ly, lx, factor=None):
+        from mbo_utilities.masknmf.params import MasknmfSettings
+        from mbo_utilities.masknmf.runner import clamp_background_downsampling
+
+        cfg = MasknmfSettings().demixing
+        if factor is not None:
+            cfg.background_downsampling_factor = factor
+        return clamp_background_downsampling(cfg, ly, lx)
+
+    def test_the_lbm_strip_that_failed(self):
+        # 50x128 at the default 30: the 50 side pools to a single pixel
+        assert self._pooled(50, 30) == 1
+        cfg = self._clamp(50, 128)
+        assert cfg.background_downsampling_factor == 12
+        assert self._pooled(50, 12) >= 2 and self._pooled(128, 12) >= 2
+
+    def test_a_wide_field_keeps_the_default(self):
+        from mbo_utilities.masknmf.params import MasknmfSettings
+
+        default = MasknmfSettings().demixing.background_downsampling_factor
+        cfg = self._clamp(512, 512)
+        assert cfg.background_downsampling_factor == default
+
+    def test_never_zero_on_a_tiny_crop(self):
+        cfg = self._clamp(6, 6)
+        assert cfg.background_downsampling_factor == 1
+
+    def test_the_callers_settings_are_left_alone(self):
+        from mbo_utilities.masknmf.params import MasknmfSettings
+
+        settings = MasknmfSettings()
+        clamped = self._clamp(50, 128)
+        assert clamped is not settings.demixing
+        assert settings.demixing.background_downsampling_factor == 30
+
+    def test_the_clamped_factor_survives_masknmfs_own_downsample(self):
+        """The crash itself: masknmf pools the baseline image, squeezes, then
+        reshapes on ``shape[1]``. Run its code, not a model of it."""
+        try:
+            import torch
+            from masknmf.compression.decomposition import spatial_downsample
+        except Exception:
+            pytest.skip("masknmf/torch not importable")
+
+        b = torch.zeros(50 * 128, 1).reshape(50, 128, 1)
+        with pytest.raises(IndexError):
+            bad = spatial_downsample(b, 30).squeeze()
+            bad.reshape(bad.shape[0] * bad.shape[1], 1)
+
+        factor = self._clamp(50, 128).background_downsampling_factor
+        good = spatial_downsample(b, factor).squeeze()
+        assert good.ndim == 2
+        good.reshape(good.shape[0] * good.shape[1], 1)
+
+
+class TestSplineDetrender:
+    """The detrender reflect-pads by half its window; torch rejects a pad
+    wider than the axis, so a movie shorter than the window has to skip it."""
+
+    def _make(self, nframes, fs, window_seconds=40):
+        from mbo_utilities.masknmf.runner import _spline_detrender
+
+        return _spline_detrender(nframes, fs, window_seconds, 25, "cpu")
+
+    def test_no_fs_means_no_detrender(self):
+        assert self._make(100_000, None) is None
+
+    def test_short_movie_at_a_high_frame_rate_skips_it(self):
+        # 40 s at 429.93 Hz is a 17k-frame window; 3000 frames cannot pad it
+        assert self._make(3000, 429.93) is None
+
+    def test_long_movie_gets_one(self):
+        try:
+            import masknmf  # noqa: F401
+        except Exception:
+            pytest.skip("masknmf not importable")
+        det = self._make(168_533, 429.93)
+        assert det is not None and det.window == int(40 * 429.93)
