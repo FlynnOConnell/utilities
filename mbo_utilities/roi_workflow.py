@@ -80,6 +80,7 @@ __all__ = [
     "demix_rois",
     "discover_rois",
     "feather_mask",
+    "pmd_crop",
     "run",
 ]
 
@@ -367,15 +368,43 @@ def feather_mask(mask: np.ndarray, edge_width: int = 3) -> np.ndarray:
     return np.clip(inside / max(int(edge_width), 1), 0.0, 1.0).astype(np.float32)
 
 
+def _factorized(arr) -> bool:
+    """True for masknmf factorized arrays, whose ``__getitem__`` reconstructs
+    only the requested crop; frame batching then just adds overhead."""
+    return callable(getattr(arr, "getitem_tensor", None))
+
+
 def roi_trace(source, mask: np.ndarray, t=slice(None), *, z: int = 0, c: int = 0, batch: int = 500, weights: np.ndarray | None = None) -> np.ndarray:
     """Mean over ``mask`` per frame, reading only the mask's bounding box.
 
-    ``source`` is anything :func:`as_movie` takes. Frames are read in
-    ``batch``-sized blocks so a long movie never lands in RAM at once.
-    ``weights`` (a full-frame image, e.g. :func:`feather_mask`) makes it a
-    weighted mean over the mask's pixels.
+    Parameters
+    ----------
+    source
+        Anything :func:`as_movie` accepts - a lazy array, a numpy array, a
+        ``PlaneMovie`` or an ``imread``-able path.
+    mask : np.ndarray
+        ``(Y, X)`` boolean mask.
+    t : slice or int, optional
+        Frames to read; all by default.
+    z, c : int, optional
+        Plane and channel passed to :func:`as_movie`.
+    batch : int, optional
+        Frames per read on a raw movie, so a long recording never lands in
+        RAM at once. A masknmf factorized array (``PMDArray``, ``ACArray``,
+        ``ResidualArray``, ...) reconstructs only the bounding box, so it is
+        read in a single call regardless of ``batch``.
+    weights : np.ndarray, optional
+        Full-frame weight image (e.g. :func:`feather_mask`); makes the trace
+        a weighted mean over the mask's pixels.
+
+    Returns
+    -------
+    np.ndarray
+        ``(num_frames,)`` float32 trace.
     """
     movie = as_movie(source, z=z, c=c)
+    if _factorized(movie.arr):
+        batch = movie.shape[0]
     y0, y1, x0, x1 = _bbox(mask)
     m = np.asarray(mask, bool)[y0:y1, x0:x1]
     w = None
@@ -396,8 +425,30 @@ def roi_trace(source, mask: np.ndarray, t=slice(None), *, z: int = 0, c: int = 0
 
 
 def pixel_trace(source, row: int, col: int, t=slice(None), *, z: int = 0, c: int = 0, batch: int = 2000) -> np.ndarray:
-    """One pixel's value per frame - ``movie[t, row, col]``."""
+    """One pixel's value per frame - ``movie[t, row, col]``.
+
+    Parameters
+    ----------
+    source
+        Anything :func:`as_movie` accepts.
+    row, col : int
+        Pixel coordinates in the frame.
+    t : slice or int, optional
+        Frames to read; all by default.
+    z, c : int, optional
+        Plane and channel passed to :func:`as_movie`.
+    batch : int, optional
+        Frames per read on a raw movie; a masknmf factorized array is read
+        in a single call.
+
+    Returns
+    -------
+    np.ndarray
+        ``(num_frames,)`` float32 trace.
+    """
     movie = as_movie(source, z=z, c=c)
+    if _factorized(movie.arr):
+        batch = movie.shape[0]
     nt, ny, nx = movie.shape
     if not (0 <= row < ny and 0 <= col < nx):
         raise IndexError(f"pixel ({row}, {col}) outside {ny}x{nx}")
@@ -1117,6 +1168,111 @@ def extract_rois(
 
 
 # ---------------------------------------------------------------------------
+# cropping an existing PMD decomposition
+# ---------------------------------------------------------------------------
+
+
+def pmd_crop(pmd, y0: int, y1: int, x0: int, x1: int):
+    """Spatially crop a ``masknmf.PMDArray`` without recompressing.
+
+    Row-selects the sparse spatial basis (and the local projector / trend
+    basis when present) and crops the mean / variance images, so the result
+    is the parent decomposition restricted to the window - exact, and
+    effectively free next to a new PMD run on the crop.
+
+    Parameters
+    ----------
+    pmd : masknmf.PMDArray
+        Parent decomposition of shape ``(T, H, W)``.
+    y0, y1, x0, x1 : int
+        Crop bounds, ``0 <= y0 < y1 <= H`` and ``0 <= x0 < x1 <= W``.
+
+    Returns
+    -------
+    masknmf.PMDArray
+        Decomposition of shape ``(T, y1 - y0, x1 - x0)`` sharing the
+        parent's temporal basis, device, and rescale / trend settings.
+    """
+    import torch
+    from masknmf import PMDArray
+
+    nt, h, w = pmd.shape
+    y0, y1, x0, x1 = int(y0), int(y1), int(x0), int(x1)
+    if not (0 <= y0 < y1 <= h and 0 <= x0 < x1 <= w):
+        raise IndexError(f"crop ({y0}:{y1}, {x0}:{x1}) outside {h}x{w}")
+    idx = torch.arange(h * w, device=pmd.device).reshape(h, w)[y0:y1, x0:x1].reshape(-1)
+    proj = pmd.u_local_projector
+    trend = pmd.spatial_trend_basis
+    return PMDArray.from_tensors(
+        (nt, y1 - y0, x1 - x0),
+        torch.index_select(pmd.u, 0, idx),
+        pmd.v,
+        pmd.mean_img[y0:y1, x0:x1],
+        pmd.var_img[y0:y1, x0:x1],
+        u_local_projector=torch.index_select(proj, 0, idx) if proj is not None else None,
+        spatial_trend_basis=trend[idx] if trend is not None else None,
+        temporal_trend_basis=pmd.temporal_trend_basis if trend is not None else None,
+        device=pmd.device,
+        rescale=pmd.rescale,
+        include_trend=pmd.include_trend,
+    )
+
+
+def _cached_pmd_crop(source, movie: PlaneMovie, cfg, logger) -> tuple[object, str] | None:
+    """Cropped ``PMDArray`` built from the source plane's cached compression.
+
+    Parameters
+    ----------
+    source
+        The plane source ``movie`` was opened from; its plane dir is where
+        the cached ``compression.hdf5`` is looked up.
+    movie : PlaneMovie
+        The crop to serve; its ``box`` gives the window.
+    cfg : MasknmfCompressionSettings
+        Current compression settings; the cache is only reused when its
+        stored settings hash matches and compression is not forced.
+    logger
+        Workflow logger.
+
+    Returns
+    -------
+    tuple of (masknmf.PMDArray, str) or None
+        The cropped decomposition and its provenance key, or None when there
+        is no usable cache (no plane dir, no file, stale settings, a shape
+        mismatch, or ``movie`` is not a crop).
+    """
+    from mbo_utilities.masknmf import runner as _runner
+    from mbo_utilities.masknmf.params import PMD_FILE, STAGE_FORCE
+
+    box = movie.box
+    if box is None or cfg.do_compression == STAGE_FORCE:
+        return None
+    src = _source_path(source)
+    if src is None:
+        return None
+    pmd_path = (src if src.is_dir() else src.parent) / PMD_FILE
+    if not pmd_path.exists():
+        return None
+    stored = _runner._read_provenance(pmd_path)
+    if stored is None or stored.get("settings") != _runner._stage_hash(cfg, "do_compression"):
+        return None
+
+    import masknmf
+
+    try:
+        pmd = masknmf.PMDArray.from_hdf5(str(pmd_path))
+    except Exception as e:
+        logger.warning(f"roi_workflow: cached {pmd_path.name} unusable ({e}); recompressing crop")
+        return None
+    size = dict(zip(movie.dims, (int(s) for s in movie.arr.shape)))
+    if tuple(pmd.shape) != (movie.shape[0], size["Y"], size["X"]):
+        return None
+    y0, y1, x0, x1 = box
+    logger.info(f"roi_workflow: cropping cached {pmd_path.name} to ({y0}:{y1}, {x0}:{x1})")
+    return pmd_crop(pmd, y0, y1, x0, x1), f"pmd_crop:{pmd_path}:{box}"
+
+
+# ---------------------------------------------------------------------------
 # demixing (masknmf, seeded with the drawn masks)
 # ---------------------------------------------------------------------------
 
@@ -1140,7 +1296,9 @@ def demix_rois(
     PMD compression runs through the same ``PlaneMovie`` view, so any
     spatially sliceable array works; its result is cached as
     ``compression.hdf5`` next to the outputs (a plane dir's earlier masknmf
-    cache is reused). Outputs are masknmf's usual suite2p-shaped sidecars
+    cache is reused). A cropped view of an already-compressed plane skips
+    compression entirely: the plane's cached decomposition is cropped from
+    its factors (:func:`pmd_crop`). Outputs are masknmf's usual suite2p-shaped sidecars
     plus ``demixing_results.hdf5``.
 
     NMF may merge or delete seeds, so the number of output components can be
@@ -1186,15 +1344,20 @@ def demix_rois(
         )
         s.compression.detrend = False
 
-    # PMD through the movie view: reuse the cache, else compute
+    # PMD through the movie view: crop a cached plane decomposition, else
+    # reuse this view's cache, else compute
     src = _source_path(source)
     fingerprint = _movie_fingerprint(movie, src)
-    pmd, comp_seconds, pmd_key = _runner._stage_compression(
-        movie, s.compression, s.runtime, cache_dir, dev, np.ones((ly, lx), float), fs, logger,
-        f"registered:{fingerprint}", False,
-    )
-    if pmd is None:
-        raise ValueError("compression skipped and no cached compression.hdf5 to demix from")
+    cached = _cached_pmd_crop(source, movie, s.compression, logger)
+    if cached is not None:
+        pmd, comp_seconds, pmd_key = cached[0], 0.0, cached[1]
+    else:
+        pmd, comp_seconds, pmd_key = _runner._stage_compression(
+            movie, s.compression, s.runtime, cache_dir, dev, np.ones((ly, lx), float), fs, logger,
+            f"registered:{fingerprint}", False,
+        )
+        if pmd is None:
+            raise ValueError("compression skipped and no cached compression.hdf5 to demix from")
 
     # seed footprints: one binary column per selected ROI
     a0 = np.zeros((ly, lx, K), np.float32)
@@ -1315,7 +1478,10 @@ def discover_rois(
     Everything runs on the crop - masknmf's superpixel initialisation
     (``engine="masknmf"``) or suite2p's detector plus its extractor
     (``engine="suite2p"``) - and ``stat.npy`` is written back in full-frame
-    coordinates, so the outputs read like any other run dir.
+    coordinates, so the outputs read like any other run dir. When the plane
+    already has a ``compression.hdf5`` computed with the same settings, the
+    crop's PMD is built from those factors (:func:`pmd_crop`) instead of
+    recompressing.
 
     Returns the output dir (``out_dir`` or ``rois_<tag>/`` beside the
     source), or ``None`` when nothing is found in the region - an ordinary
@@ -1373,12 +1539,16 @@ def discover_rois(
         detrend_ok = bool(fs) and nframes >= 2 * int(40 * fs)
         if fs and not detrend_ok:
             s.compression.detrend = False
-        pmd, comp_seconds, pmd_key = _runner._stage_compression(
-            crop, s.compression, s.runtime, out_dir, dev, np.ones((h, w), float), fs, logger,
-            f"registered:{_movie_fingerprint(crop, _source_path(source))}", False,
-        )
-        if pmd is None:
-            raise ValueError("compression skipped and no cached compression.hdf5 to demix from")
+        cached = _cached_pmd_crop(source, crop, s.compression, logger)
+        if cached is not None:
+            pmd, comp_seconds, pmd_key = cached[0], 0.0, cached[1]
+        else:
+            pmd, comp_seconds, pmd_key = _runner._stage_compression(
+                crop, s.compression, s.runtime, out_dir, dev, np.ones((h, w), float), fs, logger,
+                f"registered:{_movie_fingerprint(crop, _source_path(source))}", False,
+            )
+            if pmd is None:
+                raise ValueError("compression skipped and no cached compression.hdf5 to demix from")
         detrender = None
         if detrend_ok:
             from masknmf.compression.preprocessing import MaximinSplineDetrend
