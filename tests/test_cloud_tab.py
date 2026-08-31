@@ -73,41 +73,61 @@ def test_the_panel_is_created_once_and_reused(monkeypatch):
     assert calls[0][0] == calls[1][0], "the panel state must survive between frames"
 
 
-def test_cloud_tab_is_in_the_tab_bar_and_renders():
-    """The tab draws inside the real viewer, with the real imgui context."""
-    from imgui_bundle import imgui
-
-    import mbo_utilities.gui.viewers.time_series as ts
+def test_cloud_opens_as_a_popup_not_a_tab():
+    """Cloud lives in the Widgets menu as a floating window; the tab is gone."""
     from mbo_utilities.arrays.numpy import NumpyArray
+    from mbo_utilities.gui import _cloud
     from mbo_utilities.gui.run_gui import _create_image_widget
-    from mbo_utilities.gui.widgets import widget_toggles
+    from mbo_utilities.gui.widgets.preview_data import PreviewDataWidget
+    from mbo_utilities.gui.widgets.tabs import __all__ as tab_names
 
-    was_enabled = widget_toggles.widget_enabled("cloud")
-    widget_toggles.set_widget_enabled("cloud", True)
+    assert "CloudTabWidget" not in tab_names
 
     data = np.random.default_rng(0).random((8, 1, 1, 64, 64)).astype(np.float32)
     iw = _create_image_widget(
         NumpyArray(data, dims="TCZYX"), figure_kwargs_override={"size": FIGURE_SIZE}
     )
-
-    seen = []
-    real = imgui.begin_tab_item
-    force = [True]
-
-    def spy(label, *args, **kwargs):
-        seen.append(label)
-        if label == "Cloud" and force[0]:
-            force[0] = False
-            return real(label, None, imgui.TabItemFlags_.set_selected)
-        return real(label, *args, **kwargs)
-
-    ts.imgui.begin_tab_item = spy
+    gui = next(
+        w for w in iw.figure.imgui_windows.values() if isinstance(w, PreviewDataWidget)
+    )
+    drawn = []
+    real = _cloud.draw_cloud_tab
+    _cloud.draw_cloud_tab = lambda parent, fpath=None: drawn.append(fpath) or real(parent, fpath)
     try:
-        for _ in range(4):
+        iw.figure.canvas.draw()
+        assert not drawn, "the popup must stay closed until asked for"
+        gui._show_cloud = True
+        for _ in range(2):
             iw.figure.canvas.draw()
     finally:
-        ts.imgui.begin_tab_item = real
-        widget_toggles.set_widget_enabled("cloud", was_enabled)
+        _cloud.draw_cloud_tab = real
         iw.close()
+    assert drawn, "the popup never rendered the cloud panel"
 
-    assert "Cloud" in seen
+
+def test_biohpc_opens_as_a_popup_not_a_tab():
+    from mbo_utilities.arrays.numpy import NumpyArray
+    from mbo_utilities.gui.run_gui import _create_image_widget
+    from mbo_utilities.gui.widgets import biohpc
+    from mbo_utilities.gui.widgets.preview_data import PreviewDataWidget
+
+    assert not hasattr(biohpc, "BioHpcWidget")
+
+    data = np.random.default_rng(0).random((8, 1, 1, 64, 64)).astype(np.float32)
+    iw = _create_image_widget(
+        NumpyArray(data, dims="TCZYX"), figure_kwargs_override={"size": FIGURE_SIZE}
+    )
+    gui = next(
+        w for w in iw.figure.imgui_windows.values() if isinstance(w, PreviewDataWidget)
+    )
+    drawn = []
+    real = biohpc.draw_biohpc_tab
+    biohpc.draw_biohpc_tab = lambda parent: drawn.append(parent) or real(parent)
+    try:
+        gui._show_biohpc = True
+        for _ in range(2):
+            iw.figure.canvas.draw()
+    finally:
+        biohpc.draw_biohpc_tab = real
+        iw.close()
+    assert drawn, "the popup never rendered the BioHPC panel"

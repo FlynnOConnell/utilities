@@ -105,35 +105,19 @@ WIDGET_REGISTRY: tuple[WidgetEntry, ...] = (
     WidgetEntry(
         key="manual_roi",
         label="Manual ROI Labeling",
-        tooltip="Freehand ROI drawing and labelling: controls and traces "
-                "in a top panel, the table in the ROIs tab.",
+        tooltip="Freehand ROI drawing and labelling: control cards and the trace "
+                "plot in a top panel; table, traces, and runs in their own tabs.",
         default=False,
         on_toggle=_toggle_manual_roi,
         subwidgets=(
             SubWidget("tools", "Drawing tools"),
             SubWidget("overlay", "Overlay controls"),
             SubWidget("labels", "Label editor"),
+            SubWidget("process", "Process card"),
             SubWidget("table", "ROI table", tooltip="The ROIs tab in this panel."),
-            SubWidget("traces", "Traces", tooltip="The Traces tab: one ROI's F / Fneu."),
+            SubWidget("traces", "Trace table", tooltip="The Traces tab: every collected trace with stats."),
+            SubWidget("runs", "Runs tab", tooltip="The Runs tab: active, finished, and on-disk runs."),
         ),
-    ),
-    WidgetEntry(
-        key="biohpc",
-        label="BioHPC",
-        tooltip="Transfer to and run jobs on BioHPC.",
-        subwidgets=(
-            SubWidget("transfer", "Transfer"),
-            SubWidget("metadata", "Metadata"),
-            SubWidget("analysis", "Analysis"),
-            SubWidget("jobs", "Jobs"),
-        ),
-    ),
-    WidgetEntry(
-        key="cloud",
-        label="Cloud (GPU)",
-        tooltip="Run the loaded dataset on an ephemeral Google Cloud A100. "
-                "Needs the imgui_cloud package.",
-        default=False,
     ),
 )
 
@@ -328,4 +312,11 @@ def draw_widgets_menu(parent: Any) -> None:
         _set_all(parent, False)
     if imgui.menu_item("Reset to Defaults", "", False, True)[0]:
         reset_widget_toggles(parent)
+
+    imgui.separator()
+    # windows, not tabs: these open as floating popups over the viewer
+    if imgui.menu_item("BioHPC...", "", False, True)[0]:
+        parent._show_biohpc = True
+    if imgui.menu_item("Cloud (GPU)...", "", False, True)[0]:
+        parent._show_cloud = True
     imgui.end_menu()

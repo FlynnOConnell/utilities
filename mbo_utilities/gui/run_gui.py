@@ -648,16 +648,20 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
         from mbo_utilities.gui.widgets.preview_data import PreviewDataWidget
 
         # drawing needs the windowing controls to see anything, so the ROI
-        # ui takes the free top and left edges alongside the preview widget,
-        # not instead of it. Flip the Widgets-menu toggle on for this session
-        # when asked for, or when this data already has annotations beside
-        # it; the widget builds itself from the toggle. Not persisted — the
+        # ui takes the top strip and right-widget tabs alongside the preview
+        # widget, not instead of it. Flip the Widgets-menu toggle on for this session
+        # when asked for, or when this data has annotations or pipeline ROIs
+        # beside it; the widget builds itself from the toggle. Not persisted — the
         # flag came from the command line or the disk, not the menu.
         from mbo_utilities.gui.manual_roi import labels_path
+        from mbo_utilities.gui.roi_runs import run_dir_complete
         from mbo_utilities.gui.widgets.widget_toggles import set_widget_enabled
 
         src = data_array.source_path
-        if widget == "manualroi" or (src is not None and labels_path(src).exists()):
+        if widget == "manualroi" or (
+            src is not None
+            and (labels_path(src).exists() or run_dir_complete(labels_path(src).parent))
+        ):
             set_widget_enabled("manual_roi", True, persist=False)
 
         gui = PreviewDataWidget(

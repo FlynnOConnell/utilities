@@ -264,6 +264,20 @@ class TestPerDataStateReset:
         assert "_reset_per_data_state(parent)" in src, \
             "load_new_data must call _reset_per_data_state"
 
+    def test_load_new_data_rebuilds_the_roi_widget(self):
+        """Pin that load_new_data tears down and reattaches the manual ROI
+        widget and drops the parked store/runs — the old widget's store is
+        shaped for the previous file, so a stale one refuses every trace
+        and run on the new data. Source pin, same reasoning as above.
+        """
+        import inspect
+        from mbo_utilities.gui import _dialogs
+        src = inspect.getsource(_dialogs.load_new_data)
+        assert "detach_roi_widget(parent)" in src
+        assert "attach_roi_widget(parent)" in src
+        assert "_manual_roi_store = None" in src
+        assert "_manual_roi_runs = None" in src
+
     def test_init_state_uses_same_helper(self):
         """PreviewDataWidget._init_state must define its per-data defaults
         via _reset_per_data_state so reload and initial launch can never

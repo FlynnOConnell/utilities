@@ -192,6 +192,24 @@ def _ome_layout(meta: dict) -> tuple[int, int, int] | None:
     return (frames, slices, channels) if frames * slices * channels > 1 else None
 
 
+def _plane_color_layout(meta: dict, pages: int) -> tuple[int, int]:
+    """``(z-planes, color channels)`` for ``pages`` interleaved pages per
+    frame (``pages == planes * colors``). With neither count in ``meta``,
+    the interleave is z only for LBM-shaped data - a 1-2 page interleave on
+    anything else is PMT color channels, not depth."""
+    planes = meta.get("num_planes") or meta.get("num_zplanes")
+    colors = meta.get("num_color_channels")
+    if planes is None and colors is None:
+        stack = meta.get("stack_type", "")
+        as_z = stack in ("lbm", "pollen") or (not stack and pages > 2)
+        planes, colors = (pages, 1) if as_z else (1, pages)
+    elif planes is None:
+        planes = max(pages // max(int(colors), 1), 1)
+    elif colors is None:
+        colors = max(pages // max(int(planes), 1), 1)
+    return int(planes), int(colors)
+
+
 def _shape_layout(meta: dict) -> tuple[int, ...] | None:
     """(frames, planes[, channels]) from a TZCYX ``shape`` for shaped/legacy
     metadata that predates the ImageJ count keys, else None."""
@@ -1062,15 +1080,9 @@ class ScanImageArray(TiffReaderMixin, RoiFeatureMixin, ReductionMixin, PhaseCorr
         # for single-plane with 2 PMTs: color channels
         # this is used for shape calculation and data indexing
         self.num_channels = self._metadata.get("nchannels") or get_param(self._metadata, "nplanes", default=1)
-        # actual z-planes (1 for single-plane, beamlet count for LBM, slice count for piezo)
-        # check both num_planes and num_zplanes keys
-        self._num_zplanes = (
-            self._metadata.get("num_planes")
-            or self._metadata.get("num_zplanes")
-            or self.num_channels
+        self._num_zplanes, self._num_color_channels = _plane_color_layout(
+            self._metadata, self.num_channels
         )
-        # actual color channels (PMT/detector channels, typically 1 or 2)
-        self._num_color_channels = self._metadata.get("num_color_channels", 1)
         self.num_frames = get_param(self._metadata, "nframes")
         self._source_dtype = get_param(self._metadata, "dtype", default="int16")
         self._target_dtype = None

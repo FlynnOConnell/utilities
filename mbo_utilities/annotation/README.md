@@ -11,7 +11,9 @@ the imgui/pygfx shell; everything here imports numpy/zarr only.
   free-text note), the user-defined class-label set, and the display palettes
   (`CLASS_COLORS` is the same tab10 set as masknmf's classification GUI, so a
   shared label set looks the same in both tools). Mutations track
-  `dirty_planes` for incremental saving.
+  `dirty_planes` for incremental saving. Each record also carries a
+  persistent `uid` (never reused; `next_uid` round-trips through the zarr)
+  and a `source` string (`""` = drawn by hand).
 - `ngff.py` — `LabelsZarr`: OME-NGFF-style labels zarr, layout matched to
   `arrays/suite2p.py::_add_suite2p_labels` (`{"version": "0.5", "labels":
   ["0"]}` root attrs, `0` = `(Z, Y, X)` uint32 with `image-label` attrs).

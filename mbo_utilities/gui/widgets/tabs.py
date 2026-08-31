@@ -6,9 +6,11 @@ Signal Quality tabs delegate to ``PreviewDataWidget``, Run to the pipelines
 package, Cloud to ``gui/_cloud.py`` — so these classes are only the seam
 between a tab and its panel.
 
-Manual ROI labelling is split: its controls hang off the figure's top edge
-(``gui/manual_roi.py``), while its ROI table and trace viewer are the ROIs
-and Traces tabs here, beside Preview and Signal Quality.
+Manual ROI labelling is split: its controls and trace plot hang off the
+figure's top edge (``gui/manual_roi.py``), while its ROI table, trace table
+and run browser are the ROIs, Traces and Runs tabs here, beside Preview and
+Signal Quality. The top panel's tab selection and the ROIs / Traces tabs
+here follow each other.
 
 Tab order is ``priority``; the viewer draws them in that order.
 """
@@ -22,10 +24,10 @@ from imgui_bundle import imgui, imgui_ctx
 from mbo_utilities.gui.widgets._base import Widget
 
 __all__ = [
-    "CloudTabWidget",
     "PreviewTabWidget",
+    "RoiRunsTabWidget",
     "RoiTableTabWidget",
-    "RoiTracesTabWidget",
+    "TraceTableTabWidget",
     "RunTabWidget",
     "SignalQualityTabWidget",
 ]
@@ -154,10 +156,16 @@ class RoiTableTabWidget(Widget):
         return None
 
     def wants_focus(self) -> bool:
-        # one-shot programmatic focus (menu toggle, --widget manualroi)
+        # one-shot programmatic focus (menu toggle, --widget manualroi,
+        # or the top panel switching to its ROI tab)
         roi = getattr(self.parent, "manual_roi", None)
-        if roi is not None and getattr(roi, "focus_tab", False):
+        if roi is None:
+            return False
+        if getattr(roi, "focus_tab", False):
             roi.focus_tab = False
+            return True
+        if getattr(roi, "_focus_right", None) == "rois":
+            roi._focus_right = None
             return True
         return False
 
@@ -166,6 +174,7 @@ class RoiTableTabWidget(Widget):
         if roi is None:
             imgui.text_disabled("Manual ROI Labeling is off.")
             return
+        roi._right_tab_now = "rois"
         # lazy: manual_roi pulls in masknmf, only needed once it is on
         from mbo_utilities.gui._imgui_helpers import fit_width
         from mbo_utilities.gui.manual_roi import MIN_TAB_WIDTH
@@ -178,8 +187,9 @@ class RoiTableTabWidget(Widget):
                     roi.draw_tab()
 
 
-class RoiTracesTabWidget(Widget):
-    """The Traces tab: one ROI's traces from the manual-ROI widget."""
+class TraceTableTabWidget(Widget):
+    """The Traces tab: every collected trace with stats; the selection here
+    is what the top panel's Traces tab plots."""
 
     name = "Traces"
     tab_label = "Traces"
@@ -195,14 +205,14 @@ class RoiTracesTabWidget(Widget):
         roi = getattr(self.parent, "manual_roi", None)
         if roi is None:
             return "Enable Widgets > Manual ROI Labeling to draw ROIs."
-        if not roi.traces:
+        if not roi.has_traces():
             return "No traces yet: use the trace button on a row of the ROIs tab, or run extract / demix."
         return None
 
     def wants_focus(self) -> bool:
         roi = getattr(self.parent, "manual_roi", None)
-        if roi is not None and getattr(roi, "focus_traces", False):
-            roi.focus_traces = False
+        if roi is not None and getattr(roi, "_focus_right", None) == "traces":
+            roi._focus_right = None
             return True
         return False
 
@@ -211,31 +221,35 @@ class RoiTracesTabWidget(Widget):
         if roi is None:
             imgui.text_disabled("Manual ROI Labeling is off.")
             return
-        with imgui_ctx.begin_child("##RoiTracesContent", imgui.ImVec2(0, 0), imgui.ChildFlags_.none):
-            roi.draw_traces()
+        roi._right_tab_now = "traces"
+        with imgui_ctx.begin_child("##TraceTableContent", imgui.ImVec2(0, 0), imgui.ChildFlags_.none):
+            roi.draw_trace_table()
 
 
-class CloudTabWidget(Widget):
-    """The Cloud tab: run the loaded dataset on an ephemeral cloud GPU."""
+class RoiRunsTabWidget(Widget):
+    """The Runs tab: the manual-ROI widget's runs — active, done, and on disk."""
 
-    name = "Cloud (GPU)"
-    tab_label = "Cloud"
+    name = "Runs"
+    tab_label = "Runs"
     placement = "tab"
-    toggle_key = "cloud"
-    priority = 90
+    toggle_key = "manual_roi.runs"
+    priority = 47
 
     @classmethod
     def is_supported(cls, parent: Any) -> bool:
         return True
 
-    def draw(self) -> None:
-        from mbo_utilities.gui._cloud import draw_cloud_tab
+    def tab_disabled(self) -> str | None:
+        if getattr(self.parent, "manual_roi", None) is None:
+            return "Enable Widgets > Manual ROI Labeling to draw ROIs."
+        return None
 
-        # horizontal scrollbar: over-wide content scrolls, never clips
-        with imgui_ctx.begin_child(
-            "##CloudContent",
-            imgui.ImVec2(0, 0),
-            imgui.ChildFlags_.none,
-            imgui.WindowFlags_.horizontal_scrollbar,
-        ):
-            draw_cloud_tab(self.parent, self.parent.fpath)
+    def draw(self) -> None:
+        roi = getattr(self.parent, "manual_roi", None)
+        if roi is None:
+            imgui.text_disabled("Manual ROI Labeling is off.")
+            return
+        roi._right_tab_now = "runs"
+        with imgui_ctx.begin_child("##RoiRunsContent", imgui.ImVec2(0, 0), imgui.ChildFlags_.none):
+            roi.draw_runs()
+

@@ -17,7 +17,7 @@ contiguous ``1..N``.
 from __future__ import annotations
 
 import colorsys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -80,6 +80,8 @@ class RoiRecord:
     area: int
     class_index: int = UNLABELED
     note: str = ""
+    uid: int = 0  # persistent id, never reused; 0 = unassigned
+    source: str = ""  # "" = drawn by hand; "<run name>:<row>" = promoted
 
 
 class RoiLabelStore:
@@ -99,6 +101,7 @@ class RoiLabelStore:
         min_pixels: int = 1,
         labels: np.ndarray | None = None,
         rois: list[RoiRecord] | None = None,
+        next_uid: int = 0,
     ):
         if labels is None:
             labels = np.zeros((int(nz), int(ny), int(nx)), np.uint16)
@@ -116,6 +119,15 @@ class RoiLabelStore:
         self.label_names: tuple[str, ...] = tuple(str(n) for n in label_names)
         self.min_pixels = int(min_pixels)
         self.dirty_planes: set[int] = set()
+        self.next_uid = max(
+            int(next_uid), max((r.uid for r in self.rois), default=0) + 1, 1
+        )
+        seen: set[int] = set()
+        for r in self.rois:
+            if r.uid <= 0 or r.uid in seen:
+                r.uid = self.next_uid
+                self.next_uid += 1
+            seen.add(r.uid)
 
     # ------------------------------------------------------------------
     # shape
@@ -137,19 +149,23 @@ class RoiLabelStore:
     # roi mutations
     # ------------------------------------------------------------------
 
-    def add_roi(self, z: int, mask: np.ndarray) -> int | None:
+    def add_roi(self, z: int, mask: np.ndarray, source: str = "") -> int | None:
         """Claim the free pixels of a boolean ``(Y, X)`` mask on plane ``z``.
 
         Pixels already owned by another ROI are dropped. Returns the new
         ROI's index, or None when fewer than ``min_pixels`` free pixels
-        remain (the volume is untouched then).
+        remain (the volume is untouched then). ``source`` names where the
+        mask came from ("" = drawn by hand).
         """
         z = int(z)
         plane = self.labels[z]
         rows, cols = np.nonzero(np.asarray(mask, bool) & (plane == 0))
         if rows.size < self.min_pixels:
             return None
-        self.rois.append(RoiRecord(z=z, area=int(rows.size)))
+        self.rois.append(
+            RoiRecord(z=z, area=int(rows.size), uid=self.next_uid, source=str(source))
+        )
+        self.next_uid += 1
         plane[rows, cols] = len(self.rois)
         self.dirty_planes.add(z)
         return len(self.rois) - 1
@@ -170,6 +186,20 @@ class RoiLabelStore:
         self.labels[:] = 0
         self.rois.clear()
         self.dirty_planes.update(range(self.nz))
+
+    def snapshot(self) -> RoiLabelStore:
+        """Deep copy (volume, records, names, ``next_uid``) that later
+        mutations of either store cannot reach."""
+        return RoiLabelStore(
+            self.nz,
+            self.ny,
+            self.nx,
+            label_names=self.label_names,
+            min_pixels=self.min_pixels,
+            labels=self.labels.copy(),
+            rois=[replace(r) for r in self.rois],
+            next_uid=self.next_uid,
+        )
 
     # ------------------------------------------------------------------
     # labels / notes
@@ -198,6 +228,13 @@ class RoiLabelStore:
     # ------------------------------------------------------------------
     # queries
     # ------------------------------------------------------------------
+
+    def uid_index(self, uid: int) -> int | None:
+        """ROI index currently holding ``uid``, or None when it is gone."""
+        for i, r in enumerate(self.rois):
+            if r.uid == uid:
+                return i
+        return None
 
     def roi_at(self, z: int, row: int, col: int) -> int:
         """ROI index under a pixel, or -1 for background/out of range."""

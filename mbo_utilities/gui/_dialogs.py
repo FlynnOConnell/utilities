@@ -446,6 +446,22 @@ def load_new_data(parent: Any, path: str):
                 proc.window_sizes = None
                 proc.window_order = None
 
+        # The manual ROI widget is bound to the old data's shape, store and
+        # graphics; tear it down while the old scene is still intact and
+        # drop the parked state (it belongs to the old file, and a same-shape
+        # new file would silently adopt it).
+        roi_was_on = getattr(parent, "manual_roi", None) is not None
+        if roi_was_on:
+            from mbo_utilities.gui.manual_roi import detach_roi_widget
+
+            try:
+                detach_roi_widget(parent)
+            except Exception:
+                parent.logger.debug("manual ROI teardown failed", exc_info=True)
+                parent.manual_roi = None
+        parent._manual_roi_store = None
+        parent._manual_roi_runs = None
+
         # iw-array API: use data indexer for replacing data
         # data[0] = new_array triggers _reset_dimensions() automatically
         parent.image_widget.data[0] = new_data
@@ -520,6 +536,13 @@ def load_new_data(parent: Any, path: str):
         parent._viewer = viewer_cls(parent.image_widget, parent.fpath, parent=parent)
         parent._viewer.on_data_loaded()
         parent.logger.debug(f"Viewer switched to: {parent._viewer.name}")
+
+        # rebuild the ROI widget against the new data (fresh store, or the
+        # new file's own manual_labels.zarr)
+        if roi_was_on:
+            from mbo_utilities.gui.manual_roi import attach_roi_widget
+
+            attach_roi_widget(parent)
 
         # seed the playback rate from the new dataset's frame rate
         # (never overrides an fps the user typed).

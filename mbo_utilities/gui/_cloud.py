@@ -18,7 +18,7 @@ from pathlib import Path
 
 from imgui_bundle import imgui
 
-__all__ = ["draw_cloud_tab"]
+__all__ = ["draw_cloud_popup", "draw_cloud_tab"]
 
 _INSTALL_HINT = "uv pip install git+https://github.com/FlynnOConnell/imgui_cloud.git"
 
@@ -61,3 +61,16 @@ def draw_cloud_tab(parent, fpath=None) -> None:
         state = {}
         parent._cloud_panel_state = state
     draw_panel(state, dir_input=_dir_for(fpath))
+
+
+def draw_cloud_popup(parent) -> None:
+    """The Cloud (GPU) window, opened from the Widgets menu."""
+    if not getattr(parent, "_show_cloud", False):
+        return
+    imgui.set_next_window_size(imgui.ImVec2(760, 560), imgui.Cond_.first_use_ever)
+    opened, keep = imgui.begin("Cloud (GPU)", True)
+    if not keep:
+        parent._show_cloud = False
+    if opened:
+        draw_cloud_tab(parent, getattr(parent, "fpath", None))
+    imgui.end()

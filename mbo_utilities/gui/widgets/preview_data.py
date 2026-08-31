@@ -168,7 +168,7 @@ class PreviewDataWidget(EdgeWindow):
     """
 
     # built on demand by sync_manual_roi() when the Widgets menu entry is on;
-    # owns the figure's top (controls) and left (ROI table) edge windows
+    # owns the figure's top strip (controls) and the right-widget tabs
     manual_roi = None
 
     def __init__(
@@ -676,9 +676,9 @@ class PreviewDataWidget(EdgeWindow):
         """Create or tear down the manual-ROI widget to match the toggle.
 
         Building it attaches an overlay graphic to the subplot and claims the
-        figure's top and left edge windows, so it is created lazily the first
-        time the widget is switched on and dropped again when it is switched
-        off.
+        figure's top strip and right-widget tabs, so it is created lazily the
+        first time the widget is switched on and dropped again when it is
+        switched off.
         """
         from mbo_utilities.gui.manual_roi import attach_roi_widget, detach_roi_widget
 
@@ -1250,6 +1250,11 @@ class PreviewDataWidget(EdgeWindow):
         draw_keybinds_popup(self)
         draw_help_popup(self)
         draw_options_popup(self)
+        from mbo_utilities.gui._cloud import draw_cloud_popup
+        from mbo_utilities.gui.widgets.biohpc import draw_biohpc_popup
+
+        draw_biohpc_popup(self)
+        draw_cloud_popup(self)
         try:
             from mbo_utilities.gui.widgets.isoview_crop import draw_window as _draw_iso_crop_window
             _draw_iso_crop_window(self)

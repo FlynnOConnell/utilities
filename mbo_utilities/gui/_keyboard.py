@@ -217,23 +217,30 @@ def rebind_space_to_playback(parent: Any) -> None:
         parent._space_rebound = True
 
 
-# frame on which a popup used the arrow keys for itself (see claim_arrow_keys);
-# the viewer leaves T / Z alone on that frame and the next, whatever the draw order
-_arrows_claimed = -2
+# frame on which a widget used each arrow key for itself (see claim_arrow_keys);
+# the viewer leaves that direction alone on that frame and the next, whatever
+# the draw order
+_ARROW_KEYS = ("left_arrow", "right_arrow", "up_arrow", "down_arrow")
+_arrow_claims: dict[str, int] = dict.fromkeys(_ARROW_KEYS, -2)
 
 
-def claim_arrow_keys():
-    """Keep the viewer from also stepping T / Z on this frame's arrow presses."""
-    global _arrows_claimed
-    _arrows_claimed = imgui.get_frame_count()
+def claim_arrow_keys(keys: tuple[str, ...] = _ARROW_KEYS):
+    """Keep the viewer from also stepping T / Z on this frame's presses of ``keys``."""
+    frame = imgui.get_frame_count()
+    for key in keys:
+        _arrow_claims[key] = frame
+
+
+def _arrow_claimed(key: str) -> bool:
+    return imgui.get_frame_count() - _arrow_claims[key] <= 1
 
 
 def handle_arrow_keys(parent: Any):
     """Handle arrow key navigation for T and Z dimensions."""
     io = imgui.get_io()
 
-    # skip arrow keys when typing in text fields, or when a popup took them
-    if io.want_text_input or imgui.get_frame_count() - _arrows_claimed <= 1:
+    # skip arrow keys when typing in text fields
+    if io.want_text_input:
         return
 
     if not parent.image_widget or not parent.image_widget.data:
@@ -257,14 +264,14 @@ def handle_arrow_keys(parent: Any):
     t_max = shape[0] - 1
     current_t = current_indices[0]
 
-    if imgui.is_key_pressed(imgui.Key.left_arrow):
+    if not _arrow_claimed("left_arrow") and imgui.is_key_pressed(imgui.Key.left_arrow):
         new_t = max(0, current_t - step)
         if new_t != current_t:
             current_indices[0] = new_t
             parent.image_widget.indices = current_indices
             return
 
-    if imgui.is_key_pressed(imgui.Key.right_arrow):
+    if not _arrow_claimed("right_arrow") and imgui.is_key_pressed(imgui.Key.right_arrow):
         new_t = min(t_max, current_t + step)
         if new_t != current_t:
             current_indices[0] = new_t
@@ -282,14 +289,14 @@ def handle_arrow_keys(parent: Any):
         z_max = shape[z_pos] - 1
         current_z = current_indices[z_pos]
 
-        if imgui.is_key_pressed(imgui.Key.down_arrow):
+        if not _arrow_claimed("down_arrow") and imgui.is_key_pressed(imgui.Key.down_arrow):
             new_z = max(0, current_z - step)
             if new_z != current_z:
                 current_indices[z_pos] = new_z
                 parent.image_widget.indices = current_indices
                 return
 
-        if imgui.is_key_pressed(imgui.Key.up_arrow):
+        if not _arrow_claimed("up_arrow") and imgui.is_key_pressed(imgui.Key.up_arrow):
             new_z = min(z_max, current_z + step)
             if new_z != current_z:
                 current_indices[z_pos] = new_z

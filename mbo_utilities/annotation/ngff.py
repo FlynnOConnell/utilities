@@ -11,10 +11,11 @@ that:
   render the same colors as the GUI.
 - ``image-label.properties`` holds one entry per label value with the
   mbo-specific per-ROI state: ``class-index`` / ``class`` (name), ``note``,
-  ``z`` and ``area``. That is where the annotation round-trips from.
-- the root ``mbo`` attr carries the label-name set and the source image
-  path (a sidecar store has no ``../../0`` image group to point at, so
-  provenance lives here instead of ``image-label.source``).
+  ``z``, ``area``, ``uid`` and ``source``. That is where the annotation
+  round-trips from.
+- the root ``mbo`` attr carries the label-name set, ``next_uid`` and the
+  source image path (a sidecar store has no ``../../0`` image group to
+  point at, so it lives here instead of ``image-label.source``).
 
 ``load`` also accepts a labels zarr written by other tools (no
 ``properties``): records are then derived from the volume itself and come
@@ -85,6 +86,8 @@ class LabelsZarr:
                 "note": r.note,
                 "z": int(r.z),
                 "area": int(r.area),
+                "uid": int(r.uid),
+                "source": r.source,
             }
             for i, r in enumerate(store.rois)
         ]
@@ -95,6 +98,7 @@ class LabelsZarr:
                 "mbo": {
                     "label_names": list(store.label_names),
                     "source_image": str(source_path) if source_path else None,
+                    "next_uid": int(store.next_uid),
                 },
             }
         )
@@ -189,9 +193,17 @@ class LabelsZarr:
                     area=int(props.get("area", area)),
                     class_index=class_index,
                     note=str(props.get("note", "")),
+                    uid=int(props.get("uid", 0) or 0),
+                    source=str(props.get("source", "")),
                 )
             )
         nz, ny, nx = volume.shape
         return RoiLabelStore(
-            nz, ny, nx, label_names=label_names, labels=volume, rois=rois
+            nz,
+            ny,
+            nx,
+            label_names=label_names,
+            labels=volume,
+            rois=rois,
+            next_uid=int(mbo.get("next_uid", 0) or 0),
         )

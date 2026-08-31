@@ -13,6 +13,7 @@ from mbo_utilities.annotation import (
     UNLABELED,
     LabelsZarr,
     RoiLabelStore,
+    RoiRecord,
     class_color,
 )
 
@@ -112,6 +113,53 @@ class TestStore:
         with pytest.raises(ValueError):
             store.add_label_name("  ")
 
+    def test_add_roi_assigns_uids_and_source(self, store):
+        assert store.next_uid == 1
+        store.add_roi(0, disk(32, 32, 10, 10, 3))
+        store.add_roi(1, disk(32, 32, 20, 20, 3), source="rois_a:2")
+        assert [r.uid for r in store.rois] == [1, 2]
+        assert [r.source for r in store.rois] == ["", "rois_a:2"]
+        assert store.next_uid == 3
+        assert store.uid_index(2) == 1
+        assert store.uid_index(99) is None
+
+    def test_delete_never_reuses_uids(self, store):
+        for i in range(3):
+            store.add_roi(0, disk(32, 32, 8 + 5 * i, 8, 3))
+        store.delete_roi(2)  # holds uid 3, the max so far
+        assert store.next_uid == 4
+        index = store.add_roi(0, disk(32, 32, 8, 24, 3))
+        assert store.rois[index].uid == 4
+        assert store.uid_index(3) is None
+
+    def test_adopted_records_get_fresh_uids(self):
+        labels = np.zeros((1, 8, 8), np.uint16)
+        labels[0, 0, :3] = (1, 2, 3)
+        rois = [
+            RoiRecord(z=0, area=1, uid=5),
+            RoiRecord(z=0, area=1),
+            RoiRecord(z=0, area=1, uid=5),
+        ]
+        store = RoiLabelStore(1, 8, 8, labels=labels, rois=rois)
+        assert [r.uid for r in store.rois] == [5, 6, 7]
+        assert store.next_uid == 8
+
+    def test_snapshot_isolation(self, store):
+        store.add_label_name("soma")
+        store.add_roi(0, disk(32, 32, 10, 10, 3))
+        snap = store.snapshot()
+        store.add_roi(1, disk(32, 32, 20, 20, 3))
+        store.set_class(0, 0)
+        store.set_note(0, "changed")
+        assert len(snap.rois) == 1
+        assert snap.rois[0].class_index == UNLABELED
+        assert snap.rois[0].note == ""
+        assert snap.labels[1].max() == 0
+        assert snap.next_uid == 2 and store.next_uid == 3
+        assert snap.label_names == ("soma",) and snap.min_pixels == 4
+        snap.add_roi(2, disk(32, 32, 5, 5, 2))
+        assert store.labels[2].max() == 0
+
     def test_colors_follow_class(self, store):
         store.add_label_name("soma")
         store.add_roi(0, disk(32, 32, 10, 10, 3))
@@ -159,6 +207,49 @@ class TestLabelsZarr:
         restored = LabelsZarr.load(path)
         assert np.array_equal(restored.labels, store.labels)
         assert restored.rois[2].note == "new one"
+
+    def test_uid_source_round_trip(self, tmp_path):
+        store = self._populated()
+        store.add_roi(1, disk(32, 32, 16, 16, 3), source="rois_a:4")
+        path = tmp_path / "manual_labels.zarr"
+        LabelsZarr(path).save(store)
+        restored = LabelsZarr.load(path)
+        assert [r.uid for r in restored.rois] == [1, 2, 3]
+        assert [r.source for r in restored.rois] == ["", "", "rois_a:4"]
+        assert restored.next_uid == store.next_uid == 4
+
+    def test_next_uid_survives_deleting_the_max_uid_roi(self, tmp_path):
+        store = self._populated()  # uids 1, 2; next_uid 3
+        store.delete_roi(1)
+        path = tmp_path / "manual_labels.zarr"
+        LabelsZarr(path).save(store)
+        restored = LabelsZarr.load(path)
+        assert restored.next_uid == 3
+        index = restored.add_roi(1, disk(32, 32, 16, 16, 3))
+        assert restored.rois[index].uid == 3  # uid 2 is never reused
+
+    def test_legacy_zarr_loads_with_fresh_uids(self, tmp_path):
+        import zarr
+
+        store = self._populated()
+        path = tmp_path / "manual_labels.zarr"
+        LabelsZarr(path).save(store)
+        # strip the uid-era attrs to mimic a zarr from before they existed
+        root = zarr.open_group(str(path), mode="a")
+        mbo = dict(root.attrs["mbo"])
+        del mbo["next_uid"]
+        root.attrs["mbo"] = mbo
+        arr = root["0"]
+        image_label = dict(arr.attrs["image-label"])
+        image_label["properties"] = [
+            {k: v for k, v in p.items() if k not in ("uid", "source")}
+            for p in image_label["properties"]
+        ]
+        arr.attrs["image-label"] = image_label
+        restored = LabelsZarr.load(path)
+        assert [r.uid for r in restored.rois] == [1, 2]
+        assert all(r.source == "" for r in restored.rois)
+        assert restored.next_uid == 3
 
     def test_ngff_layout(self, tmp_path):
         import zarr

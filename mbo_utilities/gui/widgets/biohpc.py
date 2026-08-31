@@ -33,10 +33,9 @@ from imgui_bundle import (
 )
 
 from mbo_utilities.gui._imgui_helpers import fit_width, set_tooltip
-from mbo_utilities.gui.widgets._base import Widget
 from mbo_utilities.gui.widgets.widget_toggles import sub_enabled
 
-__all__ = ["BioHpcWidget", "draw_biohpc_tab"]
+__all__ = ["draw_biohpc_popup", "draw_biohpc_tab"]
 
 # demo credentials for the proof of concept. real auth never belongs in
 # source — this gate only unlocks a local, simulated workflow.
@@ -1109,32 +1108,21 @@ def draw_biohpc_tab(parent: Any) -> None:
         panel.draw_login()
 
 
-class BioHpcWidget(Widget):
-    """BioHPC transfer / metadata / analysis / jobs, as its own viewer tab."""
+def draw_biohpc_popup(parent: Any) -> None:
+    """The BioHPC window, opened from the Widgets menu."""
+    if not getattr(parent, "_show_biohpc", False):
+        return
+    from mbo_utilities.gui.widgets.widget_toggles import set_widget_enabled
 
-    name = "BioHPC"
-    tab_label = "BioHPC"
-    placement = "tab"
-    toggle_key = "biohpc"
-    priority = 80
-
-    @classmethod
-    def is_supported(cls, parent: Any) -> bool:
-        """Always available: the panel handles the no-dataset case itself."""
-        return True
-
-    def draw(self) -> None:
-        # horizontal scrollbar: over-wide content scrolls, never clips
-        with imgui_ctx.begin_child(
-            "##BioHpcContent",
-            imgui.ImVec2(0, 0),
-            imgui.ChildFlags_.none,
-            imgui.WindowFlags_.horizontal_scrollbar,
-        ):
-            with fit_width():
-                draw_biohpc_tab(self.parent)
-
-    def cleanup(self) -> None:
-        panel = getattr(self.parent, "_biohpc_panel", None)
-        if panel is not None and hasattr(panel, "cleanup"):
-            panel.cleanup()
+    # the panel gates its sub-tabs on these; the window being open means on
+    for key in ("biohpc", "biohpc.transfer", "biohpc.metadata",
+                "biohpc.analysis", "biohpc.jobs"):
+        set_widget_enabled(key, True, persist=False)
+    imgui.set_next_window_size(imgui.ImVec2(880, 620), imgui.Cond_.first_use_ever)
+    opened, keep = imgui.begin("BioHPC", True)
+    if not keep:
+        parent._show_biohpc = False
+    if opened:
+        with fit_width():
+            draw_biohpc_tab(parent)
+    imgui.end()

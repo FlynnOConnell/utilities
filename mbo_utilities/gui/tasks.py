@@ -1450,10 +1450,12 @@ def task_generate_bigstitcher(args: dict, logger: logging.Logger) -> None:
 
 # Registry
 def task_roi_workflow(args: dict, logger: logging.Logger) -> None:
-    """Register (suite2p | masknmf | none) then extract or demix drawn ROIs.
+    """Register (suite2p | masknmf | none) then extract, demix, or discover ROIs.
 
     ``args`` mirrors ``mbo_utilities.roi_workflow.run``: ``input_path``,
-    ``output_dir``, ``register_method``, ``process``, ``rois`` (labels zarr
+    ``output_dir``, ``register_method``, ``process`` (``"extract"``,
+    ``"demix"``, or ``"discover"``, which reads ``box`` and ``engine`` from
+    ``process_settings``), ``rois`` (labels zarr
     path or None for the store beside the input), ``selection``
     (``{"planes": [...0-based], "indices": [...], "labels": [...]}``),
     ``planes`` (1-based), ``register_settings``, ``process_settings``,

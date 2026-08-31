@@ -996,3 +996,17 @@ class TestImreadDispatcher:
         # imread returns Suite2pArray which is always 5D (T, C, Z, Y, X)
         assert hasattr(arr, "shape")
         assert arr.shape == (20, 1, 1, 128, 128)
+
+
+def test_plane_color_layout_channels_are_not_zplanes():
+    # 2 PMT channels with sparse metadata read as colors, not depth; LBM
+    # interleaves (many pages, or a stack_type saying so) stay z-planes
+    from mbo_utilities.arrays.tiff import _plane_color_layout
+
+    assert _plane_color_layout({"nchannels": 2}, 2) == (1, 2)
+    assert _plane_color_layout({}, 30) == (30, 1)
+    assert _plane_color_layout({"stack_type": "lbm"}, 2) == (2, 1)
+    assert _plane_color_layout({"stack_type": "single_plane"}, 2) == (1, 2)
+    assert _plane_color_layout({"num_planes": 1, "num_color_channels": 2}, 2) == (1, 2)
+    assert _plane_color_layout({"num_planes": 14}, 28) == (14, 2)
+    assert _plane_color_layout({"num_color_channels": 2}, 28) == (14, 2)
