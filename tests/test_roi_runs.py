@@ -469,7 +469,7 @@ class _Settings:
 
 
 class _Host:
-    """Stand-in for the PreviewDataWidget that owns the Run tab's settings."""
+    """Stand-in for the PreviewDataWidget that owns the Process tab's settings."""
 
     def __init__(self, s2p=None, s2p_db=None, masknmf=None):
         if s2p is not None:

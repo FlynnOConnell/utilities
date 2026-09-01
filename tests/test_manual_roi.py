@@ -472,6 +472,21 @@ class TestClassLabels:
         assert abs(cam.local.position[0] - 44.5) < 1.5
         assert abs(cam.local.position[1] - 44.5) < 1.5
 
+    def test_follow_mode_keeps_the_zoom(self, widget):
+        """Stepping through ROIs pans; it must not re-zoom the view the
+        user set, which is what made every step jump."""
+        widget.add_roi(square(4, 4, 9))
+        widget.add_roi(square(40, 40, 9))
+        widget.select_roi(0)
+        widget.follow = True
+        cam = widget.subplot.camera
+        cam.show_rect(0, 30, 0, 30)
+        width, height = cam.width, cam.height
+        widget.select_roi(1)
+        assert (cam.width, cam.height) == (width, height)
+        assert abs(cam.local.position[0] - 44.5) < 1.5
+        assert abs(cam.local.position[1] - 44.5) < 1.5
+
     def test_labeling_advances_only_in_follow_mode(self, widget):
         widget.add_roi(square(4, 4, 9))
         widget.add_roi(square(40, 40, 9))
@@ -1522,24 +1537,67 @@ class TestTracesTab:
     def test_trace_columns_fit_the_narrow_tab(self, widget):
         """The tab is a ~250px column, so the table stretches to it and the
         two least useful columns start hidden instead of running off the
-        right edge."""
+        right edge. The last column is the delete button, not a stat."""
         from mbo_utilities.gui.manual_roi import TRACE_COLUMNS
 
         assert [c[0] for c in TRACE_COLUMNS] == [
-            "roi", "source", "frames", "mean", "peak", "snr"
+            "roi", "source", "frames", "peak", ""
         ]
         assert [c[0] for c in TRACE_COLUMNS if c[2]] == ["frames", "peak"]
 
     def test_trace_sort_keys_line_up_with_the_columns(self, widget):
-        """draw_trace_table indexes one tuple by the clicked column index."""
+        """draw_trace_table indexes one tuple by the clicked column index;
+        the trailing button column has no key of its own."""
         from mbo_utilities.gui.manual_roi import TRACE_COLUMNS
 
         widget.add_roi(square(10, 10, 9))
         widget.quick_trace(0)
         pump(widget)
         key = widget._trace_rows()[0]
-        values = (widget._trace_shown(key)[0], key[1], *widget._trace_stat(key))
-        assert len(values) == len(TRACE_COLUMNS)
+        n, _mean, peak, _snr = widget._trace_stat(key)
+        values = (widget._trace_shown(key)[0], key[1], n, peak)
+        assert len(values) == len(TRACE_COLUMNS) - 1
+
+    def test_deleting_a_trace_row_takes_its_roi(self, widget):
+        widget.add_roi(square(10, 10, 9))
+        widget.add_roi(square(35, 35, 9))
+        widget.quick_trace(0)
+        widget.quick_trace(1)
+        pump(widget)
+        rows = widget._trace_rows()
+        assert widget.n_rois == 2 and len(rows) == 2
+        widget.delete_trace_row(rows[0])
+        assert widget.n_rois == 1
+        assert rows[0] not in widget._trace_rows()
+
+    def test_one_trace_per_roi(self, widget):
+        """A quick trace and a run's trace of one ROI are the same
+        measurement twice, so the row's buttons grey out once it has one."""
+        widget.add_roi(square(10, 10, 9))
+        widget.add_roi(square(35, 35, 9))
+        widget.quick_trace(0)
+        pump(widget)
+        assert widget.has_trace(0) and not widget.has_trace(1)
+        traced_row = widget._row_index[(-1, 0)]
+        free_row = widget._row_index[(-1, 1)]
+        assert widget._trace_row_disabled(traced_row)
+        assert widget._run_disabled(traced_row)
+        assert widget._trace_row_disabled(free_row) is None
+        assert widget._run_disabled(free_row) is None
+        # a batch trace covers only what is left, so nothing doubles up
+        widget.trace_in_view()
+        pump(widget)
+        assert len(widget._trace_rows()) == 2
+        # deleting the row frees the ROI again
+        widget.delete_trace_row(("uid", "quick", widget.store.rois[1].uid))
+        assert not widget.has_trace(1)
+
+    def test_deleting_a_derived_trace_row_discards_the_component(self, widget):
+        widget._add_derived(make_result(widget, [disc(40, 40), disc(20, 20)],
+                                        with_traces=True))
+        widget.delete_trace_row(("row", "find01", 1))
+        assert 1 in widget.derived[0].discarded
+        assert ("row", "find01", 1) not in widget._trace_rows()
 
     def test_top_choice_survives_stale_right_reports(self, widget):
         # the right bar redraws its old tab for a frame or two after the top
@@ -2019,7 +2077,7 @@ class TestWidgetAttach:
         assert "ROIs" in seen, f"ROIs tab missing from tab bar: {seen}"
         assert "Traces" in seen, f"Traces tab missing from tab bar: {seen}"
         assert "Runs" not in seen, "the Runs tab was removed"
-        assert "Image" in seen and "Run" in seen, "the other tabs must survive"
+        assert "Image" in seen and "Process" in seen, "the other tabs must survive"
         assert ran, "ROI tab body never drew"
         assert not errors, f"ROI tab raised: {errors}"
         assert roi.focus_tab is False, "focus must be one-shot"
@@ -2597,7 +2655,7 @@ class _StubHost:
 
 
 class TestPipelineParams:
-    """Runs started from the PROCESS card use the Run tab's settings."""
+    """Runs started from the PROCESS card use the Process tab's settings."""
 
     def test_process_maps_to_its_pipeline(self, widget):
         widget.process = "demix"
@@ -2636,7 +2694,7 @@ class TestPipelineParams:
     def test_summary_says_defaults_until_the_run_tab_builds_it(self, widget):
         label, detail = widget._pipeline_summary("masknmf")
         assert label == "masknmf: defaults"
-        assert "Run tab" in detail
+        assert "Process tab" in detail
         label, detail = widget._pipeline_summary("suite2p")
         assert label == "suite2p: defaults"
 

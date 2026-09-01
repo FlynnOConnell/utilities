@@ -125,6 +125,15 @@ class TestTopStrip:
 class TestSignalQualitySplit:
     """The plot goes on the top strip, the table stays in the right tab."""
 
+    @pytest.fixture(autouse=True)
+    def _signal_quality_on(self):
+        """The widget ships off; these tests are about it being on."""
+        from mbo_utilities.gui.widgets.widget_toggles import set_widget_enabled
+
+        set_widget_enabled("signal_quality", True, persist=False)
+        yield
+        set_widget_enabled("signal_quality", False, persist=False)
+
     @staticmethod
     def _gui(shape=(4, 1, 5, 32, 32)):
         from mbo_utilities.arrays.numpy import NumpyArray
@@ -198,7 +207,6 @@ class TestSignalQualitySplit:
             gui._sync_top_panels()
             assert not gui.top_strip.has("zstats")
         finally:
-            set_widget_enabled("signal_quality", True, persist=False)
             iw.close()
 
     def test_the_two_halves_draw_and_pair_with_the_right_tab(self):
