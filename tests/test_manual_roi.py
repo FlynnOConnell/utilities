@@ -2573,3 +2573,119 @@ class TestStripCollapse:
         assert strip.size == 260
         strip.reset_size()
         assert strip.size != 260
+
+
+class _StubSettings:
+    def __init__(self, payload, **attrs):
+        self._payload = payload
+        self.__dict__.update(attrs)
+
+    def to_dict(self):
+        return dict(self._payload)
+
+
+class _StubHost:
+    """The PreviewDataWidget bits the ROI card reads for pipeline params."""
+
+    frame_average = 1
+
+    def __init__(self, s2p=None, masknmf=None):
+        if s2p is not None:
+            self.s2p = s2p
+        if masknmf is not None:
+            self._pipeline_instances = {"MaskNMF": _StubSettings({}, settings=masknmf)}
+
+
+class TestPipelineParams:
+    """Runs started from the PROCESS card use the Run tab's settings."""
+
+    def test_process_maps_to_its_pipeline(self, widget):
+        widget.process = "demix"
+        assert widget.pipeline_for() == "masknmf"
+        widget.process = "extract-s2p"
+        assert widget.pipeline_for() == "suite2p"
+        widget.process = "extract"
+        assert widget.pipeline_for() is None
+        assert widget.pipeline_for("demix") == "masknmf"
+
+    def test_settings_come_from_the_host_or_are_none(self, widget):
+        assert widget.masknmf_settings() is None  # no host in this fixture
+        assert widget.suite2p_detection_settings() is None
+
+        widget.host = _StubHost(masknmf=_StubSettings({"demixing": {"do_demixing": 2}}))
+        assert widget.masknmf_settings() == {"demixing": {"do_demixing": 2}}
+
+        widget.host = _StubHost(s2p=_StubSettings({"detection": {"threshold_scaling": 2.0}}))
+        assert widget.suite2p_detection_settings() == {"threshold_scaling": 2.0}
+
+    def test_empty_detection_section_reads_as_none(self, widget):
+        widget.host = _StubHost(s2p=_StubSettings({"detection": {}}))
+        assert widget.suite2p_detection_settings() is None
+
+    def test_params_button_jumps_to_the_run_tab(self, widget):
+        widget.host = _StubHost()
+        widget.open_pipeline_params("masknmf")
+        assert widget.host._selected_pipeline_name == "MaskNMF"
+        assert widget.host._force_run_tab is True
+
+        widget.host._force_run_tab = False
+        widget.open_pipeline_params("suite2p")
+        assert widget.host._selected_pipeline_name == "Suite2p"
+        assert widget.host._force_run_tab is True
+
+    def test_summary_says_defaults_until_the_run_tab_builds_it(self, widget):
+        label, detail = widget._pipeline_summary("masknmf")
+        assert label == "masknmf: defaults"
+        assert "Run tab" in detail
+        label, detail = widget._pipeline_summary("suite2p")
+        assert label == "suite2p: defaults"
+
+    def test_summary_reports_the_stage_toggles(self, widget):
+        from mbo_utilities.masknmf.params import MasknmfSettings, STAGE_FORCE
+
+        settings = MasknmfSettings()
+        settings.demixing.do_demixing = STAGE_FORCE
+        widget.host = _StubHost(masknmf=settings)
+        _label, detail = widget._pipeline_summary("masknmf")
+        assert "reg:run" in detail
+        assert "demix:force" in detail
+
+    def test_demix_run_carries_the_settings(self, widget, monkeypatch, tmp_path):
+        seen = {}
+
+        def fake_demix(src, store, indices, **kwargs):
+            seen.update(kwargs)
+            return None
+
+        monkeypatch.setattr("mbo_utilities.gui.manual_roi.demix_rois", fake_demix)
+        widget.fpath = tmp_path / "movie.tif"
+        widget.host = _StubHost(masknmf=_StubSettings({"runtime": {"device": "cpu"}}))
+        widget.process = "demix"
+        widget.add_roi(square(10, 10, 9))
+        widget.run_rois([0], "params")
+        pump(widget)
+        assert seen.get("settings") == {"runtime": {"device": "cpu"}}
+
+    def test_the_card_draws_the_params_row(self, widget):
+        import traceback
+
+        from imgui_bundle import imgui
+
+        from mbo_utilities.gui.widgets.widget_toggles import set_widget_enabled
+
+        seen, errors = [], []
+        real = imgui.small_button
+
+        def spy(label, *args, **kwargs):
+            seen.append(label)
+            return real(label, *args, **kwargs)
+
+        set_widget_enabled("manual_roi", True, persist=False)
+        imgui.small_button = spy
+        try:
+            errors = draw_frames(widget, 3)
+        finally:
+            imgui.small_button = real
+            set_widget_enabled("manual_roi", False, persist=False)
+        assert not errors, errors[0]
+        assert "Params##pipeline" in seen

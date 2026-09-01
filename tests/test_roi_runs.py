@@ -455,3 +455,61 @@ def test_run_registry_round_trip(tmp_path):
     nested = tmp_path / "new" / "deep" / rr.REGISTRY_NAME
     rr.save_run_registry(nested, [])
     assert rr.load_run_registry(nested) == []
+
+
+class _Settings:
+    """Stand-in for a settings dataclass: just carries a to_dict()."""
+
+    def __init__(self, payload, **attrs):
+        self._payload = payload
+        self.__dict__.update(attrs)
+
+    def to_dict(self):
+        return dict(self._payload)
+
+
+class _Host:
+    """Stand-in for the PreviewDataWidget that owns the Run tab's settings."""
+
+    def __init__(self, s2p=None, s2p_db=None, masknmf=None):
+        if s2p is not None:
+            self.s2p = s2p
+        if s2p_db is not None:
+            self.s2p_db = s2p_db
+        if masknmf is not None:
+            self._pipeline_instances = {"MaskNMF": _Settings({}, settings=masknmf)}
+
+
+def test_full_plane_args_uses_the_run_tabs_suite2p_settings(tmp_path):
+    fpath = tmp_path / "raw.tif"
+    # tri-state 2 = force, which reaches lsp as its own kwarg
+    s2p = _Settings({"run": {"do_registration": 2}}, do_registration=2, do_detection=0)
+    host = _Host(s2p=s2p, s2p_db=_Settings({"data_path": ["x"]}))
+
+    args = rr.full_plane_args("suite2p", fpath, 3, None, host=host)
+    assert args["settings"] == {"run": {"do_registration": 2}}
+    assert args["db"] == {"data_path": ["x"]}
+    assert args["s2p_settings"] == {"force_reg": True, "force_detect": False}
+
+
+def test_full_plane_args_without_a_host_keeps_the_old_payload(tmp_path):
+    from mbo_utilities.masknmf.params import MasknmfSettings
+
+    fpath = tmp_path / "raw.tif"
+    s2p = rr.full_plane_args("suite2p", fpath, 3, None)
+    assert set(s2p) == {"input_path", "output_dir", "planes", "reader_kwargs"}
+    mnmf = rr.full_plane_args("masknmf", fpath, 1, None)
+    assert mnmf["settings"] == MasknmfSettings().to_dict()
+
+
+def test_full_plane_args_uses_the_run_tabs_masknmf_settings(tmp_path):
+    fpath = tmp_path / "raw.tif"
+    tuned = _Settings({"demixing": {"do_demixing": 2}})
+    args = rr.full_plane_args("masknmf", fpath, 1, None, host=_Host(masknmf=tuned))
+    assert args["settings"] == {"demixing": {"do_demixing": 2}}
+
+
+def test_masknmf_settings_is_none_until_the_run_tab_builds_it():
+    assert rr.masknmf_settings(None) is None
+    assert rr.masknmf_settings(_Host()) is None
+    assert rr.masknmf_settings(_Host(masknmf=_Settings({"a": 1}))) == {"a": 1}
