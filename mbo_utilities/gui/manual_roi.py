@@ -161,7 +161,8 @@ MIN_ROI_PIXELS = 9
 MIN_REGION_SIDE = 4
 SELECTED_OPACITY = SELECTED_ALPHA
 SAVE_NAME = "manual_labels.zarr"
-DEFAULT_LABEL_NAMES = ("cell", "not cell")
+# no seeded class labels: the label set starts empty, the user names their own
+DEFAULT_LABEL_NAMES: tuple[str, ...] = ()
 COLUMNS = ("id", "label", "source", "ok")
 PROCESSES = ("extract", "extract-s2p", "demix")
 
@@ -174,18 +175,18 @@ KEYBINDS = (
     ("r", "arm / disarm region drawing"),
     ("esc", "stop drawing, else clear the region"),
     ("ctrl+z", "undo the last drawn ROI"),
-    ("delete", "delete the selected ROI / discard the selected derived one"),
+    ("delete", "delete the selected ROI / discard the selected algo one"),
     ("up / down", "previous / next trace on the Traces panel, else ROI in view"),
     ("u", "next unlabeled ROI"),
     ("f", "center the shown ROI; labeling then advances"),
-    ("1-9", "label the selected ROI (drawn or derived), then advance"),
+    ("1-9", "label the selected ROI (drawn or algo), then advance"),
     ("0", "clear its label"),
-    ("y", "promote the selected derived ROI"),
-    ("n", "discard the selected derived ROI"),
-    ("x", "accept / reject the selected derived ROI"),
+    ("y", "promote the selected algo ROI"),
+    ("n", "discard the selected algo ROI"),
+    ("x", "accept / reject the selected algo ROI"),
     ("t", "quick trace the selected ROI"),
     ("b", "toggle the drawn overlay"),
-    ("d", "toggle the derived overlay"),
+    ("d", "toggle the algo overlay"),
     ("click", "select what is under the cursor (drawing off)"),
     ("ctrl+click", "toggle an ROI in the group (image, table, trace legend)"),
     ("shift+click", "add to the group (a row range in the table)"),
@@ -201,7 +202,7 @@ _HELP_STEPS = (
     "extract-s2p (suite2p's extractor) or demix (masknmf seeded NMF).",
     "Draw a region with r, then find masknmf / find suite2p detects ROIs "
     "inside it, unseeded.",
-    "Detected components arrive as a derived overlay and table rows: "
+    "Detected components arrive as an algo overlay and table rows: "
     "promote one into the drawn set (y) or discard it (n). Deleting a "
     "promoted ROI makes its row promotable again.",
     "The Traces tab plots quick traces and run traces per ROI; the Runs "
@@ -2089,7 +2090,8 @@ class ManualRoiWidget:
 
     def _draw_roi_panel(self):
         """The ROI panel: control cards over a status row, each card gated by
-        its Widgets-menu subwidget toggle."""
+        its Widgets-menu subwidget toggle. Cards split the panel width evenly,
+        so widening the window gives every card more room."""
         with fit_width("ROI tools", min_width=MIN_PANEL_WIDTH) as shown:
             if not shown:
                 return
@@ -2103,14 +2105,17 @@ class ManualRoiWidget:
                 cards.append(self._draw_labels_card)
             if sub_enabled("manual_roi", "process"):
                 cards.append(self._draw_process_card)
+            gap = em(0.6)
+            avail = imgui.get_content_region_avail().x
+            w = max((avail - gap * (len(cards) - 1)) / len(cards), em(14))
             for i, draw in enumerate(cards):
                 if i:
-                    imgui.same_line(0, em(0.6))
-                draw(h)
+                    imgui.same_line(0, gap)
+                draw(h, w)
             self._draw_status()
 
-    def _draw_navigate_card(self, h: float):
-        with card("##nav", "NAVIGATE", h):
+    def _draw_navigate_card(self, h: float, w: float = 0.0):
+        with card("##nav", "NAVIGATE", h, w):
             if imgui.button("prev"):
                 self.step(-1)
             imgui.same_line(0, em(0.4))
@@ -2132,8 +2137,8 @@ class ManualRoiWidget:
             if imgui.button("Open full FOV"):
                 self.open_full_fov()
 
-    def _draw_draw_card(self, h: float):
-        with card("##draw", "DRAW", h):
+    def _draw_draw_card(self, h: float, w: float = 0.0):
+        with card("##draw", "DRAW", h, w):
             with selected_button_style(self.drawing):
                 if imgui.button("Add ROI"):
                     self.set_drawing(not self.drawing)
@@ -2172,11 +2177,12 @@ class ManualRoiWidget:
                 if imgui.small_button("clear##region"):
                     self.clear_region()
 
-    def _draw_view_card(self, h: float):
-        with card("##view", "VIEW", h):
+    def _draw_view_card(self, h: float, w: float = 0.0):
+        with card("##view", "VIEW", h, w):
             dirty = False
-            changed, self.show_masks = imgui.checkbox("masks", self.show_masks)
+            changed, self.show_masks = imgui.checkbox("drawn", self.show_masks)
             dirty |= changed
+            set_tooltip("The ROIs you drew by hand", show_mark=False)
             imgui.same_line(0, em(0.4))
             imgui.text_disabled("(b)")
             imgui.same_line(0, em(0.6))
@@ -2186,8 +2192,9 @@ class ManualRoiWidget:
             if dirty:
                 self.refresh_overlay()
             dirty = False
-            changed, self.show_derived = imgui.checkbox("derived", self.show_derived)
+            changed, self.show_derived = imgui.checkbox("algo", self.show_derived)
             dirty |= changed
+            set_tooltip("ROIs an algorithm found (find / demix / full-plane runs)", show_mark=False)
             imgui.same_line(0, em(0.4))
             imgui.text_disabled("(d)")
             imgui.same_line(0, em(0.6))
@@ -2203,8 +2210,8 @@ class ManualRoiWidget:
             imgui.same_line(0, em(0.6))
             self._draw_save_note()
 
-    def _draw_labels_card(self, h: float):
-        with card("##labels", "LABELS", h):
+    def _draw_labels_card(self, h: float, w: float = 0.0):
+        with card("##labels", "LABELS", h, w):
             if self.n_rois:
                 if draw_progress(self.classes.labels[: self.n_rois]):
                     self.next_unlabeled()
@@ -2222,8 +2229,8 @@ class ManualRoiWidget:
                 self.assign_class(picked)
 
     def _draw_label_columns(self):
-        """One button per class, stacked top-down; a new column starts only
-        when the card's height is used up."""
+        """One button per class, split into two columns filled evenly; more
+        columns only when the card's height cannot hold half the entries."""
         picked = None
         row_h = imgui.get_frame_height_with_spacing()
         rows = max(int(imgui.get_content_region_avail().y // row_h), 1)
@@ -2232,11 +2239,15 @@ class ManualRoiWidget:
         ]
         if self.classes.names:
             entries += [("unlabel", None), ("unlabel_all", None)]
-        for c0 in range(0, len(entries), rows):
+        if not entries:
+            return None
+        ncols = max(2, -(-len(entries) // rows))
+        per_col = -(-len(entries) // ncols)
+        for c0 in range(0, len(entries), per_col):
             if c0:
                 imgui.same_line(0, em(0.8))
             imgui.begin_group()
-            for kind, i in entries[c0 : c0 + rows]:
+            for kind, i in entries[c0 : c0 + per_col]:
                 if kind == "label":
                     with label_button(self.classes.color(i)):
                         if imgui.button(f"{self.classes.names[i]} ({self.classes.count(i)})##lab{i}"):
@@ -2256,58 +2267,78 @@ class ManualRoiWidget:
             imgui.end_group()
         return picked
 
-    def _draw_process_card(self, h: float):
-        with card("##process", "PROCESS", h):
+    def _caption(self, text: str, width: float):
+        """Dim row caption at a fixed width, so the rows line up."""
+        imgui.align_text_to_frame_padding()
+        imgui.text_disabled(text)
+        imgui.same_line(width)
+
+    def _draw_process_card(self, h: float, w: float = 0.0):
+        """One action per row, each with a dim caption saying what it does:
+        run the drawn ROIs, find new ROIs in the region, run a whole plane."""
+        with card("##process", "PROCESS", h, w):
+            cap = em(3.6)
+            self._caption("ROIs", cap)
             imgui.set_next_item_width(em(7))
             changed, sel = imgui.combo("##process", PROCESSES.index(self.process), list(PROCESSES))
             if changed:
                 self.process = PROCESSES[sel]
             set_tooltip(
-                "extract: suite2p-style traces from the drawn masks.\n"
-                "extract-s2p: suite2p's own mask builder and extractor.\n"
-                "demix: masknmf NMF seeded with the drawn masks.\n"
-                "Outputs land in rois_<tag>/ beside the data.",
+                "What to run on the drawn ROIs:\n"
+                "extract - mean traces from the masks\n"
+                "extract-s2p - suite2p's own extractor\n"
+                "demix - masknmf NMF seeded with the masks",
                 show_mark=False,
             )
             imgui.same_line(0, em(0.4))
-            imgui.set_next_item_width(em(5))
+            imgui.set_next_item_width(em(4.5))
             _, self.run_tag = imgui.input_text_with_hint("##run_tag", "tag", self.run_tag)
+            set_tooltip("Names the output folder: rois_<tag>/ beside the data", show_mark=False)
             imgui.same_line(0, em(0.4))
-            if imgui.button("run listed"):
+            if imgui.button("Run"):
                 self.run_in_view()
-            set_tooltip("Run every drawn ROI currently listed in the table", show_mark=False)
+            set_tooltip(
+                "Run every drawn ROI listed in the table through the picked "
+                "process; outputs land in rois_<tag>/ beside the data",
+                show_mark=False,
+            )
+            self._caption("find", cap)
             no_region = self.region is None
             if no_region:
                 imgui.begin_disabled()
-            find_masknmf = imgui.button("find masknmf")
+            find_masknmf = imgui.button("masknmf##find")
             hovered = imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled)
             imgui.same_line(0, em(0.4))
-            find_suite2p = imgui.button("find suite2p")
+            find_suite2p = imgui.button("suite2p##find")
             hovered |= imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled)
             if no_region:
                 imgui.end_disabled()
             if hovered:
                 imgui.set_tooltip(
-                    "draw a region with r first" if no_region
-                    else "unseeded detection inside the region, on this plane"
+                    "Detect new ROIs inside a region, unseeded - draw the "
+                    "region with r first" if no_region
+                    else "Detect new ROIs inside the region, unseeded; they "
+                         "arrive as an algo overlay to promote or discard"
                 )
             if find_masknmf:
                 self.discover_region("masknmf")
             if find_suite2p:
                 self.discover_region("suite2p")
+            self._caption("plane", cap)
             no_path = self.fpath is None
             if no_path:
                 imgui.begin_disabled()
             for i, kind in enumerate(("suite2p", "masknmf")):
                 if i:
                     imgui.same_line(0, em(0.4))
-                if imgui.button(f"{kind} plane"):
+                if imgui.button(f"{kind}##plane"):
                     self.run_full_plane(kind)
                 if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
                     imgui.set_tooltip(
-                        f"Full {kind} run of plane z{self.z + 1} -> "
-                        f"zplane{self.z + 1:02d}/ beside the data.\n"
-                        "Run tab for full volume / settings."
+                        "open a file first" if no_path else
+                        f"Full {kind} run of the plane on screen -> "
+                        f"zplane{self._plane_pos(self.z).get(self.zdim, 0) + 1:02d}/ "
+                        "beside the data.\nRun tab for full volume / settings."
                     )
             if no_path:
                 imgui.end_disabled()
@@ -2329,13 +2360,8 @@ class ManualRoiWidget:
         return THEME.text_dim, self.status
 
     def _draw_status(self):
-        """help / keybinds buttons, the status message, right-aligned counts."""
-        if imgui.button("help"):
-            self.help_open = not self.help_open
-        imgui.same_line(0, em(0.6))
-        if imgui.button("keybinds"):
-            self.keybinds_open = not self.keybinds_open
-        imgui.same_line(0, em(1.0))
+        """The status message with right-aligned counts. Help / keybinds live
+        on the menu row, beside the Metadata Viewer button."""
         color, text = self._status_message()
         imgui.align_text_to_frame_padding()
         imgui.text_colored(to_vec4(color), text)
@@ -2344,7 +2370,7 @@ class ManualRoiWidget:
         if avail <= em(1):
             return
         m = sum(len(s.result.stat) - len(s.discarded) for s in self.derived)
-        counts = f"{self.n_rois} drawn · {m} derived"
+        counts = f"{self.n_rois} drawn · {m} algo"
         with imgui_ctx.begin_child(
             "##roi_counts", imgui.ImVec2(avail, em(1.6)),
             imgui.ChildFlags_.none, imgui.WindowFlags_.no_scrollbar,
@@ -2565,7 +2591,7 @@ class ManualRoiWidget:
         return (
             RowAction(RUN_ICON, f"Run - {self.process} this ROI", self._act_run, self._run_disabled),
             RowAction(TRACE_ICON, "Quick trace - mean of this ROI per frame", self._act_trace, self._trace_row_disabled),
-            RowAction(REMOVE_ICON, "Remove - delete the drawn ROI, discard the derived one", self._act_remove),
+            RowAction(REMOVE_ICON, "Remove - delete the drawn ROI, discard the algo one", self._act_remove),
         )
 
     # ------------------------------------------------------------------

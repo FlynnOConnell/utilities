@@ -210,17 +210,34 @@ def draw_process_status_indicator(parent: Any, in_menu_bar: bool = False):
         imgui.set_mouse_cursor(imgui.MouseCursor_.hand)
         imgui.set_tooltip("Click to view process console")
 
-    # 2. Metadata Button
+    # 2. Metadata / help / keybinds buttons, all in the same dark grey with
+    # their hotkeys greyed out beside them
     if not in_menu_bar:
         imgui.same_line()
-    # Dark grey background
     imgui.push_style_color(imgui.Col_.button, imgui.ImVec4(0.2, 0.2, 0.2, 1.0))
     imgui.push_style_color(imgui.Col_.button_hovered, imgui.ImVec4(0.3, 0.3, 0.3, 1.0))
     imgui.push_style_color(imgui.Col_.button_active, imgui.ImVec4(0.15, 0.15, 0.15, 1.0))
     imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.9, 0.9, 0.9, 1.0))
 
-    if imgui.button("Metadata Viewer (m)"):
+    if imgui.button("Metadata Viewer"):
         parent.show_metadata_viewer = not parent.show_metadata_viewer
+    if not in_menu_bar:
+        imgui.same_line(0, 2)
+    imgui.align_text_to_frame_padding()
+    imgui.text_disabled("(m)")
+
+    # the ROI tool's help / keybinds sit here rather than in its own panel,
+    # so the panel keeps its width for the cards
+    roi = getattr(parent, "manual_roi", None)
+    if roi is not None:
+        if not in_menu_bar:
+            imgui.same_line()
+        if imgui.button("ROI Help"):
+            roi.help_open = not roi.help_open
+        if not in_menu_bar:
+            imgui.same_line()
+        if imgui.button("ROI Keys"):
+            roi.keybinds_open = not roi.keybinds_open
 
     imgui.pop_style_color(4)
     imgui.pop_style_var()  # frame_rounding
