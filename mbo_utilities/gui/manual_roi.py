@@ -68,7 +68,6 @@ from mbo_utilities.gui.imgui import (
     SummaryImageViewer,
     draw_label_editor,
     draw_label_filter,
-    draw_progress,
     draw_range_filter,
     draw_roi_table,
 )
@@ -142,8 +141,11 @@ PANEL_LOCATION = "top"
 # menu row and its tab bar on top of this)
 PANEL_HEIGHT = 200
 
-# below these widths the panel / tabs collapse to a placeholder line
-MIN_PANEL_WIDTH = 260
+# a card narrower than this clips its controls, so instead of squeezing them
+# the row wraps and the panel asks the strip for another row's height
+MIN_CARD_EM = 20.0
+MAX_CARD_ROWS = 3
+# below this width the tabs collapse to a placeholder line
 MIN_TAB_WIDTH = 150
 
 # Traces tab columns: (name, stretch weight, hidden by default). The order is
@@ -245,6 +247,34 @@ def _line_colormap(rgb) -> int:
         color = (key[0] / 255.0, key[1] / 255.0, key[2] / 255.0, 1.0)
         idx = implot.add_colormap(name, np.array([color, color], np.float32))
     return int(idx)
+
+
+def card_grid(n: int, avail: float, min_w: float, gap: float) -> tuple[int, int, float]:
+    """Lay ``n`` cards out across ``avail`` px.
+
+    Parameters
+    ----------
+    n : int
+        Number of cards to place.
+    avail : float
+        Width available to the row, in pixels.
+    min_w : float
+        Narrowest a card may be drawn; cards wrap onto another row rather
+        than shrink past it, so their contents never clip.
+    gap : float
+        Horizontal space between two cards.
+
+    Returns
+    -------
+    tuple of (int, int, float)
+        Cards per row, number of rows, and the width every card is drawn at.
+        Rows are evened out, so five cards three-to-a-row go 3 + 2 rather
+        than leaving a single card on the second row.
+    """
+    per_row = min(max(int((avail + gap) // (min_w + gap)), 1), max(n, 1))
+    rows = -(-n // per_row)
+    per_row = -(-n // rows)
+    return per_row, rows, max((avail - gap * (per_row - 1)) / per_row, min_w)
 
 
 def labels_path(fpath) -> Path:
@@ -476,9 +506,11 @@ class ManualRoiWidget:
         self._own_strip = strip is None
         self.tools_window = TopStrip(iw.figure) if self._own_strip else strip
         self.tools_window.add_hook(self._frame)
-        self.tools_window.register(
-            TopPanel("roi", "ROI", self._draw_roi_panel, PANEL_HEIGHT, "rois", 10)
+        # kept so the panel can ask for more height once its cards wrap
+        self._roi_panel = TopPanel(
+            "roi", "ROI", self._draw_roi_panel, PANEL_HEIGHT, "rois", 10
         )
+        self.tools_window.register(self._roi_panel)
         self.tools_window.register(
             TopPanel("traces", "Traces", self.draw_traces, PANEL_HEIGHT, "traces", 11)
         )
@@ -2090,26 +2122,40 @@ class ManualRoiWidget:
 
     def _draw_roi_panel(self):
         """The ROI panel: control cards over a status row, each card gated by
-        its Widgets-menu subwidget toggle. Cards split the panel width evenly,
-        so widening the window gives every card more room."""
-        with fit_width("ROI tools", min_width=MIN_PANEL_WIDTH) as shown:
+        its Widgets-menu subwidget toggle.
+
+        Cards share the width evenly and never go below ``MIN_CARD_EM``, so
+        nothing clips off the right edge: a window too narrow to hold them on
+        one row wraps them onto more, and the strip is asked for a row's more
+        height to match. Narrower than ``MAX_CARD_ROWS`` rows can show, the
+        panel collapses to its placeholder line.
+        """
+        cards = [self._draw_navigate_card]
+        if sub_enabled("manual_roi", "tools"):
+            cards.append(self._draw_draw_card)
+        if sub_enabled("manual_roi", "overlay"):
+            cards.append(self._draw_view_card)
+        if sub_enabled("manual_roi", "labels"):
+            cards.append(self._draw_labels_card)
+        if sub_enabled("manual_roi", "process"):
+            cards.append(self._draw_process_card)
+        gap = em(0.6)
+        min_w = em(MIN_CARD_EM)
+        fewest = -(-len(cards) // MAX_CARD_ROWS)
+        with fit_width(
+            "ROI tools", min_width=fewest * min_w + (fewest - 1) * gap
+        ) as shown:
             if not shown:
+                self._roi_panel.height = PANEL_HEIGHT
                 return
-            h = max(imgui.get_content_region_avail().y - em(1.8), em(6))
-            cards = [self._draw_navigate_card]
-            if sub_enabled("manual_roi", "tools"):
-                cards.append(self._draw_draw_card)
-            if sub_enabled("manual_roi", "overlay"):
-                cards.append(self._draw_view_card)
-            if sub_enabled("manual_roi", "labels"):
-                cards.append(self._draw_labels_card)
-            if sub_enabled("manual_roi", "process"):
-                cards.append(self._draw_process_card)
-            gap = em(0.6)
             avail = imgui.get_content_region_avail().x
-            w = max((avail - gap * (len(cards) - 1)) / len(cards), em(14))
+            per_row, rows, w = card_grid(len(cards), avail, min_w, gap)
+            self._roi_panel.height = PANEL_HEIGHT * rows
+            vgap = imgui.get_style().item_spacing.y
+            body = max(imgui.get_content_region_avail().y - em(1.8), em(6))
+            h = max((body - vgap * (rows - 1)) / rows, em(6))
             for i, draw in enumerate(cards):
-                if i:
+                if i % per_row:
                     imgui.same_line(0, gap)
                 draw(h, w)
             self._draw_status()
@@ -2213,8 +2259,12 @@ class ManualRoiWidget:
     def _draw_labels_card(self, h: float, w: float = 0.0):
         with card("##labels", "LABELS", h, w):
             if self.n_rois:
-                if draw_progress(self.classes.labels[: self.n_rois]):
-                    self.next_unlabeled()
+                # just the count: NAVIGATE already carries "next unlabeled (u)"
+                done = int((self.classes.labels[: self.n_rois] >= 0).sum())
+                imgui.text_colored(
+                    to_vec4(THEME.ok if done == self.n_rois else THEME.warn),
+                    f"labeled {done}/{self.n_rois}",
+                )
             self.new_label, changed = draw_label_editor(self.classes, self.new_label, "_roi")
             if changed:
                 self._sync_store_from_classes()
@@ -2230,7 +2280,11 @@ class ManualRoiWidget:
 
     def _draw_label_columns(self):
         """One button per class, split into two columns filled evenly; more
-        columns only when the card's height cannot hold half the entries."""
+        columns only when the card's height cannot hold half the entries.
+
+        Buttons are sized to their column rather than to their text, so a
+        long class name widens nothing and the columns stay even.
+        """
         picked = None
         row_h = imgui.get_frame_height_with_spacing()
         rows = max(int(imgui.get_content_region_avail().y // row_h), 1)
@@ -2243,26 +2297,34 @@ class ManualRoiWidget:
             return None
         ncols = max(2, -(-len(entries) // rows))
         per_col = -(-len(entries) // ncols)
+        gap, hint = em(0.8), em(2.0)
+        col_w = max(
+            (imgui.get_content_region_avail().x - gap * (ncols - 1)) / ncols, em(5)
+        )
+        size = imgui.ImVec2(max(col_w - hint, em(3.5)), 0)
         for c0 in range(0, len(entries), per_col):
             if c0:
-                imgui.same_line(0, em(0.8))
+                imgui.same_line(0, gap)
             imgui.begin_group()
             for kind, i in entries[c0 : c0 + per_col]:
                 if kind == "label":
                     with label_button(self.classes.color(i)):
-                        if imgui.button(f"{self.classes.names[i]} ({self.classes.count(i)})##lab{i}"):
+                        if imgui.button(
+                            f"{self.classes.names[i]} ({self.classes.count(i)})##lab{i}",
+                            size,
+                        ):
                             picked = i
                     if i < 9:
                         imgui.same_line(0, 4)
                         imgui.text_disabled(f"({i + 1})")
                 elif kind == "unlabel":
-                    if imgui.button("unlabel##_roi"):
+                    if imgui.button("unlabel##_roi", size):
                         picked = UNLABELED
                     imgui.same_line(0, 4)
                     imgui.text_disabled("(0)")
                 else:
                     with danger_button():
-                        if imgui.button("unlabel all##_roi"):
+                        if imgui.button("unlabel all##_roi", size):
                             picked = UNLABEL_ALL
             imgui.end_group()
         return picked
@@ -2384,9 +2446,12 @@ class ManualRoiWidget:
 
     def _draw_save_note(self):
         if self._writer is None:
-            imgui.text_disabled("autosave off - ROIs are kept in memory only")
+            imgui.text_disabled("autosave off")
             if imgui.is_item_hovered():
-                imgui.set_tooltip("open a file to autosave beside it, or press Save")
+                imgui.set_tooltip(
+                    "ROIs are kept in memory only - open a file to autosave "
+                    "beside it, or press Save"
+                )
             return
         imgui.text_disabled("Autosaved")
         if not imgui.is_item_hovered():

@@ -2205,3 +2205,109 @@ class TestGroupBuffer:
         uid = widget.store.rois[0].uid
         rgb = tuple(v / 255.0 for v in widget.store.roi_rgb(0))
         assert widget._trace_color(("uid", "quick", uid)) == rgb
+
+
+class TestCardGrid:
+    """Cards wrap onto more rows rather than shrink past the width their
+    controls need, so nothing clips off the right edge."""
+
+    def _grid(self, n, avail, min_w=280.0, gap=10.0):
+        from mbo_utilities.gui.manual_roi import card_grid
+
+        return card_grid(n, avail, min_w, gap)
+
+    def test_one_row_when_they_all_fit(self):
+        assert self._grid(5, 2000)[:2] == (5, 1)
+
+    def test_wraps_instead_of_shrinking(self):
+        per_row, rows, w = self._grid(5, 900)
+        assert (per_row, rows) == (3, 2)
+        assert w >= 280
+
+    def test_rows_are_evened_out(self):
+        # room for four to a row still goes 3 + 2, not 4 + 1
+        assert self._grid(5, 1200)[:2] == (3, 2)
+
+    def test_single_card_takes_the_whole_width(self):
+        assert self._grid(1, 900) == (1, 1, 900)
+
+    def test_never_narrower_than_the_minimum(self):
+        for avail in range(200, 2400, 37):
+            for n in range(1, 6):
+                per_row, rows, w = self._grid(n, float(avail))
+                assert w >= 280, (n, avail, w)
+                assert per_row * rows >= n
+
+
+class TestPanelWrapping:
+    def _widget(self, width):
+        from mbo_utilities.gui._ndviewer import MboNDViewer
+        from mbo_utilities.gui.manual_roi import ManualRoiWidget
+
+        data = np.random.default_rng(0).random((6, 64, 64)).astype(np.float32)
+        iw = MboNDViewer(data=data, figure_kwargs={"size": (width, 900)})
+        iw.show()
+        return iw, ManualRoiWidget(iw, fpath=None)
+
+    def _drawn(self, widget, frames=6):
+        from mbo_utilities.gui.widgets.widget_toggles import set_widget_enabled
+
+        set_widget_enabled("manual_roi", True, persist=False)
+        try:
+            return draw_frames(widget, frames)
+        finally:
+            set_widget_enabled("manual_roi", False, persist=False)
+
+    def test_wide_window_keeps_one_row(self):
+        from mbo_utilities.gui.manual_roi import PANEL_HEIGHT
+
+        iw, w = self._widget(1800)
+        try:
+            assert not self._drawn(w)
+            assert w._roi_panel.height == PANEL_HEIGHT
+        finally:
+            iw.close()
+
+    def test_narrow_window_wraps_and_asks_for_more_height(self):
+        from mbo_utilities.gui.manual_roi import PANEL_HEIGHT
+
+        iw, w = self._widget(1000)
+        try:
+            assert not self._drawn(w)
+            # cards wrapped onto a second row, so the strip is asked for
+            # a second row's height instead of clipping them
+            assert w._roi_panel.height == 2 * PANEL_HEIGHT
+        finally:
+            iw.close()
+
+    def test_no_card_clips_at_any_width(self):
+        import contextlib
+
+        from imgui_bundle import imgui
+
+        from mbo_utilities.gui import manual_roi as mr
+
+        real_card = mr.card
+        seen = {}
+
+        @contextlib.contextmanager
+        def spy(name, title, height, width=0.0, *args, **kwargs):
+            with real_card(name, title, height, width, *args, **kwargs):
+                yield
+                # scroll_max_x is the previous frame's overflow, so only the
+                # last frame of a settled layout is meaningful
+                seen[name] = imgui.get_scroll_max_x()
+
+        for width in (1800, 1200, 1000, 800):
+            iw, w = self._widget(width)
+            seen.clear()
+            mr.card = spy
+            try:
+                errors = self._drawn(w)
+            finally:
+                mr.card = real_card
+                iw.close()
+            assert not errors, errors[0]
+            assert seen, f"no cards drawn at {width}"
+            clipped = {n: o for n, o in seen.items() if o > 0.5}
+            assert not clipped, f"cards clip at window width {width}: {clipped}"
