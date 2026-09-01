@@ -2311,3 +2311,95 @@ class TestPanelWrapping:
             assert seen, f"no cards drawn at {width}"
             clipped = {n: o for n, o in seen.items() if o > 0.5}
             assert not clipped, f"cards clip at window width {width}: {clipped}"
+
+
+class TestRunAll:
+    """The row pinned under the ROI table runs every listed ROI, either
+    through the picked process or as quick traces."""
+
+    def test_listed_drawn_follows_the_table_filters(self, widget):
+        for i in range(3):
+            widget.add_roi(square(2 + 14 * i, 2, 9))
+        widget.store.add_label_name("soma")
+        label(widget, 1, 0)
+        assert widget.listed_drawn() == [0, 1, 2]
+        widget.order.filter_label = 0
+        widget.order.rebuild()
+        assert widget.listed_drawn() == [1]
+
+    def test_listed_drawn_skips_algo_rows(self, widget):
+        widget.add_roi(square(10, 10, 9))
+        widget._add_derived(make_result(widget, [disc(40, 40), disc(52, 52)]))
+        assert len(widget.rows) == 3
+        assert widget.listed_drawn() == [0]
+
+    def test_trace_all_runs_every_listed_roi_on_one_thread(self, widget):
+        for i in range(3):
+            widget.add_roi(square(2 + 14 * i, 2, 9))
+        widget.trace_in_view()
+        assert len(widget._trace_threads) == 1, "one job for the whole list"
+        pump(widget)
+        traced = {uid for ts in widget.trace_sets.values() for uid in ts.data}
+        assert traced == {r.uid for r in widget.store.rois}
+
+    def test_trace_all_reports_one_job(self, widget):
+        from mbo_utilities.gui.widgets.process_manager import get_process_manager
+
+        pm = get_process_manager()
+        before = {j.job_id for j in pm.get_jobs()}
+        for i in range(3):
+            widget.add_roi(square(2 + 14 * i, 2, 9))
+        widget.trace_in_view()
+        new = [j for j in pm.get_jobs() if j.job_id not in before]
+        assert len(new) == 1
+        assert "3 ROIs" in new[0].description
+        pump(widget)
+        assert new[0].status == "completed"
+        assert new[0].status_message == "3 traces"
+
+    def test_trace_all_with_nothing_listed_is_a_no_op(self, widget):
+        widget.trace_in_view()
+        assert widget._trace_threads == []
+
+    def test_run_all_sends_the_listed_rois_to_the_process(self, widget, monkeypatch):
+        sent = {}
+        monkeypatch.setattr(
+            type(widget), "run_rois",
+            lambda self, indices, tag: sent.update(indices=list(indices), tag=tag),
+        )
+        for i in range(3):
+            widget.add_roi(square(2 + 14 * i, 2, 9))
+        widget.run_tag = "batch"
+        widget.run_in_view()
+        assert sent == {"indices": [0, 1, 2], "tag": "batch"}
+
+    def test_the_tab_draws_the_run_all_row(self, widget):
+        import traceback
+
+        from imgui_bundle import imgui
+
+        from mbo_utilities.gui.manual_roi import RUN_ICON, TRACE_ICON
+
+        widget.add_roi(square(10, 10, 9))
+        seen, errors = [], []
+        real = imgui.button
+
+        def spy(label, *args, **kwargs):
+            seen.append(label)
+            return real(label, *args, **kwargs)
+
+        def body(*_args):
+            try:
+                widget.draw_tab()
+            except Exception:
+                errors.append(traceback.format_exc())
+
+        widget.tools_window._update_calls[:] = [body]
+        imgui.button = spy
+        try:
+            widget.iw.figure.canvas.draw()
+        finally:
+            imgui.button = real
+        assert not errors, errors[0]
+        assert f"{RUN_ICON} run all" in seen
+        assert f"{TRACE_ICON} trace all" in seen

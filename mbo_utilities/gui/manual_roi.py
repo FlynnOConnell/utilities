@@ -1741,37 +1741,70 @@ class ManualRoiWidget:
             return "no (T, Y, X) movie behind this view"
         return None
 
-    def quick_trace(self, index: int):
-        """Mean of the ROI's pixels per frame, on a thread tracked as a job."""
+    def _trace_inputs(self, index: int):
+        """``(uid, mask, weights, movie)`` for one drawn ROI, or None when it
+        is out of range or has no movie behind it."""
         if not 0 <= index < self.n_rois:
-            return
+            return None
         record = self.store.rois[index]
         movie = self.movie(record.z)
         if movie is None:
-            return
-        uid = record.uid
+            return None
         mask = self.store.labels[record.z] == (index + 1)
-        weights = feather_mask(mask)
+        return record.uid, mask, feather_mask(mask), movie
+
+    def quick_trace(self, index: int):
+        """Mean of the ROI's pixels per frame, on a thread tracked as a job."""
+        self.trace_rois([index])
+
+    def trace_rois(self, indices: list[int]):
+        """Quick trace several drawn ROIs on one background job.
+
+        Parameters
+        ----------
+        indices : list of int
+            Store indices; any without a movie behind them are skipped. The
+            ROIs are traced one after another on a single thread, so running
+            a long list never spawns a thread per ROI.
+        """
+        work = []
+        for i in indices:
+            got = self._trace_inputs(i)
+            if got is not None:
+                work.append((i, *got))
+        if not work:
+            return
         # traces taken at different binnings live on different time bases;
         # record it so the table can say so
         averaged = int(getattr(self.host, "frame_average", 1) or 1)
-        description = f"quick trace - ROI {index}"
+        description = (
+            f"quick trace - ROI {work[0][0]}" if len(work) == 1
+            else f"quick trace - {len(work)} ROIs"
+        )
         job = get_process_manager().start_job("roi_trace", description)
         self.status = f"{description} started"
 
         def run():
-            try:
-                y = roi_trace(movie, mask, weights=weights)
-            except Exception as error:  # noqa: BLE001 - reported on the job
-                self.logger.exception(f"{description} failed")
-                job.fail(f"{type(error).__name__}: {error}")
-                self._trace_results.put((uid, None, str(error)))
-                return
-            job.done(f"{y.size} frames")
-            entry = {"F": np.asarray(y, np.float32), "frame_average": averaged}
-            self._trace_results.put((uid, entry, None))
+            frames = 0
+            for n, (index, uid, mask, weights, movie) in enumerate(work):
+                try:
+                    y = roi_trace(movie, mask, weights=weights)
+                except Exception as error:  # noqa: BLE001 - reported on the job
+                    self.logger.exception(f"quick trace - ROI {index} failed")
+                    job.fail(f"{type(error).__name__}: {error}")
+                    self._trace_results.put((uid, None, str(error)))
+                    return
+                frames = int(y.size)
+                entry = {"F": np.asarray(y, np.float32), "frame_average": averaged}
+                self._trace_results.put((uid, entry, None))
+                job.set_progress((n + 1) / len(work), f"ROI {index}")
+            job.done(
+                f"{frames} frames" if len(work) == 1 else f"{len(work)} traces"
+            )
 
-        thread = threading.Thread(target=run, name=f"roi-trace-{index}", daemon=True)
+        thread = threading.Thread(
+            target=run, name=f"roi-trace-{work[0][0]}", daemon=True
+        )
         self._trace_threads.append(thread)
         thread.start()
 
@@ -1900,10 +1933,17 @@ class ManualRoiWidget:
     def run_roi(self, index: int):
         self.run_rois([index], f"roi{index:04d}")
 
+    def listed_drawn(self) -> list[int]:
+        """Store indices of the drawn ROIs the table currently lists."""
+        return [self.rows[int(r)][1] for r in self.order.order if self.rows[int(r)][0] < 0]
+
     def run_in_view(self):
         """Run every drawn ROI the table currently lists."""
-        listed = [self.rows[int(r)][1] for r in self.order.order if self.rows[int(r)][0] < 0]
-        self.run_rois(listed, self.run_tag)
+        self.run_rois(self.listed_drawn(), self.run_tag)
+
+    def trace_in_view(self):
+        """Quick trace every drawn ROI the table currently lists."""
+        self.trace_rois(self.listed_drawn())
 
     def discover_region(self, engine: str):
         """Detect ROIs inside ``self.region`` on the plane on screen; the
@@ -2509,8 +2549,8 @@ class ManualRoiWidget:
     # ------------------------------------------------------------------
 
     def draw_tab(self):
-        """The ROIs tab: filters, the combined drawn + derived table, and
-        the selection footer."""
+        """The ROIs tab: filters, the combined drawn + algo table, the
+        selection footer and the run-all row pinned under it."""
         changed_any = False
         if self.store.nz > 1:
             on = self.order.plane is not None
@@ -2539,7 +2579,7 @@ class ManualRoiWidget:
         if changed_any:
             self.order.rebuild()
 
-        footer = 2 * imgui.get_frame_height_with_spacing() + 12
+        footer = 3 * imgui.get_frame_height_with_spacing() + 12
         with imgui_ctx.begin_child("##roi_table", imgui.ImVec2(0, -footer)):
             if self.rows:
                 pos = self.order.pos
@@ -2623,6 +2663,55 @@ class ManualRoiWidget:
             imgui.begin_disabled()
             imgui.button("Delete selected")
             imgui.end_disabled()
+        self._draw_run_all()
+
+    def _draw_run_all(self):
+        """The run-all row pinned under the table.
+
+        Right-aligned so it sits under the table's per-row action icons and
+        carries the same two: run every listed drawn ROI through the picked
+        process, or quick trace them all.
+        """
+        listed = self.listed_drawn()
+        run_label = f"{RUN_ICON} run all"
+        trace_label = f"{TRACE_ICON} trace all"
+        pad = imgui.get_style().frame_padding.x * 2
+        gap = em(0.4)
+        width = (
+            imgui.calc_text_size(run_label).x
+            + imgui.calc_text_size(trace_label).x
+            + 2 * pad
+            + gap
+        )
+        avail = imgui.get_content_region_avail().x
+        if width < avail:
+            imgui.set_cursor_pos_x(imgui.get_cursor_pos_x() + avail - width)
+        no_run = not listed or self.fpath is None
+        if no_run:
+            imgui.begin_disabled()
+        if imgui.button(run_label):
+            self.run_in_view()
+        if no_run:
+            imgui.end_disabled()
+        if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
+            imgui.set_tooltip(
+                "no data path to write beside" if self.fpath is None
+                else "no drawn ROIs listed" if not listed
+                else f"Run all {len(listed)} listed ROIs through {self.process} "
+                     f"-> {OUT_PREFIX}{self.run_tag}/"
+            )
+        imgui.same_line(0, gap)
+        why = self.trace_disabled(0) if listed else "no drawn ROIs listed"
+        if why is not None:
+            imgui.begin_disabled()
+        if imgui.button(trace_label):
+            self.trace_in_view()
+        if why is not None:
+            imgui.end_disabled()
+        if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
+            imgui.set_tooltip(
+                why or f"Quick trace all {len(listed)} listed ROIs"
+            )
 
     # row actions: callbacks take a table row index and route per kind
 
