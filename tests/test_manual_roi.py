@@ -2403,3 +2403,123 @@ class TestRunAll:
         assert not errors, errors[0]
         assert f"{RUN_ICON} run all" in seen
         assert f"{TRACE_ICON} trace all" in seen
+
+
+class TestTracePlotView:
+    """The trace plot's autofit toggle and x axis units."""
+
+    def _fits(self, widget, frames=1):
+        """Times the plot asked implot to refit while drawing."""
+        import traceback
+
+        from imgui_bundle import implot
+
+        calls, errors = [], []
+        real = implot.set_next_axes_to_fit
+
+        def spy():
+            calls.append(1)
+            return real()
+
+        def body(*_args):
+            try:
+                widget.draw_traces()
+            except Exception:
+                errors.append(traceback.format_exc())
+
+        widget.tools_window._update_calls[:] = [body]
+        implot.set_next_axes_to_fit = spy
+        try:
+            for _ in range(frames):
+                widget.iw.figure.canvas.draw()
+        finally:
+            implot.set_next_axes_to_fit = real
+        assert not errors, errors[0]
+        return len(calls)
+
+    def _two_traces(self, widget):
+        for i in range(2):
+            widget.add_roi(square(2 + 14 * i, 2, 9))
+        widget.quick_trace(0)
+        widget.quick_trace(1)
+        pump(widget)
+        return widget._sorted_trace_rows()
+
+    def test_autofit_starts_on_in_frames(self, widget):
+        assert widget.autofit is True
+        assert widget.x_unit == "frames"
+
+    def test_time_units_need_a_sampling_rate(self, widget):
+        widget._fs_read, widget._fs_value = True, None
+        assert widget.x_units() == ("frames",)
+        widget._fs_value = 10.0
+        assert widget.x_units() == ("frames", "seconds", "ms")
+
+    def test_x_scale_follows_the_unit_and_the_traces_binning(self, widget):
+        widget.add_roi(square(10, 10, 9))
+        widget.quick_trace(0)
+        pump(widget)
+        key = widget._sorted_trace_rows()[0]
+        widget._fs_read, widget._fs_value = True, 10.0
+        widget.x_unit = "frames"
+        assert widget._x_scale(key) == 1.0
+        widget.x_unit = "seconds"
+        assert widget._x_scale(key) == pytest.approx(0.1)
+        widget.x_unit = "ms"
+        assert widget._x_scale(key) == pytest.approx(100.0)
+        # a trace binned 4x holds one sample per 4 acquired frames
+        widget.trace_sets[next(iter(widget.trace_sets))].data[
+            widget.store.rois[0].uid
+        ]["frame_average"] = 4
+        widget.x_unit = "seconds"
+        assert widget._x_scale(key) == pytest.approx(0.4)
+
+    def test_x_scale_stays_in_frames_without_a_rate(self, widget):
+        widget.add_roi(square(10, 10, 9))
+        widget.quick_trace(0)
+        pump(widget)
+        key = widget._sorted_trace_rows()[0]
+        widget._fs_read, widget._fs_value = True, None
+        widget.x_unit = "seconds"
+        assert widget._x_scale(key) == 1.0
+
+    def test_autofit_off_holds_the_view_across_trace_switches(self, widget):
+        rows = self._two_traces(widget)
+        widget.select_trace(rows[0])
+        assert self._fits(widget) >= 1, "the first draw fits"
+
+        widget.autofit = False
+        widget.select_trace(rows[1])
+        assert self._fits(widget) == 0, "switching traces must hold the view"
+
+        widget.autofit = True
+        widget.select_trace(rows[0])
+        assert self._fits(widget) >= 1
+
+    def test_fit_button_overrides_autofit_off(self, widget):
+        rows = self._two_traces(widget)
+        widget.select_trace(rows[0])
+        widget.autofit = False
+        self._fits(widget)  # settle
+        widget._force_fit = True
+        assert self._fits(widget) >= 1
+
+    def test_changing_units_refits_even_with_autofit_off(self, widget):
+        rows = self._two_traces(widget)
+        widget.select_trace(rows[0])
+        widget._fs_read, widget._fs_value = True, 10.0
+        widget.autofit = False
+        self._fits(widget)  # settle
+
+        # what the units combo does on a change
+        widget.x_unit = "seconds"
+        widget._force_fit = True
+        assert self._fits(widget) >= 1
+
+    def test_an_unavailable_unit_falls_back_to_frames(self, widget):
+        rows = self._two_traces(widget)
+        widget.select_trace(rows[0])
+        widget._fs_read, widget._fs_value = True, None
+        widget.x_unit = "seconds"
+        self._fits(widget)
+        assert widget.x_unit == "frames"

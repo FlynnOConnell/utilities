@@ -159,6 +159,10 @@ TRACE_COLUMNS = (
     ("snr", 1.0, False),
 )
 
+# x axis units for the trace plot; the time ones need a sampling rate
+X_UNITS = ("frames", "seconds", "ms")
+X_AXIS_LABELS = {"frames": "frame", "seconds": "time (s)", "ms": "time (ms)"}
+
 MIN_ROI_PIXELS = 9
 MIN_REGION_SIDE = 4
 SELECTED_OPACITY = SELECTED_ALPHA
@@ -494,6 +498,13 @@ class ManualRoiWidget:
         self._trace_sort = (0, True)
         self._trace_fit = True
         self._plot_key = None
+        # autofit refits the axes whenever the plotted traces change; turn it
+        # off to hold a zoomed-in stretch while stepping through ROIs
+        self.autofit = True
+        self._force_fit = False
+        self.x_unit = X_UNITS[0]
+        self._fs_value: float | None = None
+        self._fs_read = False
 
         self.process = PROCESSES[0]
         self.run_tag = "manual"
@@ -2823,6 +2834,52 @@ class ManualRoiWidget:
         now = int(getattr(self.host, "frame_average", 1) or 1)
         return f" x{taken}" if taken != now and taken > 1 else ""
 
+    def fs(self) -> float | None:
+        """Sampling rate of the data behind the view in Hz, or None.
+
+        Read once from the array's metadata; without one the trace plot can
+        only offer frame units.
+        """
+        if not self._fs_read:
+            self._fs_read = True
+            movie = self.movie()
+            meta = getattr(getattr(movie, "arr", None), "metadata", None)
+            if meta:
+                try:
+                    from mbo_utilities.metadata import get_param
+
+                    rate = get_param(dict(meta), "fs")
+                    self._fs_value = float(rate) if rate else None
+                except Exception:
+                    self.logger.debug("no usable fs in metadata", exc_info=True)
+        return self._fs_value
+
+    def x_units(self) -> tuple[str, ...]:
+        """X axis units on offer: frames always, time only with an ``fs``."""
+        return X_UNITS if self.fs() else X_UNITS[:1]
+
+    def _x_scale(self, key) -> float:
+        """X units per sample of one trace.
+
+        A trace taken at frame averaging ``A`` holds one sample per ``A``
+        acquired frames, so its samples sit ``A / fs`` seconds apart - traces
+        binned differently still line up in time.
+        """
+        rate = self.fs()
+        if self.x_unit == "frames" or not rate:
+            return 1.0
+        entry = self._trace_entry(key) or {}
+        per_sample = int(entry.get("frame_average", 1) or 1) / rate
+        return per_sample * (1000.0 if self.x_unit == "ms" else 1.0)
+
+    def _cursor_scale(self) -> float:
+        """X units per viewer frame, for the playhead line."""
+        rate = self.fs()
+        if self.x_unit == "frames" or not rate:
+            return 1.0
+        per_frame = int(getattr(self.host, "frame_average", 1) or 1) / rate
+        return per_frame * (1000.0 if self.x_unit == "ms" else 1.0)
+
     def _window_spec(self) -> tuple[str, int]:
         """``(projection, size)`` of the viewer's window function.
 
@@ -2957,13 +3014,40 @@ class ManualRoiWidget:
             self._trace_display.clear()
             self._trace_stats.clear()
             self._trace_fit = True
-        imgui.same_line(0, 14)
+        imgui.same_line(0, 12)
+        changed, self.autofit = imgui.checkbox("autofit", self.autofit)
+        set_tooltip(
+            "Refit the axes to whatever is plotted. Turn it off to keep the "
+            "stretch you zoomed to while stepping through ROIs.",
+            show_mark=False,
+        )
+        if changed and self.autofit:
+            self._force_fit = True
+        imgui.same_line(0, 6)
+        if imgui.button("fit"):
+            self._force_fit = True
+        set_tooltip("Fit the axes to the plotted traces now", show_mark=False)
+        imgui.same_line(0, 10)
+        units = self.x_units()
+        if self.x_unit not in units:
+            self.x_unit = units[0]
+        imgui.set_next_item_width(em(5.5))
+        changed, sel = imgui.combo("##x_unit", units.index(self.x_unit), list(units))
+        set_tooltip(
+            "X axis units"
+            + ("" if self.fs() else " - no fs in the metadata, so frames only"),
+            show_mark=False,
+        )
+        if changed:
+            self.x_unit = units[sel]
+            # the axis means something else now, so the old range would not
+            # show anything sensible
+            self._force_fit = True
+        imgui.same_line(0, 12)
         proj, size = self._window_spec()
         window = f" · {proj} {size}" if size > 1 else ""
-        imgui.text_disabled(
-            f"{header}, frame {self.current_frame()}{window} · "
-            "drag pans, scroll zooms, double-click fits"
-        )
+        imgui.text_disabled(f"{header}, frame {self.current_frame()}{window}")
+        set_tooltip("drag pans, scroll zooms, double-click fits", show_mark=False)
         height = max(imgui.get_content_region_avail().y - 4, 60.0)
         if implot.get_current_context() is None:
             implot.create_context()
@@ -2971,9 +3055,11 @@ class ManualRoiWidget:
         if key != self._plot_key:
             self._plot_key = key
             self._trace_fit = True
-        if self._trace_fit:
+        fit = (self._trace_fit and self.autofit) or self._force_fit
+        self._trace_fit = False
+        self._force_fit = False
+        if fit:
             implot.set_next_axes_to_fit()
-            self._trace_fit = False
         flags = implot.Flags_.no_title
         if len(lines) <= 1:
             flags |= implot.Flags_.no_legend
@@ -2983,21 +3069,24 @@ class ManualRoiWidget:
             # no auto-fit flags: the axes stay interactive between refits.
             # each line takes its ROI's mask color via a single-color
             # colormap; neuropil is always the same blue
-            implot.setup_axes("frame", "dF/F (%)")
+            implot.setup_axes(X_AXIS_LABELS[self.x_unit], "dF/F (%)")
             ctrl = imgui.get_io().key_ctrl
             for label, tkey in lines:
                 y, yneu = self._display(tkey)
                 if y is None:
                     continue
+                scale = self._x_scale(tkey)
                 rgb = self._trace_color(tkey)
                 if rgb is not None:
                     implot.push_colormap(_line_colormap(rgb))
-                implot.plot_line(label, self._windowed(y))
+                implot.plot_line(label, self._windowed(y), xscale=scale)
                 if rgb is not None:
                     implot.pop_colormap()
                 if yneu is not None:
                     implot.push_colormap(_fneu_colormap())
-                    implot.plot_line(f"{label} Fneu", self._windowed(yneu))
+                    implot.plot_line(
+                        f"{label} Fneu", self._windowed(yneu), xscale=scale
+                    )
                     implot.pop_colormap()
                 pair = self._key_to_pair(tkey)
                 if pair is not None:
@@ -3018,9 +3107,12 @@ class ManualRoiWidget:
                                 self.select_derived(*pair)
                         implot.end_legend_popup()
             if self.tdim is not None:
-                moved, frame = implot.drag_line_x(0, float(self.current_frame()), _CURSOR_COLOR, 1.5)[:2]
-                if moved:
-                    self.set_frame(round(frame))
+                cursor = self._cursor_scale()
+                moved, at = implot.drag_line_x(
+                    0, float(self.current_frame()) * cursor, _CURSOR_COLOR, 1.5
+                )[:2]
+                if moved and cursor:
+                    self.set_frame(round(at / cursor))
         finally:
             implot.end_plot()
 
