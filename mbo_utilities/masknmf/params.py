@@ -134,7 +134,9 @@ class MasknmfDemixingSettings:
 
 @dataclass
 class MasknmfRuntimeSettings:
-    device: str = "auto"  # auto | cuda | cpu
+    # GPU by default: superpixel init needs CUDA, and "auto" quietly fell
+    # back to a cpu run that is orders of magnitude slower
+    device: str = "cuda"  # auto | cuda | cpu
     frame_batch_size: int = 300
     exclude_border_radius: int = 0
     # native HDF5 stage outputs stay on disk so Skip/Run gating can resume

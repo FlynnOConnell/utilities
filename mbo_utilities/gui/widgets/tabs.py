@@ -2,7 +2,7 @@
 
 Every tab in the main tab bar is a ``placement = "tab"`` widget with an entry
 in the Widgets menu. The bodies live where the work lives — the Preview and
-Signal Quality tabs delegate to ``PreviewDataWidget``, Run to the pipelines
+Signal Quality tabs delegate to ``PreviewDataWidget``, Process to the pipelines
 package, Cloud to ``gui/_cloud.py`` — so these classes are only the seam
 between a tab and its panel.
 
@@ -91,10 +91,10 @@ class SignalQualityTabWidget(Widget):
 
 
 class RunTabWidget(Widget):
-    """The Run tab: registration / segmentation pipelines."""
+    """The Process tab: registration / segmentation pipelines."""
 
-    name = "Run"
-    tab_label = "Run"
+    name = "Process"
+    tab_label = "Process"
     placement = "tab"
     toggle_key = "run"
     priority = 30

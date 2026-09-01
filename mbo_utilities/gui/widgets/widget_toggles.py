@@ -96,10 +96,11 @@ WIDGET_REGISTRY: tuple[WidgetEntry, ...] = (
         key="signal_quality",
         label="Signal Quality",
         tooltip="Per-plane z-stats and signal-quality plots.",
+        default=False,
     ),
     WidgetEntry(
         key="run",
-        label="Run",
+        label="Process",
         tooltip="Registration / segmentation pipelines.",
     ),
     WidgetEntry(

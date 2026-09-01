@@ -13,6 +13,7 @@ import h5py
 
 from . import log
 from .file_io import load_npy
+from .metadata.base import normalize_ops_arrays
 from .metadata.io import _build_ome_metadata
 
 from tqdm.auto import tqdm
@@ -2083,7 +2084,10 @@ def _try_generic_writers(
             ops["T"] = nt
             ops["nt"] = nt
             # Convert Path objects to strings for cross-platform compatibility
-            np.save(outpath.parent / "ops.npy", _convert_paths_to_strings(ops))
+            np.save(
+                outpath.parent / "ops.npy",
+                normalize_ops_arrays(_convert_paths_to_strings(ops)),
+            )
     elif outpath.suffix.lower() == ".zarr":
         # Zarr v3 format for numpy arrays. Match the layout produced by
         # `_write_volumetric_zarr` so generic-writer output behaves the
@@ -2317,8 +2321,10 @@ def write_ops(metadata, raw_filename, **kwargs):
         if key not in protected_keys:
             ops[key] = value
 
-    # Convert Path objects to strings for cross-platform compatibility
-    np.save(ops_path, _convert_paths_to_strings(ops))
+    # Convert Path objects to strings for cross-platform compatibility, and
+    # images / per-frame vectors back to arrays: metadata merged in above may
+    # have come through JSON as lists, which suite2p indexes with .shape
+    np.save(ops_path, normalize_ops_arrays(_convert_paths_to_strings(ops)))
     logger.debug(
         f"Ops file written to {ops_path} with nframes={ops['nframes']}, nframes_chan1={ops.get('nframes_chan1')}"
     )

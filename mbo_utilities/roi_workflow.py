@@ -65,6 +65,7 @@ __all__ = [
     "RoiSelection",
     "RunResult",
     "as_movie",
+    "detection_algo",
     "load_rois",
     "load_run_dir",
     "select_rois",
@@ -574,6 +575,32 @@ class RunResult:
     iscell: np.ndarray | None
     uids: np.ndarray | None
     store_indices: np.ndarray | None
+    #: which detector produced these rows ("s2p-sparsery", "masknmf", ...);
+    #: "" for a result built without ops (tests, hand-made results)
+    algo: str = ""
+
+
+def detection_algo(ops: dict) -> str:
+    """Which detector produced a run dir's ROIs.
+
+    suite2p picks its detector from ops rather than from a name, so report
+    the algorithm the run actually used - sourcery, sparsery or cellpose -
+    instead of the bare "suite2p" that says nothing about the components.
+    """
+    wf = ops.get("roi_workflow") or {}
+    engine = str(
+        wf.get("engine")
+        or ("masknmf" if ops.get("pipeline") == "masknmf" else "suite2p")
+    )
+    if engine != "suite2p":
+        return engine
+    # same derivation lbm_suite2p_python uses (db_settings), so a run dir
+    # reports the detector it was actually configured with
+    if ops.get("algorithm"):
+        return f"s2p-{ops['algorithm']}"
+    if ops.get("anatomical_only"):
+        return "s2p-cellpose"
+    return "s2p-sparsery" if ops.get("sparse_mode", True) else "s2p-sourcery"
 
 
 def load_run_dir(path: str | Path, *, iscell_only: bool = True, logger=None) -> RunResult:
@@ -658,7 +685,7 @@ def load_run_dir(path: str | Path, *, iscell_only: bool = True, logger=None) -> 
     return RunResult(
         path=path, kind=str(kind), z=z, shape=(int(ops["Ly"]), int(ops["Lx"])),
         stat=stat, F=F, Fneu=Fneu, norm=norm, iscell=iscell,
-        uids=uids, store_indices=store_indices,
+        uids=uids, store_indices=store_indices, algo=detection_algo(ops),
     )
 
 
@@ -821,7 +848,14 @@ def _ops_for(source, movie: PlaneMovie) -> dict:
     if p is not None:
         d = p if p.is_dir() else p.parent
         if (d / "ops.npy").exists():
-            return np.load(d / "ops.npy", allow_pickle=True).item()
+            from mbo_utilities.metadata.base import normalize_ops_arrays
+
+            # an ops.npy written before the images were normalized carries
+            # them as JSON lists; repair on the way through rather than
+            # copying the breakage into this run's outputs
+            return normalize_ops_arrays(
+                np.load(d / "ops.npy", allow_pickle=True).item()
+            )
     nt, ly, lx = movie.shape
     ops = {"Ly": ly, "Lx": lx, "nframes": nt, "processing_history": []}
     meta = getattr(movie.arr, "metadata", None) or {}

@@ -17,6 +17,7 @@ from mbo_utilities.arrays._base import _imwrite_base, ReductionMixin, Shape5DMix
 from mbo_utilities.pipeline_registry import PipelineInfo, register_pipeline
 from mbo_utilities.file_io import load_npy
 from mbo_utilities._writers import _convert_paths_to_strings
+from mbo_utilities.metadata.base import normalize_ops_arrays
 
 logger = log.get("arrays.bin")
 
@@ -235,7 +236,7 @@ class BinArray(ReductionMixin, Shape5DMixin):
 
             # Write ops.npy (convert Path objects to strings for cross-platform compatibility)
             ops_file = outpath / "ops.npy"
-            np.save(ops_file, _convert_paths_to_strings(md))
+            np.save(ops_file, normalize_ops_arrays(_convert_paths_to_strings(md)))
             logger.info(f"Wrote ops.npy to {ops_file}")
             return outpath
 

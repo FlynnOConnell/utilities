@@ -658,6 +658,48 @@ def strip_for_export(md: dict) -> dict:
 
 
 
+# ops fields that must reach suite2p as arrays: it and its plotting code
+# index them with .shape / .size, never as sequences
+_OPS_ARRAY_KEYS: frozenset[str] = frozenset(
+    _SUITE2P_SUMMARY_IMAGES + _PER_FRAME_VECTORS + _SUITE2P_REGISTRATION_INTERNALS
+)
+
+
+def normalize_ops_arrays(ops: dict) -> dict:
+    """Bring an ops dict's image and per-frame fields back to ndarrays.
+
+    Metadata that has been through JSON — a zarr attr, a tiff description,
+    an h5 attribute — comes back as (nested) lists. suite2p and
+    lbm_suite2p_python index those fields with ``.shape``, so a list-valued
+    ``meanImgE`` surfaces downstream as "'list' object has no attribute
+    'shape'" and every figure that touches it fails.
+
+    Empty ones are dropped rather than saved as empty arrays: the consumers
+    test for the key's absence, and lbm_suite2p_python recomputes
+    ``meanImgE`` from ``meanImg`` when it is missing.
+    """
+    import numpy as np
+
+    out = {}
+    for k, v in ops.items():
+        if k not in _OPS_ARRAY_KEYS:
+            out[k] = v
+            continue
+        if isinstance(v, (list, tuple)):
+            if not len(v):
+                continue
+            try:
+                v = np.asarray(v)
+            except Exception:
+                _logger().warning("ops field %r is not array-shaped; kept as is", k)
+                out[k] = v
+                continue
+        if isinstance(v, np.ndarray) and v.size == 0:
+            continue
+        out[k] = v
+    return out
+
+
 # keys whose values are filesystem paths recorded by a pipeline run —
 # provenance that goes stale the moment the output directory is copied to
 # another machine or share (db.npy data_path, ops raw_file, ...).

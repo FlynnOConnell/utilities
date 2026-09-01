@@ -220,6 +220,8 @@ def write_plane_outputs(
 
 def merge_ops(plane_dir: str | Path, updates: dict) -> dict:
     """Merge ``updates`` into the plane dir's ops.npy (create if missing)."""
+    from mbo_utilities.metadata.base import normalize_ops_arrays
+
     ops_path = Path(plane_dir) / "ops.npy"
     ops: dict = {}
     if ops_path.exists():
@@ -231,5 +233,5 @@ def merge_ops(plane_dir: str | Path, updates: dict) -> dict:
     ops.update(updates)
     ops["save_path"] = str(plane_dir)
     ops["ops_path"] = str(ops_path)
-    np.save(ops_path, ops)
+    np.save(ops_path, normalize_ops_arrays(ops))
     return ops
