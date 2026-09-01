@@ -6,7 +6,8 @@ strip off the top edge of the figure and, when PreviewDataWidget hosts it
 (the ``Widgets > Manual ROI Labeling`` toggle), adds ROIs / Traces / Runs
 tabs to the right widget. These tests pin the mask bookkeeping (fill,
 overlap rejection, delete + renumber), the pointer-event wiring through the
-real pygfx renderer, persistence, z-planes, the overlay controls, region
+real pygfx renderer, persistence, z-planes, the overlay controls (fill,
+outline and circle mask modes), region
 mode, uid-keyed traces, derived sets (rows, picking, promote / discard),
 run submission and restore, the on/off toggle, and that the panel, tabs and
 menu draw without raising.
@@ -94,6 +95,43 @@ def label(widget, index, class_index):
     """Give ROI ``index`` a class the way the buttons / hotkeys do."""
     widget.select_roi(index)
     widget.assign_class(class_index)
+
+
+def drawn_showing(widget) -> bool:
+    """Whether this plane's drawn ROIs are on screen, whichever mask mode is
+    up: pixels in the fill overlay, a live path in the vector one."""
+    if widget.mask_mode == "fill":
+        return widget.overlay.visible and bool(widget.overlay.data.value[..., 3].any())
+    return widget.outline.visible
+
+
+def derived_showing(widget) -> bool:
+    """The same question for the algo overlay."""
+    if widget.mask_mode == "fill":
+        return widget.derived_overlay.visible and bool(
+            widget.derived_overlay.data.value[..., 3].any()
+        )
+    return widget.derived_outline.visible
+
+
+def paths(line) -> list:
+    """A line graphic's pieces, split on the NaN rows between them; nothing
+    at all when it is hidden, so the placeholder buffer of a line that was
+    never filled cannot pass for geometry."""
+    if not line.visible:
+        return []
+    xy = line.data.value[:, :2]
+    out, run = [], []
+    for point in xy:
+        if np.isnan(point).any():
+            if run:
+                out.append(np.array(run))
+                run = []
+            continue
+        run.append(point)
+    if run:
+        out.append(np.array(run))
+    return out
 
 
 def disc(y, x, r=3):
@@ -187,6 +225,7 @@ class TestMasks:
 
     def test_masks_render_feathered(self, widget):
         """The lbm_suite2p_python look: soft edges, nothing past the mask."""
+        widget.set_mask_mode("fill")
         widget.add_roi(square(10, 10, 9))
         widget.selected = -1
         widget.refresh_overlay()
@@ -198,6 +237,7 @@ class TestMasks:
     def test_only_the_selected_roi_gets_a_white_rim(self, widget):
         from mbo_utilities.gui.roi_runs import _rim
 
+        widget.set_mask_mode("fill")
         widget.add_roi(square(2, 2, 9))
         widget.add_roi(square(20, 20, 9))
         widget.selected = 0
@@ -207,17 +247,19 @@ class TestMasks:
         assert (rgb[rims[0]] == 255).all(axis=1).any()
         assert not (rgb[rims[1]] == 255).all(axis=1).any()
 
-    def test_hiding_masks_hides_the_overlay(self, widget):
+    @pytest.mark.parametrize("mode", ["circle", "outline", "fill"])
+    def test_hiding_masks_hides_the_overlay(self, widget, mode):
+        widget.set_mask_mode(mode)
         widget.add_roi(square(10, 10, 9))
         widget.show_masks = False
         widget.refresh_overlay()
-        assert not widget.overlay.visible
+        assert not widget.overlay.visible and not widget.outline.visible
         widget.show_masks = True
         widget.refresh_overlay()
-        assert widget.overlay.visible
-        assert widget.overlay.data.value[..., 3].any()
+        assert drawn_showing(widget)
 
     def test_touching_rois_keep_distinct_colors(self, widget):
+        widget.set_mask_mode("fill")
         widget.add_roi(square(10, 10, 9))
         widget.add_roi(square(20, 10, 9))
         widget.selected = -1
@@ -252,6 +294,7 @@ class TestSelection:
     def test_selected_fill_is_more_opaque(self, widget):
         from mbo_utilities.gui.manual_roi import SELECTED_OPACITY
 
+        widget.set_mask_mode("fill")
         widget.add_roi(square(4, 4, 20))
         widget.add_roi(square(34, 34, 20))
         widget.select_roi(0)
@@ -281,6 +324,7 @@ class TestSelection:
         assert widget.selected == -1
 
     def test_opacity_changes_pixels(self, widget):
+        widget.set_mask_mode("fill")
         widget.add_roi(square(10, 10, 12))
         widget.select_roi(-1)
         before = widget.overlay.data.value.copy()
@@ -342,6 +386,8 @@ class TestSelection:
         for overlay in (widget.overlay, widget.derived_overlay):
             tiles = overlay.world_object.children
             assert tiles and not any(t.material.pick_write for t in tiles)
+        for line in (widget.outline, widget.derived_outline):
+            assert not line.world_object.material.pick_write
         assert not widget.stroke_line.world_object.material.pick_write
         widget.add_roi(square(10, 10, 9))
         assert not any(
@@ -451,6 +497,7 @@ class TestClassLabels:
     def test_assign_class_recolors_and_counts(self, widget):
         from mbo_utilities.annotation import class_color
 
+        widget.set_mask_mode("fill")
         widget.add_roi(square(10, 10, 9))
         widget.store.add_label_name("soma")
         widget.assign_class(0)
@@ -573,12 +620,135 @@ class TestMaskAppearance:
         assert (widget.derived_overlay.vmin, widget.derived_overlay.vmax) == (0, 255)
 
     def test_feather_ramps_toward_the_edge(self, widget):
+        widget.set_mask_mode("fill")
         widget.add_roi(square(10, 10, 20))
         widget.select_roi(-1)
         alpha = widget.overlay.data.value[..., 3].astype(int)
         row = alpha[20, 10:30]
         assert row[0] < row[1] < row[2]  # the 3 px ramp
         assert row[9] == round(255 * widget.opacity)
+
+
+class TestMaskModes:
+    """Circle and outline draw the masks as line geometry instead of a
+    filled raster, so the pixels under an ROI stay readable - the point of
+    the modes, and the default the widget opens in."""
+
+    def test_circles_are_the_default_and_leave_the_fill_off(self, widget):
+        widget.add_roi(square(10, 10, 9))
+        assert widget.mask_mode == "circle"
+        assert widget.outline.visible and not widget.overlay.visible
+        # thin, and thin on screen: a hairline however far in you zoom
+        assert widget.line_width == 1.0
+        assert widget.outline.thickness == 1.0
+        assert widget.outline.size_space == "screen"
+
+    def test_the_circle_rings_the_mask_it_stands_in_for(self, widget):
+        widget.add_roi(square(10, 10, 9))  # pixels 10..19, centre (15, 15)
+        widget.select_roi(-1)
+        (ring,) = paths(widget.outline)
+        assert np.allclose(ring[0], ring[-1])  # closed
+        centre = ring[:-1].mean(axis=0)  # the closing point is the first one
+        assert np.allclose(centre, (15.0, 15.0), atol=0.1)
+        radius = np.linalg.norm(ring - centre, axis=1)
+        # the equal-area circle of a 100 px mask, a touch outside its edge
+        assert np.allclose(radius, radius[0], atol=0.01)
+        assert 5.0 < radius[0] < 7.0
+
+    def test_the_ring_size_slider_scales_it(self, widget):
+        widget.add_roi(square(10, 10, 9))
+        widget.select_roi(-1)
+        before = np.ptp(paths(widget.outline)[0], axis=0)
+        widget.ring_scale *= 2
+        widget.refresh_overlay()
+        after = np.ptp(paths(widget.outline)[0], axis=0)
+        assert np.allclose(after, before * 2, rtol=0.01)
+
+    def test_a_tiny_mask_still_gets_a_ring(self, widget):
+        """The case the modes exist for: a few pixels per cell."""
+        widget.add_roi(square(20, 20, 2))  # 3x3, the smallest ROI allowed
+        widget.select_roi(-1)
+        (ring,) = paths(widget.outline)
+        radius = np.linalg.norm(ring[:-1] - ring[:-1].mean(axis=0), axis=1)
+        # its equal-area circle is under 2 px across, so the floor holds it
+        assert np.allclose(radius, 2.0, atol=0.01)
+
+    def test_outline_mode_traces_the_mask_border(self, widget):
+        widget.set_mask_mode("outline")
+        widget.add_roi(square(10, 10, 9))  # pixels 10..19
+        widget.select_roi(-1)
+        points = np.concatenate(paths(widget.outline))
+        # the border of the pixels themselves, not half a pixel inside it
+        assert np.allclose(points.min(axis=0), (10.0, 10.0))
+        assert np.allclose(points.max(axis=0), (20.0, 20.0))
+
+    def test_each_roi_keeps_its_own_color(self, widget):
+        widget.add_roi(square(10, 10, 9))
+        widget.add_roi(square(30, 30, 9))
+        widget.select_roi(-1)
+        colors = widget.outline.colors.value
+        finite = ~np.isnan(widget.outline.data.value[:, 0])
+        shown = {tuple(np.round(c, 3)) for c in colors[finite]}
+        assert len(shown) == 2
+        for i in (0, 1):
+            rgb = tuple(round(c / 255.0, 3) for c in widget.store.roi_rgb(i))
+            assert any(np.allclose(s[:3], rgb, atol=0.01) for s in shown)
+        # opaque: a hairline at the fill overlay's opacity is invisible
+        assert (colors[finite][:, 3] == 1.0).all()
+
+    def test_the_selection_gets_a_white_ring_outside_its_own(self, widget):
+        widget.add_roi(square(10, 10, 9))
+        widget.select_roi(0)
+        rings = paths(widget.outline)
+        assert len(rings) == 2
+        spans = sorted(np.ptp(r[:, 0]) for r in rings)
+        assert spans[1] > spans[0]  # the halo sits outside the ROI's ring
+        white = np.array([1.0, 1.0, 1.0, 1.0])
+        assert np.allclose(widget.outline.colors.value[-1], white)
+
+    def test_switching_modes_swaps_which_graphic_draws(self, widget):
+        widget.add_roi(square(10, 10, 9))
+        widget.set_mask_mode("fill")
+        assert widget.overlay.visible and not widget.outline.visible
+        assert widget.overlay.data.value[..., 3].any()
+        widget.set_mask_mode("outline")
+        assert widget.outline.visible and not widget.overlay.visible
+        widget.cycle_mask_mode()
+        assert widget.mask_mode == "fill"
+        widget.cycle_mask_mode()
+        assert widget.mask_mode == "circle"
+
+    def test_deleting_the_last_roi_empties_the_overlay(self, widget):
+        widget.add_roi(square(10, 10, 9))
+        assert widget.outline.visible
+        widget.delete_roi(0)
+        assert not widget.outline.visible
+
+    def test_derived_sets_draw_as_paths_too(self, widget):
+        widget._add_derived(make_result(widget, [disc(40, 40), disc(52, 52)]))
+        assert widget.derived_outline.visible
+        assert not widget.derived_overlay.visible
+        assert len(paths(widget.derived_outline)) == 2
+        widget.discard_derived(0, 0)
+        assert len(paths(widget.derived_outline)) == 1
+        widget.toggle_derived_overlay()
+        assert not widget.derived_outline.visible
+
+    def test_a_rejected_component_draws_dimmer(self, widget):
+        widget._add_derived(make_result(widget, [disc(40, 40)]))
+        opaque = widget.derived_outline.colors.value[0, 3]
+        widget.set_accepted(0, 0)
+        assert not widget.derived[0].accepted[0]
+        assert widget.derived_outline.colors.value[0, 3] < opaque
+
+    def test_the_width_slider_reaches_both_lines(self, widget):
+        widget.add_roi(square(10, 10, 9))
+        widget._add_derived(make_result(widget, [disc(40, 40)]))
+        widget.line_width = 2.5
+        widget.refresh_overlay()
+        widget.refresh_derived_overlay()
+        assert widget.outline.thickness == 2.5
+        assert widget.derived_outline.thickness == 2.5
 
 
 class TestImguiWindows:
@@ -613,8 +783,6 @@ class TestImguiWindows:
         widget._add_derived(make_result(widget, [disc(40, 40)], with_traces=True))
         widget.set_region_mode(True)
         widget._on_stroke([(30.0, 30.0), (50.0, 50.0)])
-        widget.help_open = True
-        widget.keybinds_open = True
 
         seen = []
         real = imgui.begin_child
@@ -649,10 +817,17 @@ class TestImguiWindows:
         widget.add_roi(square(10, 10, 9))
         widget.set_drawing(True)
         names = lambda: {g.name for g in widget.subplot.graphics}  # noqa: E731
-        assert {"manual_roi_overlay", "manual_roi_derived", "stroke"} <= names()
+        drawn = {
+            "manual_roi_overlay",
+            "manual_roi_derived",
+            "manual_roi_outline",
+            "manual_roi_derived_outline",
+            "stroke",
+        }
+        assert drawn <= names()
         widget.close()
         assert widget.iw.figure.imgui_windows.get("top") is None
-        assert not ({"manual_roi_overlay", "manual_roi_derived", "stroke"} & names())
+        assert not (drawn & names())
         # pan is handed back and a stroke no longer lands anywhere
         assert "mouse1" in widget.subplot.controller.controls
         before = widget.counts[:]
@@ -786,11 +961,11 @@ class TestZPlanes:
 
     def test_z_change_refreshes_the_overlay(self, zwidget):
         zwidget.add_roi(square(10, 10, 9))
-        assert zwidget.overlay.data.value[..., 3].any()
+        assert drawn_showing(zwidget)
         zwidget.iw.indices["z"] = 2
-        assert not zwidget.overlay.data.value[..., 3].any()
+        assert not drawn_showing(zwidget)
         zwidget.iw.indices["z"] = 0
-        assert zwidget.overlay.data.value[..., 3].any()
+        assert drawn_showing(zwidget)
 
     def test_selecting_a_roi_on_another_plane_jumps_z(self, zwidget):
         zwidget.add_roi(square(10, 10, 9))  # plane 0
@@ -827,10 +1002,9 @@ class TestZPlanes:
 
     def test_derived_overlay_follows_z(self, zwidget):
         zwidget._add_derived(make_result(zwidget, [disc(40, 40)], z=2))
-        assert not zwidget.derived_overlay.visible  # the set lives on z 2
+        assert not derived_showing(zwidget)  # the set lives on z 2
         zwidget.iw.indices["z"] = 2
-        assert zwidget.derived_overlay.visible
-        assert zwidget.derived_overlay.data.value[40, 40, 3] > 0
+        assert derived_showing(zwidget)
 
     def test_selecting_a_derived_row_jumps_z(self, zwidget):
         zwidget._add_derived(make_result(zwidget, [disc(40, 40)], z=2))
@@ -1153,6 +1327,7 @@ class TestDerived:
         assert widget.selected_derived is None
 
     def test_derived_overlay_draws_the_footprints(self, widget):
+        widget.set_mask_mode("fill")
         self._set(widget)
         assert widget.derived_overlay.visible
         assert np.allclose(tuple(widget.derived_overlay.offset), (0, 0, 1.5))
@@ -2146,11 +2321,11 @@ class TestPlaneMapping:
 
     def test_channel_flip_swaps_the_overlay(self, cwidget):
         cwidget.add_roi(square(10, 10, 9))  # plane 0 = (c0, z0)
-        assert cwidget.overlay.data.value[..., 3].any()
+        assert drawn_showing(cwidget)
         cwidget.iw.indices["c"] = 1
-        assert not cwidget.overlay.data.value[..., 3].any()
+        assert not drawn_showing(cwidget)
         cwidget.iw.indices["c"] = 0
-        assert cwidget.overlay.data.value[..., 3].any()
+        assert drawn_showing(cwidget)
 
     def test_selecting_jumps_both_sliders(self, cwidget):
         cwidget.iw.indices["c"] = 1
@@ -2724,6 +2899,55 @@ class TestPipelineParams:
         pump(widget)
         assert seen.get("settings") == {"runtime": {"device": "cpu"}}
 
+    def test_the_process_card_gates_find_on_a_region(self, widget):
+        """The region row carries the region tool, and its engine buttons
+        only come alive once a region exists - suite2p first in both rows."""
+        import traceback
+
+        from imgui_bundle import imgui
+
+        from mbo_utilities.gui.widgets.widget_toggles import set_widget_enabled
+
+        def _draw():
+            seen, errors = [], []
+            real_button = imgui.button
+            real_disabled = imgui.begin_disabled
+
+            def button_spy(label, *args, **kwargs):
+                seen.append(label)
+                return real_button(label, *args, **kwargs)
+
+            set_widget_enabled("manual_roi", True, persist=False)
+            imgui.button = button_spy
+            try:
+                errors = draw_frames(widget, 3)
+            finally:
+                imgui.button = real_button
+                imgui.begin_disabled = real_disabled
+                set_widget_enabled("manual_roi", False, persist=False)
+            assert not errors, errors[0]
+            return seen
+
+        seen = _draw()
+        assert "Draw region" in seen, seen
+        # suite2p before masknmf in the region row and in the plane row
+        for suffix in ("##find", "##plane"):
+            order = [b for b in seen if b.endswith(suffix)]
+            assert order[:2] == [f"suite2p{suffix}", f"masknmf{suffix}"], order
+
+        # DRAW no longer carries a region button: one region tool, in the row
+        # whose buttons need a region
+        one_frame = [b for b in seen[: len(seen) // 3]]
+        assert one_frame.count("Draw region") == 1, one_frame
+        assert "Add ROI" in one_frame and "Undo" in one_frame, one_frame
+
+        widget.set_region_mode(True)
+        widget._on_stroke([(10.0, 10.0), (40.0, 40.0)])
+        assert widget.region is not None
+        seen = _draw()
+        assert "Region" in seen, "the button names the region once one exists"
+        assert seen[: len(seen) // 3].count("Region") == 1, "only PROCESS has one"
+
     def test_the_card_draws_the_params_row(self, widget):
         import traceback
 
@@ -2746,4 +2970,279 @@ class TestPipelineParams:
             imgui.small_button = real
             set_widget_enabled("manual_roi", False, persist=False)
         assert not errors, errors[0]
-        assert "Params##pipeline" in seen
+        assert "Open##pipeline" in seen
+
+
+class TestHelpAndKeysAreAppWide:
+    """One Help button and one Keybinds button for the whole app; the ROI
+    tool is a section inside each, not a second pair of buttons."""
+
+    def test_the_roi_guide_is_markdown_for_the_help_viewer(self):
+        from mbo_utilities.gui.manual_roi import _HELP_STEPS, help_markdown
+
+        doc = help_markdown()
+        assert doc.startswith("## ROI Labeling")
+        assert "### Workflow" in doc and "### Output files" in doc
+        assert "manual_labels.zarr" in doc
+        for step in _HELP_STEPS:
+            assert step in doc
+        # the keys are the Keybinds popup's job, not the guide's
+        assert "### Keys" not in doc
+
+    def test_the_help_viewer_lists_the_roi_tab_only_with_the_widget(self):
+        from mbo_utilities.gui import _help_viewer
+
+        class _Parent:
+            manual_roi = None
+
+        parent = _Parent()
+        assert [name for name, _ in _help_viewer.docs_for(parent)] == [
+            name for name, _ in _help_viewer.DOCS
+        ]
+        parent.manual_roi = object()
+        docs = _help_viewer.docs_for(parent)
+        assert docs[-1] == ("ROI Labeling", _help_viewer.ROI_DOC)
+        assert _help_viewer.load_doc(_help_viewer.ROI_DOC).startswith("## ROI")
+
+    def test_the_keybinds_popup_gains_an_roi_section(self):
+        from mbo_utilities.gui.manual_roi import KEYBINDS
+        from mbo_utilities.gui.widgets.menu_bar import _roi_keybinds
+
+        class _Parent:
+            manual_roi = None
+
+        parent = _Parent()
+        assert _roi_keybinds(parent) == []
+        parent.manual_roi = object()
+        rows = _roi_keybinds(parent)
+        assert ("ROI Labeling", None) in rows, "a section header, not a button"
+        assert rows[-len(KEYBINDS):] == list(KEYBINDS)
+
+
+class TestAdoptingRunsStartedElsewhere:
+    """A pipeline run launched from the Process tab writes its plane dirs
+    beside the data; the widget picks them up while the session is running
+    instead of only rebuilding them from the registry on the next start."""
+
+    @staticmethod
+    def _run_dir(path, accepted=(True, False)):
+        stat = np.array([{
+            "ypix": np.array([40, 41], np.int32),
+            "xpix": np.array([40, 41], np.int32),
+            "lam": np.ones(2, np.float32), "med": (40.0, 40.0), "npix": 2,
+        }] * len(accepted), dtype=object)
+        path.mkdir(parents=True, exist_ok=True)
+        np.save(path / "stat.npy", stat)
+        np.save(path / "iscell.npy",
+                np.array([[1.0 if a else 0.0, 0.5] for a in accepted], np.float32))
+        np.save(path / "ops.npy", {"Ly": 64, "Lx": 64, "plane": 1}, allow_pickle=True)
+        return path
+
+    def test_a_finished_run_is_loaded_with_its_iscell(self, widget, tmp_path):
+        from mbo_utilities.gui.widgets.process_manager import (
+            ProcessInfo,
+            get_process_manager,
+        )
+
+        d = self._run_dir(tmp_path / "zplane01")
+        widget.fpath = tmp_path / "data.bin"
+        info = ProcessInfo(
+            pid=-4242, description="suite2p plane01", start_time=0.0,
+            task_type="suite2p",
+            args={"output_dir": str(tmp_path), "planes": [1]},
+            status="completed",
+        )
+        pm = get_process_manager()
+        pm._processes[info.pid] = info
+        try:
+            widget._adopt_checked = 0.0
+            widget._adopt_finished_runs()
+            assert [s.result.path for s in widget.derived] == [d]
+            # accepted / rejected come from the run's own iscell, curatable
+            # in the table like any other loaded run
+            assert widget.derived[0].accepted.tolist() == [True, False]
+
+            # and only once: a second pass must not double-load it
+            widget._adopt_checked = 0.0
+            widget._adopt_finished_runs()
+            assert len(widget.derived) == 1
+        finally:
+            pm._processes.pop(info.pid, None)
+
+    def test_another_datasets_run_is_left_alone(self, widget, tmp_path):
+        from mbo_utilities.gui.widgets.process_manager import (
+            ProcessInfo,
+            get_process_manager,
+        )
+
+        other = tmp_path / "elsewhere"
+        self._run_dir(other / "zplane01")
+        widget.fpath = tmp_path / "here" / "data.bin"
+        (tmp_path / "here").mkdir()
+        info = ProcessInfo(
+            pid=-4243, description="suite2p", start_time=0.0,
+            task_type="suite2p",
+            args={"output_dir": str(other), "planes": [1]},
+            status="completed",
+        )
+        pm = get_process_manager()
+        pm._processes[info.pid] = info
+        try:
+            widget._adopt_checked = 0.0
+            widget._adopt_finished_runs()
+            assert widget.derived == []
+        finally:
+            pm._processes.pop(info.pid, None)
+
+    def test_the_trace_rows_delete_button_can_be_clicked(self, widget):
+        """The row selectable spans every column, so the delete button in the
+        last one needs allow_overlap or the row eats its clicks."""
+        from imgui_bundle import imgui
+
+        widget._add_derived(make_result(widget, [disc(40, 40)], with_traces=True))
+        flags = []
+        real = imgui.selectable
+
+        def spy(label, *args, **kwargs):
+            if label.startswith("0##tr_") or "##tr_" in label:
+                flags.append(args[1] if len(args) > 1 else 0)
+            return real(label, *args, **kwargs)
+
+        import traceback
+
+        errors = []
+
+        def body(*_args):
+            try:
+                widget.draw_trace_table()
+            except Exception:
+                errors.append(traceback.format_exc())
+
+        widget.tools_window._update_calls[:] = [body]
+        imgui.selectable = spy
+        try:
+            for _ in range(2):
+                widget.iw.figure.canvas.draw()
+        finally:
+            imgui.selectable = real
+        assert not errors, errors[0]
+        assert flags, "no trace rows drawn"
+        for f in flags:
+            assert f & imgui.SelectableFlags_.allow_overlap
+
+
+class TestFollowModeAdvances:
+    """Center & advance (f): labeling steps to the next ROI that still needs
+    a label, drawn or algo."""
+
+    def test_labeling_an_algo_row_skips_ones_already_labeled(self, widget):
+        widget._add_derived(make_result(
+            widget, [disc(10, 10), disc(30, 30), disc(50, 50)]
+        ))
+        widget.store.add_label_name("soma")
+        widget.store.add_label_name("dendrite")
+        widget._resync()
+        widget.follow = True
+
+        # row 1 is already labeled, so labeling row 0 must land on row 2
+        rows = [widget._row_index[(0, k)] for k in range(3)]
+        widget.derived[0].classes[1] = 1
+        widget._resync()
+
+        widget.select_derived(0, 0)
+        widget.assign_class(0)
+        assert widget.derived[0].classes[0] == 0
+        assert widget.selected_derived == (0, 2), widget.selected_derived
+        assert widget.order.current == rows[2]
+
+    def test_it_wraps_to_the_first_row_still_needing_a_label(self, widget):
+        widget._add_derived(make_result(widget, [disc(10, 10), disc(30, 30)]))
+        widget.store.add_label_name("soma")
+        widget._resync()
+        widget.follow = True
+
+        widget.select_derived(0, 1)
+        widget.assign_class(0)  # the last row: wrap back to row 0
+        assert widget.selected_derived == (0, 0)
+
+    def test_a_label_filter_does_not_skip_the_next_drawn_roi(self):
+        """With "unlabeled only" on, the row leaves the view as it is
+        labeled and the cursor is already on the next one; stepping past it
+        skipped every other ROI."""
+        from mbo_utilities.gui.manual_roi import _PlaneOrder
+
+        labels = np.array([-1, -1, -1], np.int64)
+        order = _PlaneOrder({"source": np.zeros(3, np.int64)}, labels, 3)
+        order.sources = np.zeros(3, np.int64)
+        order.rebuild()
+        assert order.pos == 0
+
+        # ROI 0 labeled and filtered out of the view: pos now points at ROI 1
+        labels[0] = 0
+        order.filter_label = -1  # FILTER "unlabeled only"
+        order.rebuild()
+        assert order.current == 1, order.order
+        assert order.next_unlabeled(inclusive=True) and order.current == 1
+        assert order.next_unlabeled() and order.current == 2
+
+
+class TestLabelButtons:
+    """Class buttons read as two aligned columns, and the unlabel actions
+    keep the top row's corners whatever the class list does."""
+
+    @staticmethod
+    def _draw(widget):
+        from imgui_bundle import imgui
+
+        from mbo_utilities.gui.widgets.widget_toggles import set_widget_enabled
+
+        seen, small = [], []
+        real_button, real_small = imgui.button, imgui.small_button
+
+        def button_spy(label, *args, **kwargs):
+            seen.append(label)
+            return real_button(label, *args, **kwargs)
+
+        def small_spy(label, *args, **kwargs):
+            small.append((label, imgui.get_cursor_pos_x(),
+                          imgui.get_content_region_avail().x))
+            return real_small(label, *args, **kwargs)
+
+        set_widget_enabled("manual_roi", True, persist=False)
+        imgui.button, imgui.small_button = button_spy, small_spy
+        try:
+            errors = draw_frames(widget, 3)
+        finally:
+            imgui.button, imgui.small_button = real_button, real_small
+            set_widget_enabled("manual_roi", False, persist=False)
+        assert not errors, errors[0]
+        return seen, small
+
+    def test_class_buttons_paint_their_own_columns(self, widget):
+        widget.store.add_label_name("spine")
+        widget.store.add_label_name("dendrite")
+        widget._resync()
+        seen, _small = self._draw(widget)
+        # the button label is hidden: the count and the name are painted as
+        # two left-aligned columns instead of one centred string
+        assert "##lab0" in seen and "##lab1" in seen, seen
+        assert not [s for s in seen if s.startswith("n=")], seen
+        assert widget._count_text(0) == "n=0"
+
+    def test_unlabel_actions_hold_the_top_corners(self, widget):
+        widget.store.add_label_name("spine")
+        widget._resync()
+        _seen, small = self._draw(widget)
+        left = [row for row in small if row[0].startswith("unlabel##")]
+        right = [row for row in small if row[0].startswith("unlabel all##")]
+        assert left and right, small
+        # same row, one at each end: the right one starts past the middle of
+        # the width the left one had to work with
+        _l, lx, lavail = left[0]
+        _r, rx, _ravail = right[0]
+        assert rx > lx + lavail * 0.5, (lx, rx, lavail)
+
+    def test_no_label_names_means_no_buttons(self, widget):
+        seen, small = self._draw(widget)
+        assert not [s for s in seen if s.startswith("##lab")], seen
+        assert not [row for row in small if "unlabel" in row[0]], small

@@ -25,6 +25,19 @@ DOCS = [
     ("File Formats", "file_formats.md"),
 ]
 
+# not a file: the ROI tool writes its own guide, so it stays next to the
+# code it documents instead of drifting in a shipped markdown file
+ROI_DOC = "::roi::"
+
+
+def docs_for(parent: Any) -> list[tuple[str, str]]:
+    """The doc tabs to show: the shipped ones, plus the ROI tool's guide as
+    a section when that widget is on. One Help button for the whole app."""
+    docs = list(DOCS)
+    if getattr(parent, "manual_roi", None) is not None:
+        docs.append(("ROI Labeling", ROI_DOC))
+    return docs
+
 
 def get_docs_dir() -> Path:
     """get path to embedded docs directory."""
@@ -33,6 +46,10 @@ def get_docs_dir() -> Path:
 
 def load_doc(filename: str) -> str:
     """load markdown doc from assets, with caching."""
+    if filename == ROI_DOC:
+        from mbo_utilities.gui.manual_roi import help_markdown
+
+        return help_markdown()
     if filename not in _doc_cache:
         doc_path = get_docs_dir() / filename
         if doc_path.exists():
@@ -77,8 +94,9 @@ def draw_help_popup(parent: Any) -> None:
             imgui.close_current_popup()
         else:
             # doc selector tabs
+            docs = docs_for(parent)
             if imgui.begin_tab_bar("##HelpTabs"):
-                for i, (name, filename) in enumerate(DOCS):
+                for i, (name, filename) in enumerate(docs):
                     if imgui.begin_tab_item(name)[0]:
                         parent._help_selected_doc = i
                         imgui.end_tab_item()
@@ -92,7 +110,9 @@ def draw_help_popup(parent: Any) -> None:
             content_height = avail.y - 35  # space for close button
 
             if imgui.begin_child("##HelpContent", ImVec2(0, content_height), imgui.ChildFlags_.borders):
-                _, filename = DOCS[parent._help_selected_doc]
+                # the ROI tab comes and goes with its widget, so the
+                # remembered index can outlive the tab it pointed at
+                _, filename = docs[min(parent._help_selected_doc, len(docs) - 1)]
                 content = load_doc(filename)
                 _render_markdown(content)
                 imgui.end_child()

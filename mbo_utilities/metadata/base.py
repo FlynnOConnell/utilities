@@ -660,8 +660,13 @@ def strip_for_export(md: dict) -> dict:
 
 # ops fields that must reach suite2p as arrays: it and its plotting code
 # index them with .shape / .size, never as sequences
+# sdmov / refImg0 are not on the export denylist (they never reach a tiff
+# or zarr attr) but suite2p indexes them the same way
 _OPS_ARRAY_KEYS: frozenset[str] = frozenset(
-    _SUITE2P_SUMMARY_IMAGES + _PER_FRAME_VECTORS + _SUITE2P_REGISTRATION_INTERNALS
+    _SUITE2P_SUMMARY_IMAGES
+    + _PER_FRAME_VECTORS
+    + _SUITE2P_REGISTRATION_INTERNALS
+    + ("sdmov", "refImg0")
 )
 
 
@@ -694,10 +699,75 @@ def normalize_ops_arrays(ops: dict) -> dict:
                 _logger().warning("ops field %r is not array-shaped; kept as is", k)
                 out[k] = v
                 continue
+            # a list of Python floats reads back as float64; suite2p writes
+            # these fields as float32 and callers index them by dtype
+            if v.dtype == np.float64:
+                v = v.astype(np.float32)
         if isinstance(v, np.ndarray) and v.size == 0:
             continue
         out[k] = v
     return out
+
+
+def repair_ops_file(path) -> bool:
+    """Normalize one ``ops.npy`` in place; True when it had to be rewritten.
+
+    Run dirs written before the ops fields were normalized hold their
+    images as JSON lists, and nothing rewrites ops.npy on a detection-only
+    re-run - it is copied as is - so the plots keep failing until the file
+    itself is repaired.
+    """
+    import numpy as np
+
+    path = Path(path)
+    if not path.exists():
+        return False
+    try:
+        ops = np.load(path, allow_pickle=True).item()
+    except Exception as error:  # noqa: BLE001 - a bad ops.npy is not fatal here
+        _logger().warning("could not read %s to repair it: %s", path, error)
+        return False
+    if not isinstance(ops, dict):
+        return False
+    bad = [
+        k for k, v in ops.items()
+        if k in _OPS_ARRAY_KEYS and isinstance(v, (list, tuple))
+    ]
+    if not bad:
+        return False
+    try:
+        np.save(path, normalize_ops_arrays(ops))
+    except Exception as error:  # noqa: BLE001 - read-only / locked file
+        _logger().warning("could not rewrite %s: %s", path, error)
+        return False
+    _logger().info("repaired %s: %s were lists, not arrays", path, ", ".join(bad))
+    return True
+
+
+def repair_ops_tree(path) -> int:
+    """Repair every ``ops.npy`` in a run dir and its plane children.
+
+    Returns the number of files rewritten. Accepts a dir, an ops.npy, or a
+    file inside a plane dir, so callers can hand it whatever the user
+    pointed the run at.
+    """
+    path = Path(path)
+    if path.is_file():
+        path = path.parent
+    if not path.is_dir():
+        return 0
+    # the dir itself, its plane children, and one more level for the
+    # suite2p/planeNN layout
+    targets = [path / "ops.npy"]
+    for pattern in ("*/ops.npy", "*/*/ops.npy"):
+        targets += sorted(path.glob(pattern))
+    seen, fixed = set(), 0
+    for target in targets:
+        if target in seen:
+            continue
+        seen.add(target)
+        fixed += bool(repair_ops_file(target))
+    return fixed
 
 
 # keys whose values are filesystem paths recorded by a pipeline run —

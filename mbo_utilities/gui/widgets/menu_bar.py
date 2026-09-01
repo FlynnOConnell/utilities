@@ -82,11 +82,11 @@ def draw_menu_bar(parent: Any):
             draw_widgets_menu(parent)
             if imgui.begin_menu("Docs", True):
                 if imgui.menu_item(
-                    "Help", "F1", p_selected=False, enabled=True
+                    "Help", "h", p_selected=False, enabled=True
                 )[0]:
                     parent._show_help_popup = True
                 if imgui.menu_item(
-                    "Keybinds", "/", p_selected=False, enabled=True
+                    "Keybinds", "k", p_selected=False, enabled=True
                 )[0]:
                     parent._show_keybinds_popup = True
                 imgui.separator()
@@ -102,6 +102,42 @@ def draw_menu_bar(parent: Any):
             parent._clear_stale_progress()
             draw_process_status_indicator(parent, in_menu_bar=True)
             imgui.end_menu_bar()
+
+# label, hotkey hint pairs of the buttons that follow the status button; the
+# widths are measured together so the cluster can be right-aligned in one go
+_TRAILING_BUTTONS = (("Metadata Viewer", "(m)"), ("Help", "(h)"), ("Keybinds", "(k)"))
+
+
+def _toggle_metadata_viewer(parent: Any) -> None:
+    parent.show_metadata_viewer = not parent.show_metadata_viewer
+
+
+def _open_help(parent: Any) -> None:
+    parent._show_help_popup = True
+
+
+def _open_keybinds(parent: Any) -> None:
+    parent._show_keybinds_popup = not getattr(parent, "_show_keybinds_popup", False)
+
+
+def _status_cluster_width(status_text: str) -> float:
+    """Width of the status button plus every button after it."""
+    style = imgui.get_style()
+    pad, gap = style.frame_padding.x * 2.0, style.item_spacing.x
+    width = imgui.calc_text_size(status_text).x + pad
+    for label, hint in _TRAILING_BUTTONS:
+        width += gap + imgui.calc_text_size(label).x + pad
+        width += gap + imgui.calc_text_size(hint).x
+    return width
+
+
+def _right_align(width: float) -> None:
+    """Put the cursor so ``width`` of content ends at the row's right edge."""
+    style = imgui.get_style()
+    x = imgui.get_window_width() - width - style.item_spacing.x
+    if x > imgui.get_cursor_pos_x():
+        imgui.set_cursor_pos_x(x)
+
 
 def draw_process_status_indicator(parent: Any, in_menu_bar: bool = False):
     """Draw the compact, colour-coded process status button and the Metadata
@@ -174,10 +210,15 @@ def draw_process_status_indicator(parent: Any, in_menu_bar: bool = False):
     else:
         # idle
         status_color = imgui.ImVec4(0.15, 0.55, 0.15, 1.0)  # Dark Green
-        status_text = f"{ICON_IDLE} Idle"
+        status_text = f"{ICON_IDLE} Console: Idle"
 
     # Draw rounded buttons
     imgui.push_style_var(imgui.StyleVar_.frame_rounding, 5.0)
+
+    # The row's left half belongs to the menus, so this cluster is pinned to
+    # the right edge: its width is known before anything is drawn, so measure
+    # it and jump the cursor there once.
+    _right_align(_status_cluster_width(status_width_text or status_text))
 
     # 1. Status Button
     # Use distinct background color based on status
@@ -211,7 +252,9 @@ def draw_process_status_indicator(parent: Any, in_menu_bar: bool = False):
         imgui.set_tooltip("Click to view process console")
 
     # 2. Metadata / help / keybinds buttons, all in the same dark grey with
-    # their hotkeys greyed out beside them
+    # their hotkeys greyed out beside them. Help and Keybinds are one button
+    # each for the whole app - the ROI tool is a section inside them, not a
+    # second pair of buttons.
     if not in_menu_bar:
         imgui.same_line()
     imgui.push_style_color(imgui.Col_.button, imgui.ImVec4(0.2, 0.2, 0.2, 1.0))
@@ -219,28 +262,34 @@ def draw_process_status_indicator(parent: Any, in_menu_bar: bool = False):
     imgui.push_style_color(imgui.Col_.button_active, imgui.ImVec4(0.15, 0.15, 0.15, 1.0))
     imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.9, 0.9, 0.9, 1.0))
 
-    if imgui.button("Metadata Viewer"):
-        parent.show_metadata_viewer = not parent.show_metadata_viewer
-    if not in_menu_bar:
-        imgui.same_line(0, 2)
-    imgui.align_text_to_frame_padding()
-    imgui.text_disabled("(m)")
-
-    # the ROI tool's help / keybinds sit here rather than in its own panel,
-    # so the panel keeps its width for the cards
-    roi = getattr(parent, "manual_roi", None)
-    if roi is not None:
-        if not in_menu_bar:
+    actions = (_toggle_metadata_viewer, _open_help, _open_keybinds)
+    for i, ((label, hint), action) in enumerate(zip(_TRAILING_BUTTONS, actions)):
+        if i and not in_menu_bar:
             imgui.same_line()
-        if imgui.button("ROI Help"):
-            roi.help_open = not roi.help_open
+        if imgui.button(label):
+            action(parent)
         if not in_menu_bar:
-            imgui.same_line()
-        if imgui.button("ROI Keys"):
-            roi.keybinds_open = not roi.keybinds_open
+            imgui.same_line(0, 2)
+        imgui.align_text_to_frame_padding()
+        imgui.text_disabled(hint)
 
     imgui.pop_style_color(4)
     imgui.pop_style_var()  # frame_rounding
+
+
+def _roi_keybinds(parent: Any) -> list[tuple[str, str | None]]:
+    """The ROI tool's keys as one more section, when that widget is on.
+
+    The tool used to carry its own Help and Keys buttons; one app has one
+    of each, so its keys live here and its guide is a tab in the help
+    viewer.
+    """
+    roi = getattr(parent, "manual_roi", None)
+    if roi is None:
+        return []
+    from mbo_utilities.gui.manual_roi import KEYBINDS
+
+    return [("", ""), ("ROI Labeling", None), *KEYBINDS]
 
 
 def draw_keybinds_popup(parent: Any):
@@ -298,13 +347,15 @@ def draw_keybinds_popup(parent: Any):
             ("Shift + C", "Toggle sub-pixel scan-phase"),
             ("", ""),
             ("Help", None),
-            ("h / F1", "Open help"),
+            ("h", "Open help"),
             ("k", "Open/close this popup"),
         ]
+        keybinds += _roi_keybinds(parent)
 
         table_flags = imgui.TableFlags_.sizing_fixed_fit | imgui.TableFlags_.no_borders_in_body
         if imgui.begin_table("keybinds_table", 2, table_flags):
-            imgui.table_setup_column("key", imgui.TableColumnFlags_.width_fixed, 80)
+            # wide enough for the ROI section's chords ("ctrl+click")
+            imgui.table_setup_column("key", imgui.TableColumnFlags_.width_fixed, 110)
             imgui.table_setup_column("desc", imgui.TableColumnFlags_.width_stretch)
 
             for key, desc in keybinds:

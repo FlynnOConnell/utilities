@@ -147,6 +147,20 @@ def _try_hydrate_s2p_from_binary(parent: Any, path: str | Path) -> bool:
         )
         return False
 
+    # The Skip / Run / Force gates say what one past run did, not what the
+    # user wants next. A registration pass writes roidetect=0 into the plane
+    # dir's ops.npy (register() runs suite2p with detection off), so
+    # hydrating that key turned Detection to Skip for every later run and
+    # suite2p quietly regenerated figures instead of finding ROIs
+    # ("Suite2p disabled by user toggles"). Restore parameters, not gates.
+    for _gate in ("do_detection", "do_registration"):
+        if _gate in loaded:
+            loaded.pop(_gate)
+            parent.logger.debug(
+                f"suite2p hydrate: ignoring {_gate} from the run's records; "
+                "the Skip/Run/Force gates stay where the user left them"
+            )
+
     # dead custom file paths recorded on another machine fail deep inside
     # suite2p later; drop them so the run falls back to defaults.
     # cellpose_model doubles as a bare model NAME ('cpsam'), so only

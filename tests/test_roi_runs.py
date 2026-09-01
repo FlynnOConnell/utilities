@@ -325,6 +325,110 @@ def test_derived_rgba_skips_discarded_and_invisible():
     assert not rr.derived_rgba((6, 6), [s], 0.5, selected=(s, 0)).any()
 
 
+# ---- vector overlays --------------------------------------------------------
+
+
+def _pieces(pos):
+    """The line buffer's paths, split on the NaN rows between them."""
+    out, run = [], []
+    for point in pos:
+        if np.isnan(point).any():
+            if run:
+                out.append(np.array(run))
+                run = []
+            continue
+        run.append(point[:2])
+    if run:
+        out.append(np.array(run))
+    return out
+
+
+def test_footprint_edges_traces_the_pixel_border():
+    yy, xx = np.mgrid[2:5, 3:7]  # rows 2..4, cols 3..6
+    edges = rr.footprint_edges(yy.ravel(), xx.ravel())
+    finite = edges[np.isfinite(edges[:, 0])]
+    assert len(finite) % 2 == 0
+    # 3x4 block: 14 unit edges around it, on the pixel border itself
+    assert len(finite) // 2 == 14
+    assert finite[:, 0].min() == 3.0 and finite[:, 0].max() == 7.0
+    assert finite[:, 1].min() == 2.0 and finite[:, 1].max() == 5.0
+
+
+def test_footprint_edges_of_one_pixel_is_its_square():
+    edges = rr.footprint_edges([5], [7])
+    finite = edges[np.isfinite(edges[:, 0])]
+    assert len(finite) // 2 == 4
+    assert finite.min(axis=0).tolist() == [7.0, 5.0]
+    assert finite.max(axis=0).tolist() == [8.0, 6.0]
+
+
+def test_footprint_edges_of_nothing():
+    assert rr.footprint_edges([], []).shape == (0, 2)
+
+
+def test_the_ring_is_the_equal_area_circle_on_pixel_centres():
+    yy, xx = np.mgrid[10:20, 10:20]  # 100 px, centres 10.5..19.5
+    y, x = yy.ravel(), xx.ravel()
+    assert rr.footprint_center(y, x) == (15.0, 15.0)
+    assert rr.footprint_radius(y, x, 1.0) == pytest.approx(np.sqrt(100 / np.pi))
+    # a floor, so a mask a few pixels across is still worth looking at
+    assert rr.footprint_radius([1], [1], 1.0) == rr.MIN_RING_RADIUS
+
+
+def test_outline_data_gives_one_closed_path_per_component():
+    comps = [
+        (np.array([1, 2]), np.array([1, 2]), np.ones(2), (1.0, 0.0, 0.0), 1.0),
+        (np.array([8]), np.array([8]), np.ones(1), (0.0, 0.0, 1.0), 0.4),
+    ]
+    pos, colors = rr.outline_data(comps, "circle")
+    assert pos.shape[1] == 3 and colors.shape == (len(pos), 4)
+    rings = _pieces(pos)
+    assert len(rings) == 2
+    for path in rings:
+        assert np.allclose(path[0], path[-1])  # closed
+    # fill rides along as the stroke alpha, one color per path
+    finite = np.isfinite(pos[:, 0])
+    assert np.allclose(np.unique(np.round(colors[finite][:, 3], 3)), [0.4, 1.0])
+
+
+def test_outline_data_rings_the_halo_footprints_in_white():
+    comps = [(np.array([4]), np.array([4]), np.ones(1), (1.0, 0.0, 0.0), 1.0)]
+    pos, colors = rr.outline_data(comps, "circle", halo=[(np.array([4]), np.array([4]))])
+    rings = _pieces(pos)
+    assert len(rings) == 2
+    spans = [np.ptp(r[:, 0]) for r in rings]
+    assert spans[1] > spans[0]  # the halo sits outside the component's ring
+    assert np.allclose(colors[-1], (1.0, 1.0, 1.0, 1.0))
+
+
+def test_outline_data_of_nothing_is_empty():
+    pos, colors = rr.outline_data([], "circle")
+    assert pos.shape == (0, 3) and colors.shape == (0, 4)
+
+
+def test_derived_outline_follows_the_same_rows_as_derived_rgba():
+    s = rr.DerivedSet(_result([
+        _row([1], [1], [1.0]),
+        _row([3], [3], [1.0]),
+    ]), "a", (1.0, 0.0, 0.0), discarded={0})
+    pos, colors = rr.derived_outline([s], "circle")
+    assert len(_pieces(pos)) == 1  # the discarded row is skipped
+    # rejected rows draw dimmed, and only they do
+    assert colors[0, 3] == 1.0
+    s.accepted[1] = False
+    _pos, colors = rr.derived_outline([s], "circle")
+    assert colors[0, 3] < 1.0
+    s.visible = False
+    assert not len(rr.derived_outline([s], "circle")[0])
+
+
+def test_derived_outline_haloes_the_selection():
+    s = rr.DerivedSet(_result([_row([3], [3], [1.0])]), "a", (1.0, 0.0, 0.0))
+    pos, colors = rr.derived_outline([s], "circle", selected=(s, 0))
+    assert len(_pieces(pos)) == 2
+    assert np.allclose(colors[-1], (1.0, 1.0, 1.0, 1.0))
+
+
 def test_component_color_is_class_color_when_labeled():
     from mbo_utilities.annotation import class_color
 
@@ -416,9 +520,17 @@ def test_full_plane_args_minimal_payloads(tmp_path):
 
     fpath = tmp_path / "raw.tif"
     s2p = rr.full_plane_args("suite2p", fpath, 3, None)
-    assert set(s2p) == {"input_path", "output_dir", "planes", "reader_kwargs"}
+    assert set(s2p) == {
+        "input_path", "output_dir", "planes", "reader_kwargs", "ops", "s2p_settings",
+    }
     assert s2p["input_path"] == str(fpath) and s2p["output_dir"] == str(tmp_path)
     assert s2p["planes"] == [3] and s2p["reader_kwargs"] == {}
+    # detection is the point of a plane run, and it must be spelled twice:
+    # the source dir's ops.npy can carry roidetect=0 from a registration
+    # pass, and a stat.npy staged in from an earlier run of any pipeline
+    # otherwise reads as "detection already complete"
+    assert s2p["ops"] == {"roidetect": 1}
+    assert s2p["s2p_settings"] == {"force_reg": False, "force_detect": True}
 
     mnmf = rr.full_plane_args("masknmf", fpath, 1, None)
     assert set(mnmf) == {"input_path", "output_dir", "planes", "reader_kwargs", "settings"}
@@ -497,9 +609,21 @@ def test_full_plane_args_without_a_host_keeps_the_old_payload(tmp_path):
 
     fpath = tmp_path / "raw.tif"
     s2p = rr.full_plane_args("suite2p", fpath, 3, None)
-    assert set(s2p) == {"input_path", "output_dir", "planes", "reader_kwargs"}
+    assert set(s2p) == {
+        "input_path", "output_dir", "planes", "reader_kwargs", "ops", "s2p_settings",
+    }
+    assert s2p["ops"] == {"roidetect": 1}
     mnmf = rr.full_plane_args("masknmf", fpath, 1, None)
     assert mnmf["settings"] == MasknmfSettings().to_dict()
+
+
+def test_full_plane_args_honors_an_explicit_detection_skip(tmp_path):
+    """The Process tab's Skip still wins - the fix is about the toggle the
+    user never set, not about overriding one they did."""
+    host = _Host(s2p=_Settings({}, do_detection=0, do_registration=1))
+    args = rr.full_plane_args("suite2p", tmp_path / "raw.tif", 1, None, host=host)
+    assert args["ops"] == {"roidetect": 0}
+    assert args["s2p_settings"]["force_detect"] is False
 
 
 def test_full_plane_args_uses_the_run_tabs_masknmf_settings(tmp_path):
@@ -513,3 +637,72 @@ def test_masknmf_settings_is_none_until_the_run_tab_builds_it():
     assert rr.masknmf_settings(None) is None
     assert rr.masknmf_settings(_Host()) is None
     assert rr.masknmf_settings(_Host(masknmf=_Settings({"a": 1}))) == {"a": 1}
+
+
+class TestSuite2pHydrate:
+    """Opening a run dir restores its parameters, never its run gates.
+
+    A registration pass writes roidetect=0 into the plane dir's ops.npy
+    (that is how it asks suite2p for registration only). Hydrating that key
+    set the Process tab's Detection toggle to Skip, and every later suite2p
+    run then reported "Suite2p disabled by user toggles; regenerating
+    figures only" and found no ROIs.
+    """
+
+    @staticmethod
+    def _parent():
+        import logging
+
+        try:
+            from mbo_utilities.gui.widgets.pipelines.settings import (
+                Suite2pDB,
+                Suite2pSettings,
+            )
+        except Exception as error:  # suite2p / cellpose not importable here
+            pytest.skip(f"suite2p settings unavailable: {error}")
+
+        class _Parent:
+            logger = logging.getLogger("test.hydrate")
+
+            def __init__(self):
+                self.s2p = Suite2pSettings()
+                self.s2p_db = Suite2pDB()
+                self.s2p_extras = None
+
+        return _Parent()
+
+    def test_a_registered_dir_does_not_switch_detection_off(self, tmp_path):
+        from mbo_utilities.gui._dialogs import _try_hydrate_s2p_from_binary
+
+        plane = tmp_path / "zplane01"
+        plane.mkdir()
+        np.save(plane / "ops.npy", {
+            "roidetect": False,     # registration-only pass wrote this
+            "do_registration": 1,
+            "tau": 0.7,             # a real parameter, which must survive
+            "Ly": 4, "Lx": 4,
+        })
+
+        parent = self._parent()
+        before = parent.s2p.do_detection
+        assert _try_hydrate_s2p_from_binary(parent, plane)
+        assert parent.s2p.do_detection == before, "the Skip/Run gate must not move"
+        assert parent.s2p.tau == pytest.approx(0.7), "parameters still hydrate"
+
+
+def test_registration_does_not_leave_roidetect_behind(tmp_path):
+    """roidetect=0 is how register() asks for registration only; left in
+    ops.npy it is inherited by every later stage and by the GUI."""
+    from mbo_utilities.roi_workflow import _drop_run_gates
+    import logging
+
+    ops_path = tmp_path / "ops.npy"
+    np.save(ops_path, {"roidetect": 0, "do_registration": 1, "Ly": 4, "Lx": 4})
+    _drop_run_gates(ops_path, logging.getLogger("test.gates"))
+
+    ops = np.load(ops_path, allow_pickle=True).item()
+    assert "roidetect" not in ops
+    assert ops["do_registration"] == 1 and ops["Ly"] == 4
+    # missing file / missing key are both no-ops
+    _drop_run_gates(ops_path, logging.getLogger("test.gates"))
+    _drop_run_gates(tmp_path / "nope.npy", logging.getLogger("test.gates"))

@@ -7,6 +7,7 @@ Tests the centralized metadata parameter handling including:
 - ScanImage detection functions
 """
 
+import numpy as np
 import pytest
 from mbo_utilities.metadata import (
     MetadataParameter,
@@ -872,6 +873,68 @@ class TestTimeSelectionMetadata:
 
         assert meta["exclude_indices_0based"] == sel.exclude_indices
         assert "exclude_indices_summary" not in meta
+
+
+class TestNormalizeOpsArrays:
+    """ops.npy must hold its images as arrays.
+
+    Writers sanitize metadata to JSON types, so a summary image merged into
+    ops came back as nested lists; suite2p and lbm_suite2p_python index
+    those with .shape and every figure that touches one fails with
+    "'list' object has no attribute 'shape'".
+    """
+
+    def test_lists_become_arrays_and_empties_are_dropped(self):
+        from mbo_utilities.metadata import normalize_ops_arrays
+
+        ops = normalize_ops_arrays({
+            "meanImg": [[1.0, 2.0], [3.0, 4.0]],
+            "max_proj": [[1.0, 2.0], [3.0, 4.0]],
+            "Vcorr": [[0.5, 0.5], [0.5, 0.5]],
+            "meanImgE": [],
+            "xoff": [1.0, 2.0, 3.0],
+            "xrange": [0, 2],
+            "fs": 10.0,
+        })
+        for key in ("meanImg", "max_proj", "Vcorr", "xoff"):
+            assert isinstance(ops[key], np.ndarray), key
+            assert ops[key].dtype == np.float32, key
+        assert ops["meanImg"].shape == (2, 2)
+        # absent, not empty: lbm_suite2p_python recomputes meanImgE from
+        # meanImg only when the key is missing
+        assert "meanImgE" not in ops
+        # not every list in ops is an image - suite2p's own xrange is a list
+        assert ops["xrange"] == [0, 2]
+        assert ops["fs"] == 10.0
+
+    def test_arrays_pass_through_untouched(self):
+        from mbo_utilities.metadata import normalize_ops_arrays
+
+        img = np.ones((3, 3), np.float32)
+        ops = normalize_ops_arrays({"meanImg": img, "Ly": 3})
+        assert ops["meanImg"] is img
+
+    def test_repair_walks_a_run_tree_and_is_idempotent(self, tmp_path):
+        from mbo_utilities.metadata import repair_ops_tree
+
+        bad = {"meanImg": [[1.0, 2.0], [3.0, 4.0]], "Ly": 2, "Lx": 2}
+        for sub in ("", "zplane01_tp00001-50000", "suite2p/plane0"):
+            d = tmp_path / sub if sub else tmp_path
+            d.mkdir(parents=True, exist_ok=True)
+            np.save(d / "ops.npy", dict(bad))
+
+        assert repair_ops_tree(tmp_path) == 3
+        for sub in ("", "zplane01_tp00001-50000", "suite2p/plane0"):
+            d = tmp_path / sub if sub else tmp_path
+            ops = np.load(d / "ops.npy", allow_pickle=True).item()
+            assert isinstance(ops["meanImg"], np.ndarray)
+        assert repair_ops_tree(tmp_path) == 0
+
+    def test_repair_ignores_a_dir_without_ops(self, tmp_path):
+        from mbo_utilities.metadata import repair_ops_tree
+
+        assert repair_ops_tree(tmp_path) == 0
+        assert repair_ops_tree(tmp_path / "nope") == 0
 
 
 class TestStripForExport:

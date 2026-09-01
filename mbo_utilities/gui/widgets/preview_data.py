@@ -197,7 +197,10 @@ class PreviewDataWidget(EdgeWindow):
         threading_enabled: bool = True,
         size: int | None = None,
         location: Literal["bottom", "right"] = "right",
-        title: str = "Data Preview",
+        # None: no title bar over the panel. fastplotlib draws a custom,
+        # full-width title box for an edge window with a title, and a static
+        # label there only costs the panel a row of height.
+        title: str | None = None,
         show_title: bool = False,
         movable: bool = False,
         resizable: bool = False,

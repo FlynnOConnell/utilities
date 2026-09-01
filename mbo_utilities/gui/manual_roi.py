@@ -31,6 +31,13 @@ Loaded runs are remembered in a ``roi_runs.json`` sidecar and restored on
 relaunch. Traces (quick per-ROI means and run outputs) are keyed by store
 uid, so deleting an ROI never remaps anyone else's rows.
 
+Masks draw as thin rings by default (VIEW, or o to cycle): a filled
+footprint hides the very pixels you are judging, and at a handful of pixels
+per cell there is no rim thin enough to help. "circle" rings each ROI
+without covering it, "outline" traces its own border, and "fill" is the old
+shaded footprint. The vector modes are line geometry, so the stroke stays a
+hairline however far in you zoom.
+
 With drawing off, clicking selects what is under the cursor - a derived
 component when its overlay shows there, else the drawn ROI - and clicking
 the background clears the selection. Ctrl+click (in the image, the ROI
@@ -45,8 +52,8 @@ every slider that plane encodes. Only the first subplot is drawable.
 from __future__ import annotations
 
 import queue
-import textwrap
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -84,22 +91,22 @@ from mbo_utilities.gui._keyboard import claim_arrow_keys
 from mbo_utilities.gui._theme import (
     THEME,
     card,
-    close_button,
     danger_button,
     em,
     label_button,
-    popup,
-    section,
     to_vec4,
 )
 from mbo_utilities.gui import roi_runs
 from mbo_utilities.gui.roi_runs import (
+    MASK_MODES,
+    RING_SCALE,
     SELECTED_ALPHA,
     DerivedSet,
     RoiRun,
     RoiRunManager,
     TraceSet,
     component_color,
+    derived_outline,
     derived_rgba,
     display_fneu,
     display_trace,
@@ -107,6 +114,7 @@ from mbo_utilities.gui.roi_runs import (
     finished_dirs,
     full_plane_args,
     load_run_registry,
+    outline_data,
     registry_path,
     run_dir_complete,
     save_run_registry,
@@ -145,7 +153,13 @@ PANEL_HEIGHT = 200
 # a card narrower than this clips its controls, so instead of squeezing them
 # the row wraps and the panel asks the strip for another row's height
 MIN_CARD_EM = 20.0
+# DRAW holds one small grid of buttons; the width it does not need goes to
+# the cards beside it (LABELS above all, whose buttons carry class names)
+DRAW_CARD_WEIGHT = 0.7
 MAX_CARD_ROWS = 3
+# how often to look for finished pipeline runs started outside this widget;
+# the check reads one sidecar per tracked process, so not every frame
+ADOPT_INTERVAL_S = 1.0
 # below this width the tabs collapse to a placeholder line
 MIN_TAB_WIDTH = 150
 
@@ -173,6 +187,12 @@ _STAGE_NAMES = ("skip", "run", "force")
 MIN_ROI_PIXELS = 9
 MIN_REGION_SIDE = 4
 SELECTED_OPACITY = SELECTED_ALPHA
+
+MASK_MODE_TIPS = {
+    "circle": "A thin ring around each ROI - nothing covers the pixels",
+    "outline": "A thin line along the ROI's own border",
+    "fill": "The whole footprint, shaded (hides what is under it)",
+}
 SAVE_NAME = "manual_labels.zarr"
 # no seeded class labels: the label set starts empty, the user names their own
 DEFAULT_LABEL_NAMES: tuple[str, ...] = ()
@@ -193,6 +213,8 @@ PROCESS_HELP = {
 
 # one trace per ROI: the row's Run / quick-trace buttons say this instead
 ALREADY_TRACED = "already traced - delete its row in the Traces tab to redo"
+# the tag a run gets when the box is left empty; shown as the box hint
+DEFAULT_RUN_TAG = "manual"
 
 RUN_ICON = fa.ICON_FA_PLAY
 TRACE_ICON = fa.ICON_FA_CHART_LINE
@@ -215,6 +237,7 @@ KEYBINDS = (
     ("t", "quick trace the selected ROI"),
     ("b", "toggle the drawn overlay"),
     ("d", "toggle the algo overlay"),
+    ("o", "cycle how masks draw: circle / outline / fill"),
     ("click", "select what is under the cursor (drawing off)"),
     ("ctrl+click", "toggle an ROI in the group (image, table, trace legend)"),
     ("shift+click", "add to the group (a row range in the table)"),
@@ -228,8 +251,8 @@ _HELP_STEPS = (
     "the next unlabeled one and labeling steps there on its own.",
     "PROCESS runs the listed ROIs through mean (raw mask average), suite2p "
     "(suite2p's extractor) or masknmf (seeded NMF, demixed).",
-    "Draw a region with r, then find masknmf / find suite2p detects ROIs "
-    "inside it, unseeded.",
+    "PROCESS > find in region: Draw region (r), drag a box, then suite2p "
+    "or masknmf looks for ROIs inside it, unseeded.",
     "Detected components arrive as an algo overlay and table rows: "
     "promote one into the drawn set (y) or discard it (n). Deleting a "
     "promoted ROI makes its row promotable again.",
@@ -243,6 +266,24 @@ _HELP_FILES = (
     "                    iscell.npy, ops.npy, rois.json\n"
     "roi_runs.json       which runs this dataset has loaded"
 )
+
+def help_markdown() -> str:
+    """This tool's guide, as markdown for the app's help viewer.
+
+    The ROI panel used to carry its own Help and Keys buttons; there is one
+    of each for the whole app now, so the content lives here - beside the
+    code it describes - and the viewer renders it as a section. The keys
+    are not repeated here; the Keybinds popup lists them.
+    """
+    steps = "\n".join(f"{i}. {step}" for i, step in enumerate(_HELP_STEPS, 1))
+    return (
+        "## ROI Labeling\n\n"
+        "### Workflow\n\n"
+        f"{steps}\n\n"
+        "### Output files\n\n"
+        f"```\n{_HELP_FILES}\n```\n"
+    )
+
 
 _CURSOR_COLOR = imgui.ImVec4(1.0, 0.85, 0.3, 0.9)
 _FNEU_COLOR = (0.25, 0.55, 1.0, 1.0)
@@ -367,14 +408,20 @@ class _PlaneOrder(RoiOrder):
         else:
             super().clear_filter(name)
 
-    def next_unlabeled(self) -> bool:
+    def next_unlabeled(self, inclusive: bool = False) -> bool:
+        """First unlabeled drawn row after the cursor, wrapping.
+
+        ``inclusive`` starts at the cursor instead of after it: when a label
+        filter has just dropped the row that was labeled, the cursor already
+        sits on the next candidate and stepping past it would skip one.
+        """
         # only drawn rows can take a label, so u never lands on a derived one
         hits = np.flatnonzero(
             (self.labels[self.order] < 0) & (self.sources[self.order] == 0)
         )
         if not len(hits):
             return False
-        after = hits[hits > self.pos]
+        after = hits[hits >= self.pos] if inclusive else hits[hits > self.pos]
         self.pos = int(after[0] if len(after) else hits[0])
         return True
 
@@ -459,8 +506,6 @@ class ManualRoiWidget:
         self._writer: LabelsZarr | None = None
         self.new_label = ""
         self._note_buf = ""
-        self.help_open = False
-        self.keybinds_open = False
         self.scroll_to_selection = False
         self.follow = False  # center the shown ROI; labeling then advances
 
@@ -468,6 +513,13 @@ class ManualRoiWidget:
         self.opacity = 0.45
         self.show_derived = True
         self.derived_opacity = 0.6
+        # how masks draw: a ring standing in for each ROI, its own border,
+        # or the filled footprint. The vector modes stroke in screen pixels
+        # (line_width), the ring in image pixels (ring_scale over the mask's
+        # equal-area radius)
+        self.mask_mode = MASK_MODES[0]
+        self.line_width = 1.0
+        self.ring_scale = RING_SCALE
 
         self._feathers: dict[int, tuple] = {}
         self.rows: list[tuple[int, int]] = []
@@ -500,6 +552,34 @@ class ManualRoiWidget:
                 tile.material.pick_write = False
         self.derived_overlay.visible = False
 
+        # the vector overlays, one line per source. Thickness is in screen
+        # pixels, so a hairline stays a hairline at any zoom, and the paths
+        # of every ROI ride in one buffer split by NaN rows. They start on
+        # five dummy vertices: fastplotlib reads a shorter color array as
+        # one flat color, and per-vertex colors are the whole point
+        self.outline = self.subplot.add_line(
+            np.zeros((5, 3), np.float32),
+            colors=np.zeros((5, 4), np.float32),
+            color_mode="vertex",
+            thickness=self.line_width,
+            size_space="screen",
+            name="manual_roi_outline",
+            offset=(0, 0, 1.25),
+            visible=False,
+        )
+        self.derived_outline = self.subplot.add_line(
+            np.zeros((5, 3), np.float32),
+            colors=np.zeros((5, 4), np.float32),
+            color_mode="vertex",
+            thickness=self.line_width,
+            size_space="screen",
+            name="manual_roi_derived_outline",
+            offset=(0, 0, 1.6),
+            visible=False,
+        )
+        for line in (self.outline, self.derived_outline):
+            line.world_object.material.pick_write = False
+
         self.drawer = StrokeDrawer(self.subplot, self._on_stroke, self._pick)
         self.summary = SummaryImageViewer(iw.figure, title="Full FOV")
         self.region: tuple[int, int, int, int] | None = None
@@ -529,9 +609,15 @@ class ManualRoiWidget:
         self._fs_read = False
 
         self.process = PROCESSES[0]
-        self.run_tag = "manual"
+        # empty: the box shows DEFAULT_RUN_TAG as a hint, so what is
+        # typed there is the user's own tag and nothing else
+        self.run_tag = ""
         self.manager = RoiRunManager()
         self._registry_extra: list[dict] = []
+        # pids of finished pipeline runs already pulled in by
+        # _adopt_finished_runs, and when it last looked
+        self._adopted: set[int] = set()
+        self._adopt_checked = 0.0
         self._restoring = False
 
         # the top edge is shared (menu row, Signal Quality plot, these two
@@ -579,7 +665,13 @@ class ManualRoiWidget:
                 self.iw.ndwidget.indices.remove_event_handler(self._on_indices)
             except (KeyError, ValueError, AttributeError):
                 pass
-        graphics = [self.overlay, self.derived_overlay, self.drawer.line]
+        graphics = [
+            self.overlay,
+            self.derived_overlay,
+            self.outline,
+            self.derived_outline,
+            self.drawer.line,
+        ]
         if self.region_line is not None:
             graphics.append(self.region_line)
         for graphic in graphics:
@@ -1139,18 +1231,39 @@ class ManualRoiWidget:
         (self.trace_sel.discard if key in self.trace_sel else self.trace_sel.add)(key)
         self._trace_fit = True
 
-    def next_unlabeled(self):
-        if self.order.next_unlabeled():
+    def next_unlabeled(self, inclusive: bool = False):
+        if self.order.next_unlabeled(inclusive):
             self.select_row(self.order.current)
 
-    def _select_next_derived(self, start_pos: int, skip_promoted: bool = False):
-        """Select the next derived row in view at or after ``start_pos``."""
-        for pos in range(max(start_pos, 0), len(self.order.order)):
+    def _select_next_derived(
+        self,
+        start_pos: int,
+        skip_promoted: bool = False,
+        unlabeled_only: bool = False,
+    ):
+        """Select the next derived row in view at or after ``start_pos``.
+
+        ``unlabeled_only`` walks past rows that already carry a label and
+        wraps once, so labeling a run's components in follow mode lands on
+        each one that still needs a label rather than on whatever row
+        happens to come next.
+        """
+        n = len(self.order.order)
+        if not n:
+            return
+        start = max(start_pos, 0)
+        span = (
+            [(start + i) % n for i in range(n)] if unlabeled_only
+            else range(start, n)
+        )
+        for pos in span:
             row = int(self.order.order[pos])
             si, k = self.rows[row]
             if si < 0:
                 continue
             if skip_promoted and (self.derived[si].name, k) in self._promoted:
+                continue
+            if unlabeled_only and int(self.classes.labels[row]) != UNLABELED:
                 continue
             self.select_row(row)
             return
@@ -1219,12 +1332,14 @@ class ManualRoiWidget:
         if self.selected >= 0:
             self.store.set_class(self.selected, class_index)
             self._resync()
-            self.order.goto(self.selected)
+            # False when a label filter dropped the row as it was labeled -
+            # the cursor is then already on the next candidate
+            listed = self.order.goto(self.selected)
             self.status = f"ROI {self.selected}: {self.classes.name_of(self.selected)}"
             self.refresh_overlay()
             self._autosave()
             if self.follow and class_index != UNLABELED:
-                self.next_unlabeled()
+                self.next_unlabeled(inclusive=not listed)
             return
         if self.selected_derived is None:
             return
@@ -1241,7 +1356,9 @@ class ManualRoiWidget:
             self.status = f"{s.name} row {k}: {self.classes.name_of(row)}"
         self._save_registry()
         if self.follow and class_index != UNLABELED:
-            self._select_next_derived(self.order.pos + 1)
+            # the next algo row that still needs a label, not just the next
+            # one: labeling used to land on rows already labeled
+            self._select_next_derived(self.order.pos + 1, unlabeled_only=True)
 
     label_selected = assign_class
 
@@ -1267,13 +1384,36 @@ class ManualRoiWidget:
             self._feathers[record.uid] = got
         return got
 
+    def _set_line(self, line, positions, colors):
+        """Push prepared path geometry onto one of the vector overlays.
+
+        Nothing to draw hides the graphic instead: a line has to put its
+        vertices somewhere, and an empty buffer is not worth allocating.
+        """
+        if not len(positions):
+            line.visible = False
+            return
+        line.data = positions
+        line.colors = colors
+        line.thickness = self.line_width
+        line.visible = True
+
     def refresh_overlay(self):
-        """Drawn masks, feathered and colored exactly like the imported
-        ones; only the table's source column tells them apart."""
-        self.overlay.visible = self.show_masks
-        if not self.overlay.visible:
+        """Drawn masks, colored exactly like the imported ones; only the
+        table's source column tells them apart.
+
+        One component list feeds either renderer - the feathered fill, or
+        the thin paths of a vector mode - and the graphic the mode is not
+        using is hidden rather than emptied, so switching back is free.
+        Strokes draw opaque: a hairline at the fill's opacity is invisible.
+        """
+        vector = self.mask_mode != "fill"
+        self.overlay.visible = self.show_masks and not vector
+        self.outline.visible = self.show_masks and vector
+        if not self.show_masks:
             return
         comps = []
+        halo = []
         sel = None
         grouped = {k for si, k in self.buffer if si < 0}
         for i, record in enumerate(self.store.rois):
@@ -1282,10 +1422,19 @@ class ManualRoiWidget:
             ypix, xpix, lam = self._feather(i)
             rgb = np.asarray(self.store.roi_rgb(i), np.float32) / 255.0
             fill = SELECTED_OPACITY if i in grouped else self.opacity
-            comps.append((ypix, xpix, lam, rgb, fill))
+            comps.append((ypix, xpix, lam, rgb, 1.0 if vector else fill))
+            if i in grouped:
+                halo.append((ypix, xpix))
             if i == self.selected:
                 sel = (ypix, xpix, rgb)
-        self.overlay.data = feathered_rgba((self.ny, self.nx), comps, sel)
+                halo.append((ypix, xpix))
+        if vector:
+            self._set_line(
+                self.outline,
+                *outline_data(comps, self.mask_mode, halo, self.ring_scale),
+            )
+        else:
+            self.overlay.data = feathered_rgba((self.ny, self.nx), comps, sel)
 
     def _center_on(self, ypix, xpix):
         """Pan the camera onto one mask, holding the zoom the user set.
@@ -1334,16 +1483,32 @@ class ManualRoiWidget:
         self.show_masks = not self.show_masks
         self.refresh_overlay()
 
+    def set_mask_mode(self, mode: str):
+        """Switch how masks draw, for both overlays at once."""
+        if mode not in MASK_MODES or mode == self.mask_mode:
+            return
+        self.mask_mode = mode
+        self.refresh_overlay()
+        self.refresh_derived_overlay()
+        self.status = f"masks: {mode}"
+
+    def cycle_mask_mode(self):
+        self.set_mask_mode(MASK_MODES[(MASK_MODES.index(self.mask_mode) + 1) % len(MASK_MODES)])
+
     # ------------------------------------------------------------------
     # derived sets
     # ------------------------------------------------------------------
 
     def refresh_derived_overlay(self):
         """Recompute the derived overlay for the plane on screen; called on
-        select / z / load / discard / promote / toggle / opacity changes."""
+        select / z / load / discard / promote / toggle / opacity / mode
+        changes. Follows the drawn overlay's mask mode, so the two sources
+        never draw in two different idioms."""
         sets_on_z = [s for s in self.derived if s.result.z == self.z]
         show = self.show_derived and bool(sets_on_z)
-        self.derived_overlay.visible = show
+        vector = self.mask_mode != "fill"
+        self.derived_overlay.visible = show and not vector
+        self.derived_outline.visible = show and vector
         if not show:
             return
         selected = None
@@ -1352,10 +1517,18 @@ class ManualRoiWidget:
             if self.derived[si].result.z == self.z:
                 selected = (self.derived[si], k)
         grouped = {(id(self.derived[si]), k) for si, k in self.buffer if si >= 0}
-        self.derived_overlay.data = derived_rgba(
-            (self.ny, self.nx), sets_on_z, self.derived_opacity, selected,
-            grouped=grouped,
-        )
+        if vector:
+            self._set_line(
+                self.derived_outline,
+                *derived_outline(
+                    sets_on_z, self.mask_mode, selected, grouped, self.ring_scale
+                ),
+            )
+        else:
+            self.derived_overlay.data = derived_rgba(
+                (self.ny, self.nx), sets_on_z, self.derived_opacity, selected,
+                grouped=grouped,
+            )
 
     def toggle_derived_overlay(self):
         self.show_derived = not self.show_derived
@@ -2067,7 +2240,7 @@ class ManualRoiWidget:
                 "every listed ROI already has a trace" if skipped else "nothing to run"
             )
             return
-        tag = (tag or "").strip() or "manual"
+        tag = (tag or "").strip() or DEFAULT_RUN_TAG
         out_dir = self._run_out_dir(tag)
         if out_dir is None:
             return
@@ -2115,13 +2288,18 @@ class ManualRoiWidget:
     def run_roi(self, index: int):
         self.run_rois([index], f"roi{index:04d}")
 
+    @property
+    def effective_tag(self) -> str:
+        """The tag a run will actually use: what was typed, else the default."""
+        return (self.run_tag or "").strip() or DEFAULT_RUN_TAG
+
     def listed_drawn(self) -> list[int]:
         """Store indices of the drawn ROIs the table currently lists."""
         return [self.rows[int(r)][1] for r in self.order.order if self.rows[int(r)][0] < 0]
 
     def run_in_view(self):
         """Run every drawn ROI the table currently lists."""
-        self.run_rois(self.listed_drawn(), self.run_tag)
+        self.run_rois(self.listed_drawn(), self.effective_tag)
 
     def trace_in_view(self):
         """Quick trace every drawn ROI the table currently lists."""
@@ -2247,6 +2425,61 @@ class ManualRoiWidget:
                 self.status = f"{run.description}: nothing written"
                 if run.job is not None:
                     run.job.status_message = "nothing written"
+        self._adopt_finished_runs()
+
+    def _adopt_finished_runs(self):
+        """Load the ROIs of pipeline runs this widget did not start.
+
+        A suite2p / masknmf run launched from the Process tab writes its
+        plane dirs beside the data like any other run, but nothing was
+        watching for them: its components only showed up after a restart,
+        when the widget rebuilds from the registry. Rows arrive with the
+        run's own iscell, so accepted and rejected land in the table the
+        same way a run started here does.
+        """
+        now = time.monotonic()
+        if now - self._adopt_checked < ADOPT_INTERVAL_S:
+            return
+        self._adopt_checked = now
+        if self.fpath is None:
+            return
+        root = labels_path(self.fpath).parent
+        mine = {r.pid for r in self.manager.runs if r.pid is not None}
+        loaded = {str(s.result.path) for s in self.derived}
+        for info in get_process_manager().get_running():
+            if (
+                info.pid in mine
+                or info.pid in self._adopted
+                or info.status != "completed"
+                or info.task_type not in ("suite2p", "masknmf")
+            ):
+                continue
+            self._adopted.add(info.pid)
+            args = info.args or {}
+            out = args.get("output_dir")
+            if not out:
+                continue
+            out = Path(out)
+            if root not in (out, *out.parents) and out not in root.parents:
+                continue  # another dataset's run
+            dirs = [
+                d for d in finished_dirs(out, args.get("planes"))
+                if str(d) not in loaded
+            ]
+            # a volume run writes a dir per plane and this widget shows one:
+            # the planes it cannot take are the Process tab's business, not
+            # an error to put in front of the user here
+            held = self._run_error
+            took = [d for d in dirs if self.load_run(d)]
+            self._run_error = held
+            if took:
+                names = ", ".join(d.name for d in took)
+                self.logger.info(f"adopted {info.task_type} run: {names}")
+                self.status = f"loaded {info.task_type}: {names}"
+            elif dirs:
+                self.logger.debug(
+                    f"{info.task_type} run at {out} has no dir for this plane"
+                )
 
     # ------------------------------------------------------------------
     # keys
@@ -2285,6 +2518,8 @@ class ManualRoiWidget:
             self.toggle_drawn_overlay()
         if imgui.is_key_pressed(imgui.Key.d, False):
             self.toggle_derived_overlay()
+        if imgui.is_key_pressed(imgui.Key.o, False):
+            self.cycle_mask_mode()
         if imgui.is_key_pressed(imgui.Key.t, False) and self.selected >= 0:
             if self.trace_disabled(self.selected) is None:
                 self.quick_trace(self.selected)
@@ -2344,8 +2579,6 @@ class ManualRoiWidget:
             self.focus_traces = False
             self.tools_window.focus("traces")
         self.summary.draw()
-        self._draw_help_popup()
-        self._draw_keybinds_popup()
 
     def _draw_roi_panel(self):
         """The ROI panel: control cards over a status row, each card gated by
@@ -2357,15 +2590,17 @@ class ManualRoiWidget:
         height to match. Narrower than ``MAX_CARD_ROWS`` rows can show, the
         panel collapses to its placeholder line.
         """
-        cards = [self._draw_navigate_card]
+        # (draw, width weight): DRAW is one grid of buttons, so it gives its
+        # share of the row to LABELS, whose buttons carry the class names
+        cards = [(self._draw_navigate_card, 1.0)]
         if sub_enabled("manual_roi", "tools"):
-            cards.append(self._draw_draw_card)
+            cards.append((self._draw_draw_card, DRAW_CARD_WEIGHT))
         if sub_enabled("manual_roi", "overlay"):
-            cards.append(self._draw_view_card)
+            cards.append((self._draw_view_card, 1.0))
         if sub_enabled("manual_roi", "labels"):
-            cards.append(self._draw_labels_card)
+            cards.append((self._draw_labels_card, 1.0))
         if sub_enabled("manual_roi", "process"):
-            cards.append(self._draw_process_card)
+            cards.append((self._draw_process_card, 1.0))
         gap = em(0.6)
         min_w = em(MIN_CARD_EM)
         fewest = -(-len(cards) // MAX_CARD_ROWS)
@@ -2381,10 +2616,16 @@ class ManualRoiWidget:
             vgap = imgui.get_style().item_spacing.y
             body = max(imgui.get_content_region_avail().y - em(1.8), em(6))
             h = max((body - vgap * (rows - 1)) / rows, em(6))
-            for i, draw in enumerate(cards):
-                if i % per_row:
-                    imgui.same_line(0, gap)
-                draw(h, w)
+            for start in range(0, len(cards), per_row):
+                row = cards[start:start + per_row]
+                # the row keeps the width the grid gave it; the weights only
+                # decide how it is split
+                span = w * len(row)
+                unit = span / sum(weight for _, weight in row)
+                for i, (draw, weight) in enumerate(row):
+                    if i:
+                        imgui.same_line(0, gap)
+                    draw(h, max(unit * weight, min_w * 0.5))
             self._draw_status()
 
     def _draw_navigate_card(self, h: float, w: float = 0.0):
@@ -2411,57 +2652,79 @@ class ManualRoiWidget:
                 self.open_full_fov()
 
     def _draw_draw_card(self, h: float, w: float = 0.0):
+        """The drawing tools: one grid of equal buttons, keys in tooltips.
+
+        Region drawing lives in PROCESS now, beside the buttons that need a
+        region, so this card is four actions and a count.
+        """
         with card("##draw", "DRAW", h, w):
-            with selected_button_style(self.drawing):
-                if imgui.button("Add ROI"):
-                    self.set_drawing(not self.drawing)
-            imgui.same_line(0, em(0.4))
-            imgui.text_disabled("(a)")
-            imgui.same_line(0, em(0.6))
-            with selected_button_style(self.region_mode):
-                if imgui.button("Region"):
-                    self.set_region_mode(not self.region_mode)
-            if imgui.is_item_hovered():
-                imgui.set_tooltip("drag a box; discovery runs inside it")
-            imgui.same_line(0, em(0.4))
-            imgui.text_disabled("(r)")
-            if imgui.button("Undo"):
-                self.delete_roi(self.n_rois - 1)
-            imgui.same_line(0, em(0.4))
-            imgui.text_disabled("(ctrl+z)")
-            imgui.same_line(0, em(0.6))
+            gap = em(0.4)
+            btn_w = max((imgui.get_content_region_avail().x - gap) / 2, em(4))
+            size = imgui.ImVec2(btn_w, 0)
             nothing = self.selected < 0 and self.selected_derived is None
+            with selected_button_style(self.drawing):
+                if imgui.button("Add ROI", size):
+                    self.set_drawing(not self.drawing)
+            set_tooltip("Drag a closed stroke around a cell (a)", show_mark=False)
+            imgui.same_line(0, gap)
+            if imgui.button("Undo", size):
+                self.delete_roi(self.n_rois - 1)
+            set_tooltip("Remove the ROI drawn last (ctrl+z)", show_mark=False)
             if nothing:
                 imgui.begin_disabled()
-            if imgui.button("Discard" if self.selected_derived is not None else "Delete"):
+            if imgui.button(
+                "Discard" if self.selected_derived is not None else "Delete", size
+            ):
                 self.delete_selected()
             if nothing:
                 imgui.end_disabled()
-            imgui.same_line(0, em(0.4))
-            imgui.text_disabled("(del)")
-            imgui.same_line(0, em(0.6))
-            if imgui.button("Clear"):
-                self.clear()
+            if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
+                imgui.set_tooltip(
+                    "select an ROI first" if nothing
+                    else "Delete the drawn ROI, discard the algo one (del)"
+                )
+            imgui.same_line(0, gap)
+            with danger_button():
+                if imgui.button("Clear", size):
+                    self.clear()
+            set_tooltip("Delete every drawn ROI on this plane", show_mark=False)
             imgui.text_disabled(f"{self.n_rois} ROIs")
-            if self.region is not None:
-                y0, y1, x0, x1 = self.region
-                imgui.text_disabled(f"region {y1 - y0}x{x1 - x0}")
-                imgui.same_line(0, em(0.4))
-                if imgui.small_button("clear##region"):
-                    self.clear_region()
 
     def _draw_view_card(self, h: float, w: float = 0.0):
+        """How masks draw, which overlays show, and the knobs the mode uses.
+
+        The sliders swap with the mode: opacity is a fill idea and stroke
+        width a line one, so only the ones that do something are shown.
+        """
         with card("##view", "VIEW", h, w):
+            vector = self.mask_mode != "fill"
+            gap = em(0.4)
+            btn = imgui.ImVec2(
+                max(
+                    (imgui.get_content_region_avail().x - gap * (len(MASK_MODES) - 1))
+                    / len(MASK_MODES),
+                    em(3.5),
+                ),
+                0,
+            )
+            for i, mode in enumerate(MASK_MODES):
+                if i:
+                    imgui.same_line(0, gap)
+                with selected_button_style(self.mask_mode == mode):
+                    if imgui.button(mode, btn):
+                        self.set_mask_mode(mode)
+                set_tooltip(MASK_MODE_TIPS[mode], show_mark=False)
             dirty = False
             changed, self.show_masks = imgui.checkbox("drawn", self.show_masks)
             dirty |= changed
             set_tooltip("The ROIs you drew by hand", show_mark=False)
             imgui.same_line(0, em(0.4))
             imgui.text_disabled("(b)")
-            imgui.same_line(0, em(0.6))
-            imgui.set_next_item_width(em(6))
-            changed, self.opacity = imgui.slider_float("##opacity", self.opacity, 0.05, 1.0, "opacity %.2f")
-            dirty |= changed
+            if not vector:
+                imgui.same_line(0, em(0.6))
+                imgui.set_next_item_width(em(6))
+                changed, self.opacity = imgui.slider_float("##opacity", self.opacity, 0.05, 1.0, "opacity %.2f")
+                dirty |= changed
             if dirty:
                 self.refresh_overlay()
             dirty = False
@@ -2470,14 +2733,34 @@ class ManualRoiWidget:
             set_tooltip("ROIs an algorithm found (find / demix / full-plane runs)", show_mark=False)
             imgui.same_line(0, em(0.4))
             imgui.text_disabled("(d)")
-            imgui.same_line(0, em(0.6))
-            imgui.set_next_item_width(em(6))
-            changed, self.derived_opacity = imgui.slider_float(
-                "##derived_opacity", self.derived_opacity, 0.05, 1.0, "opacity %.2f"
-            )
-            dirty |= changed
+            if not vector:
+                imgui.same_line(0, em(0.6))
+                imgui.set_next_item_width(em(6))
+                changed, self.derived_opacity = imgui.slider_float(
+                    "##derived_opacity", self.derived_opacity, 0.05, 1.0, "opacity %.2f"
+                )
+                dirty |= changed
             if dirty:
                 self.refresh_derived_overlay()
+            if vector:
+                dirty = False
+                imgui.set_next_item_width(em(5.5))
+                changed, self.line_width = imgui.slider_float(
+                    "##line_width", self.line_width, 0.5, 4.0, "width %.1f px"
+                )
+                dirty |= changed
+                set_tooltip("Stroke width on screen, whatever the zoom", show_mark=False)
+                if self.mask_mode == "circle":
+                    imgui.same_line(0, em(0.6))
+                    imgui.set_next_item_width(em(5.5))
+                    changed, self.ring_scale = imgui.slider_float(
+                        "##ring_scale", self.ring_scale, 0.6, 4.0, "size %.2f"
+                    )
+                    dirty |= changed
+                    set_tooltip("Ring radius over the mask's own", show_mark=False)
+                if dirty:
+                    self.refresh_overlay()
+                    self.refresh_derived_overlay()
             if imgui.button("Save"):
                 self.save()
             imgui.same_line(0, em(0.6))
@@ -2506,24 +2789,22 @@ class ManualRoiWidget:
                 self.assign_class(picked)
 
     def _draw_label_columns(self):
-        """One button per class, split into two columns filled evenly; more
-        columns only when the card's height cannot hold half the entries.
+        """The unlabel actions pinned across the top, then one button per
+        class, split into columns filled evenly.
 
-        Buttons are sized to their column rather than to their text, so a
-        long class name widens nothing and the columns stay even.
+        Class buttons carry two columns of their own - the count, then the
+        name - each left-aligned, so the names line up down the column
+        instead of drifting with however wide the counts happen to be.
         """
         picked = None
+        if not self.classes.names:
+            return None
+        picked = self._draw_unlabel_row()
         row_h = imgui.get_frame_height_with_spacing()
         rows = max(int(imgui.get_content_region_avail().y // row_h), 1)
-        entries: list[tuple[str, int | None]] = [
-            ("label", i) for i in range(len(self.classes.names))
-        ]
-        if self.classes.names:
-            entries += [("unlabel", None), ("unlabel_all", None)]
-        if not entries:
-            return None
-        ncols = max(2, -(-len(entries) // rows))
-        per_col = -(-len(entries) // ncols)
+        n = len(self.classes.names)
+        ncols = max(2, -(-n // rows))
+        per_col = -(-n // ncols)
         gap, hint = em(0.8), em(2.0)
         col_w = max(
             (imgui.get_content_region_avail().x - gap * (ncols - 1)) / ncols, em(5)
@@ -2531,34 +2812,65 @@ class ManualRoiWidget:
         # a touch narrower than the column: the buttons carried more empty
         # space than the names needed
         size = imgui.ImVec2(max(col_w - hint - em(0.7), em(3.0)), 0)
-        for c0 in range(0, len(entries), per_col):
+        count_w = max(
+            imgui.calc_text_size(self._count_text(i)).x for i in range(n)
+        ) + em(0.5)
+        for c0 in range(0, n, per_col):
             if c0:
                 imgui.same_line(0, gap)
             imgui.begin_group()
-            for kind, i in entries[c0 : c0 + per_col]:
-                if kind == "label":
-                    with label_button(self.classes.color(i)):
-                        # "n=3 spine", not "spine (3)": the trailing (1-9)
-                        # is the keybind, so a bare count beside it read as
-                        # one too
-                        if imgui.button(
-                            f"n={self.classes.count(i)}  {self.classes.names[i]}##lab{i}",
-                            size,
-                        ):
-                            picked = i
-                    if i < 9:
-                        imgui.same_line(0, 4)
-                        imgui.text_disabled(f"({i + 1})")
-                elif kind == "unlabel":
-                    if imgui.button("unlabel##_roi", size):
-                        picked = UNLABELED
+            for i in range(c0, min(c0 + per_col, n)):
+                with label_button(self.classes.color(i)):
+                    if imgui.button(f"##lab{i}", size):
+                        picked = i
+                self._draw_label_button_text(i, count_w)
+                if i < 9:
                     imgui.same_line(0, 4)
-                    imgui.text_disabled("(0)")
-                else:
-                    with danger_button():
-                        if imgui.button("unlabel all##_roi", size):
-                            picked = UNLABEL_ALL
+                    imgui.text_disabled(f"({i + 1})")
             imgui.end_group()
+        return picked
+
+    def _count_text(self, i: int) -> str:
+        """The count column of a class button. "n=3", not "(3)": the (1-9)
+        that follows the button is the keybind, and a bare count beside it
+        read as one too."""
+        return f"n={self.classes.count(i)}"
+
+    def _draw_label_button_text(self, i: int, count_w: float) -> None:
+        """Paint one class button's two text columns over the button just
+        drawn. imgui centres a button's own label, which left the names
+        starting at a different x on every row."""
+        lo, hi = imgui.get_item_rect_min(), imgui.get_item_rect_max()
+        pad = imgui.get_style().frame_padding.x
+        y = lo.y + (hi.y - lo.y - imgui.get_text_line_height()) * 0.5
+        draw = imgui.get_window_draw_list()
+        color = imgui.get_color_u32(imgui.Col_.text)
+        # a long name is clipped to its button rather than bleeding into the
+        # column beside it
+        draw.push_clip_rect(imgui.ImVec2(lo.x, lo.y), imgui.ImVec2(hi.x - 1, hi.y), True)
+        draw.add_text(imgui.ImVec2(lo.x + pad, y), color, self._count_text(i))
+        draw.add_text(
+            imgui.ImVec2(lo.x + pad + count_w, y), color, self.classes.names[i]
+        )
+        draw.pop_clip_rect()
+
+    def _draw_unlabel_row(self):
+        """unlabel at the top left, unlabel all at the top right: two small
+        buttons that stay put however many classes there are."""
+        picked = None
+        x0 = imgui.get_cursor_pos_x()
+        avail = imgui.get_content_region_avail().x
+        if imgui.small_button("unlabel##_roi"):
+            picked = UNLABELED
+        set_tooltip("Clear the selected ROI's label (0)", show_mark=False)
+        pad = imgui.get_style().frame_padding.x * 2
+        right_w = imgui.calc_text_size("unlabel all").x + pad
+        imgui.same_line()
+        imgui.set_cursor_pos_x(max(x0 + avail - right_w, imgui.get_cursor_pos_x()))
+        with danger_button():
+            if imgui.small_button("unlabel all##_roi"):
+                picked = UNLABEL_ALL
+        set_tooltip("Clear every label on this plane", show_mark=False)
         return picked
 
     def _caption(self, text: str, width: float):
@@ -2576,94 +2888,151 @@ class ManualRoiWidget:
         else:
             imgui.same_line(width)
 
+    # captions for the PROCESS rows: what the row does, not what it is
+    _PROCESS_ROWS = ("traces", "find in region", "find in plane", "settings")
+
+    def _caption_width(self) -> float:
+        """One column wide enough for every PROCESS caption.
+
+        ``same_line`` takes an offset from the line's start, so the card's
+        own padding has to be in the number - otherwise the widest caption
+        overruns the column and that row alone loses its alignment.
+        """
+        pad = imgui.get_style().window_padding.x
+        return max(imgui.calc_text_size(c).x for c in self._PROCESS_ROWS) + pad + em(0.6)
+
     def _draw_process_card(self, h: float, w: float = 0.0):
-        """One action per row, each with a dim caption saying what it does:
-        run the drawn ROIs, find new ROIs in the region, run a whole plane."""
+        """Three things this card starts, one per row, each saying so:
+
+        traces for the ROIs already drawn, detection inside a drawn region,
+        detection over the whole plane on screen. Engines read the same way
+        everywhere - suite2p first, masknmf second - and the region row
+        carries the region tool itself, so the buttons that need a region
+        sit next to the button that makes one.
+        """
         with card("##process", "PROCESS", h, w):
-            cap = em(3.6)
-            self._caption("ROIs", cap)
-            imgui.set_next_item_width(em(7))
-            changed, sel = imgui.combo(
-                "##process",
-                PROCESSES.index(self.process),
-                [PROCESS_LABELS[p] for p in PROCESSES],
-            )
-            if changed:
-                self.process = PROCESSES[sel]
-            set_tooltip(
-                "Which signal to pull out of the drawn masks:\n\n"
-                + "\n\n".join(PROCESS_HELP[p] for p in PROCESSES),
-                show_mark=False,
-            )
-            imgui.same_line(0, em(0.4))
-            imgui.set_next_item_width(em(4.5))
-            _, self.run_tag = imgui.input_text_with_hint("##run_tag", "tag", self.run_tag)
-            set_tooltip("Names the output folder: rois_<tag>/ beside the data", show_mark=False)
-            imgui.same_line(0, em(0.4))
-            if imgui.button("Run"):
-                self.run_in_view()
-            set_tooltip(
-                "Run every drawn ROI listed in the table through the picked "
-                "process; outputs land in rois_<tag>/ beside the data",
-                show_mark=False,
-            )
-            self._caption("find", cap)
-            no_region = self.region is None
-            if no_region:
-                imgui.begin_disabled()
-            find_masknmf = imgui.button("masknmf##find")
-            hovered = imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled)
-            imgui.same_line(0, em(0.4))
-            find_suite2p = imgui.button("suite2p##find")
-            hovered |= imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled)
-            if no_region:
-                imgui.end_disabled()
-            if hovered:
-                imgui.set_tooltip(
-                    "Detect new ROIs inside a region, unseeded - draw the "
-                    "region with r first" if no_region
-                    else "Detect new ROIs inside the region, unseeded; they "
-                         "arrive as an algo overlay to promote or discard"
-                )
-            if find_masknmf:
-                self.discover_region("masknmf")
-            if find_suite2p:
-                self.discover_region("suite2p")
-            self._caption("plane", cap)
-            no_path = self.fpath is None
-            if no_path:
-                imgui.begin_disabled()
-            for i, kind in enumerate(("suite2p", "masknmf")):
-                if i:
-                    imgui.same_line(0, em(0.4))
-                if imgui.button(f"{kind}##plane"):
-                    self.run_full_plane(kind)
-                if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
-                    imgui.set_tooltip(
-                        "open a file first" if no_path else
-                        f"Full {kind} run of the plane on screen -> "
-                        f"zplane{self._plane_pos(self.z).get(self.zdim, 0) + 1:02d}/ "
-                        "beside the data.\nProcess tab for the full volume."
-                    )
-            if no_path:
-                imgui.end_disabled()
+            cap = self._caption_width()
+            self._draw_traces_row(cap)
+            self._draw_find_region_row(cap)
+            self._draw_find_plane_row(cap)
             self._draw_params_row(cap)
+
+    def _draw_traces_row(self, cap: float):
+        """Extract traces for the drawn ROIs the table lists."""
+        self._caption("traces", cap)
+        imgui.set_next_item_width(em(6))
+        changed, sel = imgui.combo(
+            "##process",
+            PROCESSES.index(self.process),
+            [PROCESS_LABELS[p] for p in PROCESSES],
+        )
+        if changed:
+            self.process = PROCESSES[sel]
+        set_tooltip(
+            "Which signal to pull out of the drawn masks:\n\n"
+            + "\n\n".join(PROCESS_HELP[p] for p in PROCESSES),
+            show_mark=False,
+        )
+        imgui.same_line(0, em(0.4))
+        imgui.set_next_item_width(em(4.5))
+        # the hint shows the tag a run gets when the box is left alone, so
+        # the default reads as a default instead of as something typed
+        _, self.run_tag = imgui.input_text_with_hint(
+            "##run_tag", DEFAULT_RUN_TAG, self.run_tag
+        )
+        set_tooltip(
+            f"Names the output folder: {OUT_PREFIX}{self.effective_tag}/ beside "
+            "the data. Leave it empty for the default.",
+            show_mark=False,
+        )
+        imgui.same_line(0, em(0.4))
+        listed = self.listed_drawn()
+        todo = self._untraced(listed)
+        why = (
+            "no data path to write beside" if self.fpath is None
+            else "no drawn ROIs listed" if not listed
+            else "every listed ROI already has a trace" if not todo
+            else None
+        )
+        if why is not None:
+            imgui.begin_disabled()
+        if imgui.button("Extract"):
+            self.run_in_view()
+        if why is not None:
+            imgui.end_disabled()
+        if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
+            imgui.set_tooltip(
+                why or f"Extract {PROCESS_LABELS[self.process]} traces for the "
+                       f"{len(todo)} listed ROI(s) -> {OUT_PREFIX}{self.effective_tag}/"
+            )
+
+    def _draw_find_region_row(self, cap: float):
+        """Detect new ROIs inside a drawn region; the region tool lives here
+        so the button that makes one sits beside the buttons that need it."""
+        self._caption("find in region", cap)
+        have_region = self.region is not None
+        with selected_button_style(self.region_mode):
+            if imgui.button("Region" if have_region else "Draw region"):
+                self.set_region_mode(not self.region_mode)
+        if imgui.is_item_hovered():
+            y0, y1, x0, x1 = self.region if have_region else (0, 0, 0, 0)
+            imgui.set_tooltip(
+                f"Region {y1 - y0}x{x1 - x0} px - drag again to replace it (r)"
+                if have_region else
+                "Drag a box on the image to mark where to look (r)"
+            )
+        for kind in ("suite2p", "masknmf"):
+            imgui.same_line(0, em(0.4))
+            if not have_region:
+                imgui.begin_disabled()
+            if imgui.button(f"{kind}##find"):
+                self.discover_region(kind)
+            if not have_region:
+                imgui.end_disabled()
+            if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
+                imgui.set_tooltip(
+                    f"Draw a region first, then {kind} looks for ROIs inside it"
+                    if not have_region else
+                    f"Look for ROIs inside the region with {kind}, unseeded; "
+                    "they arrive as an algo overlay to promote or discard"
+                )
+
+    def _draw_find_plane_row(self, cap: float):
+        """Detect ROIs across the whole plane on screen, as a detached run."""
+        self._caption("find in plane", cap)
+        no_path = self.fpath is None
+        for i, kind in enumerate(("suite2p", "masknmf")):
+            if i:
+                imgui.same_line(0, em(0.4))
+            if no_path:
+                imgui.begin_disabled()
+            if imgui.button(f"{kind}##plane"):
+                self.run_full_plane(kind)
+            if no_path:
+                imgui.end_disabled()
+            if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
+                imgui.set_tooltip(
+                    "open a file first" if no_path else
+                    f"Full {kind} run of the plane on screen -> "
+                    f"zplane{self._plane_pos(self.z).get(self.zdim, 0) + 1:02d}/ "
+                    "beside the data.\nProcess tab for the full volume."
+                )
 
     def _draw_params_row(self, cap: float):
         """What parameters the runs above will use, and where to change them.
 
-        Every run started from this card goes through the settings the Run
-        tab holds, so the skip / run / force stage toggles and every
+        Every run started from this card goes through the settings the
+        Process tab holds, so the skip / run / force stage toggles and every
         parameter are set in one place.
         """
         kind = self.pipeline_for() or "masknmf"
-        self._caption("params", cap)
+        self._caption("settings", cap)
         label, detail = self._pipeline_summary(kind)
         imgui.align_text_to_frame_padding()
         imgui.text_disabled(label)
         set_tooltip(detail, show_mark=False)
         imgui.same_line(0, em(0.4))
-        if imgui.small_button("Params##pipeline"):
+        if imgui.small_button("Open##pipeline"):
             self.open_pipeline_params(kind)
         set_tooltip(
             f"Open the Process tab on {kind} - runs started here use those "
@@ -2733,43 +3102,6 @@ class ManualRoiWidget:
             "store.rois          # per-ROI plane, area, class, note, uid, source",
         )
         imgui.end_tooltip()
-
-    def _draw_help_popup(self):
-        if not self.help_open:
-            return
-        opened, self.help_open = popup("ROI help", self.help_open)
-        if opened:
-            section("Workflow")
-            for i, step in enumerate(_HELP_STEPS, 1):
-                imgui.text_colored(to_vec4(THEME.accent), f"{i}.")
-                imgui.same_line(em(2.6))
-                imgui.text(textwrap.fill(step, 80))
-                imgui.dummy(imgui.ImVec2(0, em(0.15)))
-            section("Output files")
-            imgui.text_colored(to_vec4(THEME.code), _HELP_FILES)
-            if close_button():
-                self.help_open = False
-        imgui.end()
-
-    def _draw_keybinds_popup(self):
-        if not self.keybinds_open:
-            return
-        opened, self.keybinds_open = popup("ROI keys", self.keybinds_open)
-        if opened:
-            flags = imgui.TableFlags_.row_bg | imgui.TableFlags_.borders_inner_h
-            if imgui.begin_table("##roi-keybinds", 2, flags):
-                imgui.table_setup_column("key", imgui.TableColumnFlags_.width_fixed, em(10))
-                imgui.table_setup_column("action")
-                for key, action in KEYBINDS:
-                    imgui.table_next_row()
-                    imgui.table_next_column()
-                    imgui.text_colored(to_vec4(THEME.warn), key)
-                    imgui.table_next_column()
-                    imgui.text(action)
-                imgui.end_table()
-            if close_button():
-                self.keybinds_open = False
-        imgui.end()
 
     # ------------------------------------------------------------------
     # imgui: right tabs
@@ -2930,7 +3262,7 @@ class ManualRoiWidget:
                 else "every listed ROI already has a trace" if not todo
                 else f"Run all {len(todo)} listed ROIs through "
                      f"{PROCESS_LABELS[self.process]} "
-                     f"-> {OUT_PREFIX}{self.run_tag}/"
+                     f"-> {OUT_PREFIX}{self.effective_tag}/"
             )
         imgui.same_line(0, gap)
         why = (
@@ -3453,9 +3785,19 @@ class ManualRoiWidget:
             self.trace_sel = set(rows)
             self._trace_fit = True
         imgui.same_line(0, 6)
-        if imgui.small_button("clear"):
+        # "clear" here used to empty the plot, which reads as "delete these"
+        # next to a table of traces; the two are separate buttons now
+        if imgui.small_button("unplot"):
             self.trace_sel.clear()
             self._trace_fit = True
+        set_tooltip("Take every trace off the plot; the rows stay", show_mark=False)
+        imgui.same_line(0, 6)
+        with danger_button():
+            delete_all = imgui.small_button("delete all")
+        set_tooltip(
+            f"Delete all {len(rows)} traces and the ROIs behind them",
+            show_mark=False,
+        )
         # stretch, not fit-to-content: the tab is a narrow column and
         # fixed-width columns ran off its right edge. frames and peak start
         # hidden — right-click the header to bring them back.
@@ -3504,7 +3846,10 @@ class ManualRoiWidget:
                 imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(*rgb, 1.0))
             clicked, _ = imgui.selectable(
                 f"{shown}##tr_{origin}_{name}_{k}", picked,
-                imgui.SelectableFlags_.span_all_columns,
+                imgui.SelectableFlags_.span_all_columns
+                # the row spans the delete button's column too; without this
+                # it takes the hover and the button never sees a click
+                | imgui.SelectableFlags_.allow_overlap,
             )
             if rgb is not None:
                 imgui.pop_style_color()
@@ -3528,7 +3873,11 @@ class ManualRoiWidget:
                         "Delete - the trace and the ROI behind it"
                     )
         imgui.end_table()
-        if pending is not None:
+        if delete_all:
+            for key in rows:
+                self.delete_trace_row(key)
+            self.status = f"deleted {len(rows)} traces"
+        elif pending is not None:
             self.delete_trace_row(pending)
 
 def attach_roi_widget(parent: Any, focus: bool = False) -> ManualRoiWidget | None:

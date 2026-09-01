@@ -793,8 +793,32 @@ def register(
                 raise FileNotFoundError(f"registration produced no plane dir for plane {p}")
             d = cands[0]
         dirs.append(d)
+        _drop_run_gates(d / "ops.npy", logger)
     logger.info(f"roi_workflow: registration done in {time.time() - t0:.1f}s")
     return dirs
+
+
+def _drop_run_gates(ops_path: Path, logger) -> None:
+    """Strip ``roidetect`` from a plane dir's ops.npy after registration.
+
+    ``roidetect=0`` is how this function asks suite2p for registration
+    only; it is an instruction for one run, not a property of the data.
+    Left in ops.npy it is inherited by every later stage (masknmf's
+    merge_ops keeps it, lsp lets it win over settings that do not spell
+    it) and the GUI hydrates it as "Detection: Skip" - which is how a
+    suite2p run ends up regenerating figures and finding no ROIs.
+    """
+    try:
+        if not ops_path.exists():
+            return
+        ops = np.load(ops_path, allow_pickle=True).item()
+        if not isinstance(ops, dict) or "roidetect" not in ops:
+            return
+        ops.pop("roidetect")
+        np.save(ops_path, ops)
+        logger.debug(f"roi_workflow: dropped roidetect from {ops_path}")
+    except Exception as error:  # noqa: BLE001 - never fail a run over this
+        logger.warning(f"roi_workflow: could not clean {ops_path}: {error}")
 
 
 # ---------------------------------------------------------------------------

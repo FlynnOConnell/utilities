@@ -309,3 +309,78 @@ class TestTopStripResize:
         # nothing registered: there is no panel to shut, so no bar is drawn
         strip = TopStrip(figure)
         assert strip.size == MENU_HEIGHT
+
+
+class TestMenuRowCluster:
+    """The status / metadata / help / keybinds buttons sit at the right end
+    of the menu row, and the status button says what is idle."""
+
+    @staticmethod
+    def _gui(shape=(4, 1, 5, 32, 32)):
+        from mbo_utilities.arrays.numpy import NumpyArray
+        from mbo_utilities.gui.run_gui import _create_image_widget
+        from mbo_utilities.gui.widgets.preview_data import PreviewDataWidget
+
+        data = np.random.default_rng(0).random(shape).astype(np.float32)
+        iw = _create_image_widget(
+            NumpyArray(data, dims="TCZYX"),
+            widget="preview",
+            figure_kwargs_override={"size": FIGURE_SIZE},
+        )
+        gui = next(
+            w for w in iw.figure.imgui_windows.values()
+            if isinstance(w, PreviewDataWidget)
+        )
+        return iw, gui
+
+    def _buttons(self):
+        """``[(label, cursor_x, window_width)]`` for one drawn frame."""
+        from imgui_bundle import imgui
+
+        from mbo_utilities.gui.widgets.process_manager import get_process_manager
+
+        iw, _gui = self._gui()
+        # the status button reports whatever the shared process manager is
+        # holding, and other tests leave finished work in it; empty it just
+        # before the frame that is measured
+        pm = get_process_manager()
+        for job in pm.get_jobs():
+            pm.clear_job(job.job_id)
+        pm._processes.clear()
+        seen = []
+        real = imgui.button
+
+        def spy(label, *args, **kwargs):
+            seen.append((label, imgui.get_cursor_pos_x(), imgui.get_window_width()))
+            return real(label, *args, **kwargs)
+
+        imgui.button = spy
+        try:
+            iw.figure.canvas.draw()
+        finally:
+            imgui.button = real
+            iw.close()
+        return seen
+
+    def test_the_cluster_is_named_and_right_aligned(self):
+        seen = self._buttons()
+        labels = [label for label, _x, _w in seen]
+        status = [row for row in seen if "Console: Idle" in row[0]]
+        assert status, f"the status button names the console: {labels}"
+        # one Help and one Keybinds button, not a second ROI pair
+        assert any(label == "Help" for label, _x, _w in seen), labels
+        assert any(label == "Keybinds" for label, _x, _w in seen), labels
+        assert not [label for label in labels if label.startswith("ROI ")], labels
+        # the whole cluster starts past the middle of the row
+        _label, x, width = status[0]
+        assert x > width * 0.5, f"status button at {x} of {width}"
+
+    def test_the_panel_has_no_title_bar(self):
+        """fastplotlib draws a custom full-width title box for an edge window
+        with a title; a static "Data Preview" label only cost the panel a row
+        of height."""
+        iw, gui = self._gui()
+        try:
+            assert gui._title is None
+        finally:
+            iw.close()
