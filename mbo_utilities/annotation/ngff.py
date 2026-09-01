@@ -88,6 +88,7 @@ class LabelsZarr:
                 "area": int(r.area),
                 "uid": int(r.uid),
                 "source": r.source,
+                "color": list(r.color) if r.color is not None else None,
             }
             for i, r in enumerate(store.rois)
         ]
@@ -99,6 +100,7 @@ class LabelsZarr:
                     "label_names": list(store.label_names),
                     "source_image": str(source_path) if source_path else None,
                     "next_uid": int(store.next_uid),
+                    "plane_axes": [[str(n), int(s)] for n, s in store.plane_axes],
                 },
             }
         )
@@ -187,6 +189,7 @@ class LabelsZarr:
             class_index = int(props.get("class-index", -1))
             if not -1 <= class_index < max(len(label_names), 1):
                 class_index = -1
+            color = props.get("color")
             rois.append(
                 RoiRecord(
                     z=int(props.get("z", z)),
@@ -195,10 +198,11 @@ class LabelsZarr:
                     note=str(props.get("note", "")),
                     uid=int(props.get("uid", 0) or 0),
                     source=str(props.get("source", "")),
+                    color=tuple(int(v) for v in color) if color else None,
                 )
             )
         nz, ny, nx = volume.shape
-        return RoiLabelStore(
+        store = RoiLabelStore(
             nz,
             ny,
             nx,
@@ -207,3 +211,7 @@ class LabelsZarr:
             rois=rois,
             next_uid=int(mbo.get("next_uid", 0) or 0),
         )
+        store.plane_axes = tuple(
+            (str(n), int(s)) for n, s in (mbo.get("plane_axes") or ())
+        )
+        return store

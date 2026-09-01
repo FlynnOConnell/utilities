@@ -12,14 +12,15 @@ class StrokeDrawer:
 
     Left-drag pans by default, so the pan binding is lifted while drawing is
     armed; wheel zoom and right-drag zoom stay live. Emits a closed stroke on
-    release, or a click position when disarmed.
+    release, or a click position plus the held keyboard modifiers (a frozenset
+    of pygfx names like "Ctrl", "Shift") when disarmed.
     """
 
     def __init__(
         self,
         subplot,
         on_stroke: Callable[[list], None],
-        on_click: Optional[Callable[[int, int], None]] = None,
+        on_click: Optional[Callable[[int, int, frozenset], None]] = None,
         color: str = "magenta",
     ):
         self.subplot = subplot
@@ -89,4 +90,5 @@ class StrokeDrawer:
             return
         pos = self.subplot.map_screen_to_world((ev.x, ev.y))
         if pos is not None:
-            self.on_click(int(pos[1]), int(pos[0]))
+            mods = frozenset(getattr(ev, "modifiers", ()) or ())
+            self.on_click(int(pos[1]), int(pos[0]), mods)

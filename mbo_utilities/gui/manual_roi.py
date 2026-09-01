@@ -11,13 +11,16 @@ stroke capture, overlay compositing and theme are the shared widgets from
 
 Arm "Add ROI" (a), drag a closed stroke around a cell, release and the
 enclosed pixels become a mask. ROIs live in a ``RoiLabelStore``: one
-``(Z, Y, X)`` uint16 label volume (0 is background, ROI ``i`` is ``i + 1``)
+``(P, Y, X)`` uint16 label volume (0 is background, ROI ``i`` is ``i + 1``)
 so they can never overlap. Each ROI keeps a persistent ``uid`` and a
 ``source`` naming where it came from ("" = drawn by hand). A stroke lands
-on the z-plane the viewer currently shows; T and C are ignored. Data
-without a z slider degrades to a single plane. Annotations autosave next to
-the data as an OME-NGFF-style labels zarr (``manual_labels.zarr``, see
-``mbo_utilities.annotation``) and are restored from it on relaunch.
+on the exact slice the viewer shows: every scrolling dim except time (z,
+channel, any extra slider) keys its own plane of masks, and flipping a
+slider swaps the overlays, table filter and traces to that slice's ROIs.
+Data without scroll sliders degrades to a single plane. Annotations
+autosave next to the data as an OME-NGFF-style labels zarr
+(``manual_labels.zarr``, see ``mbo_utilities.annotation``) and are restored
+from it on relaunch.
 
 Runs happen in place: the PROCESS card sends the listed ROIs through
 extract / demix (``rois_<tag>/`` beside the data), detects new ROIs inside
@@ -30,8 +33,13 @@ uid, so deleting an ROI never remaps anyone else's rows.
 
 With drawing off, clicking selects what is under the cursor - a derived
 component when its overlay shows there, else the drawn ROI - and clicking
-the background clears the selection. Selecting a listed ROI on another
-plane jumps the z slider. Only the first subplot is drawable.
+the background clears the selection. Ctrl+click (in the image, the ROI
+table, or the trace-plot legend) toggles the ROI in a group buffer and
+shift+click adds to it (a row range in the table); class labels and the
+group color then apply to every member, so two cells can be grouped and
+sent to "soma" in two clicks. Mask, table and trace colors all come from
+the same per-ROI color. Selecting a listed ROI on another plane jumps
+every slider that plane encodes. Only the first subplot is drawable.
 """
 
 from __future__ import annotations
@@ -91,6 +99,7 @@ from mbo_utilities.gui.roi_runs import (
     RoiRun,
     RoiRunManager,
     TraceSet,
+    component_color,
     derived_rgba,
     display_fneu,
     display_trace,
@@ -178,6 +187,9 @@ KEYBINDS = (
     ("b", "toggle the drawn overlay"),
     ("d", "toggle the derived overlay"),
     ("click", "select what is under the cursor (drawing off)"),
+    ("ctrl+click", "toggle an ROI in the group (image, table, trace legend)"),
+    ("shift+click", "add to the group (a row range in the table)"),
+    ("esc", "also empties the group"),
 )
 
 _HELP_STEPS = (
@@ -219,6 +231,19 @@ def _fneu_colormap() -> int:
             )
         _fneu_cmap = int(idx)
     return _fneu_cmap
+
+
+def _line_colormap(rgb) -> int:
+    """A registered single-color colormap for one trace line (this implot
+    build has no per-line color argument, so lines take their color from the
+    pushed colormap). Looked up by name so a recreated context re-registers."""
+    key = tuple(int(round(float(v) * 255)) for v in rgb)
+    name = "mbo_line_{}_{}_{}".format(*key)
+    idx = implot.get_colormap_index(name)
+    if idx < 0:
+        color = (key[0] / 255.0, key[1] / 255.0, key[2] / 255.0, 1.0)
+        idx = implot.add_colormap(name, np.array([color, color], np.float32))
+    return int(idx)
 
 
 def labels_path(fpath) -> Path:
@@ -339,22 +364,37 @@ class ManualRoiWidget:
 
         self.zdim = find_slider_name(iw.dim_names, "z")
         self.tdim = find_slider_name(iw.dim_names, "t")
-        nz = 1
-        if self.zdim is not None:
-            rr = iw.ndwidget.indices.ref_ranges.get(self.zdim)
-            if rr is not None:
-                nz = max(int(rr.stop - rr.start), 1)
+        self.cdim = find_slider_name(iw.dim_names, "c")
+        # every scrolling dim except time keys its own mask plane, so masks
+        # follow the channel / z / any extra slider; z sits last in the flat
+        # order so a z-only store keeps plane == z and old stores restore
+        axes = []
+        for name in iw.dim_names:
+            if name == self.tdim:
+                continue
+            rr = iw.ndwidget.indices.ref_ranges.get(name)
+            n = max(int(rr.stop - rr.start), 1) if rr is not None else 1
+            if n > 1:
+                axes.append((name, n))
+        axes.sort(key=lambda a: a[0] == self.zdim)
+        self.plane_axes: tuple[tuple[str, int], ...] = tuple(axes)
+        nz = int(np.prod([n for _, n in axes])) if axes else 1
 
         self._adopted_store = store is not None and (store.nz, store.ny, store.nx) == (nz, self.ny, self.nx)
         if self._adopted_store:
             self.store = store
         else:
             self.store = RoiLabelStore(nz, self.ny, self.nx, min_pixels=MIN_ROI_PIXELS)
+        self.store.plane_axes = self.plane_axes
         for name in label_names:
             self.store.add_label_name(name)
 
         self.selected = -1
         self.selected_derived: tuple[int, int] | None = None
+        # ctrl / shift click builds a group here; label and color actions
+        # then apply to every member. Entries are (si, k), si -1 = drawn.
+        self.buffer: list[tuple[int, int]] = []
+        self._group_color = (1.0, 0.8, 0.2)
         self._pending_row_action: tuple[str, int, int] | None = None
         self.status = "press Add ROI to start"
         self._save_error: str | None = None
@@ -381,7 +421,7 @@ class ManualRoiWidget:
         self.order = _PlaneOrder({"source": np.zeros(0, np.int64)}, self.classes.labels, 0)
 
         self.z = self._current_z()
-        if self.zdim is not None:
+        if self.plane_axes:
             iw.ndwidget.indices.add_event_handler(self._on_indices)
 
         self.overlay = self.subplot.add_image(
@@ -468,7 +508,7 @@ class ManualRoiWidget:
                 renderer.remove_event_handler(fn, kind)
             except (KeyError, ValueError):
                 pass
-        if self.zdim is not None:
+        if self.plane_axes:
             try:
                 self.iw.ndwidget.indices.remove_event_handler(self._on_indices)
             except (KeyError, ValueError, AttributeError):
@@ -508,9 +548,43 @@ class ManualRoiWidget:
     # ------------------------------------------------------------------
 
     def _current_z(self) -> int:
-        if self.zdim is None:
+        """Flat store plane for the viewer's scroll position.
+
+        Plain z for z-only data; with channels or other scroll dims each
+        combination owns a plane (``plane_axes``, z fastest-varying), so the
+        masks on screen always belong to the exact slice on screen.
+        """
+        if not self.plane_axes:
             return 0
-        return int(np.clip(self.iw.indices[self.zdim], 0, self.store.nz - 1))
+        sizes = [n for _, n in self.plane_axes]
+        idx = [
+            int(np.clip(self.iw.indices[name], 0, n - 1))
+            for name, n in self.plane_axes
+        ]
+        return int(np.ravel_multi_index(idx, sizes))
+
+    def _plane_pos(self, plane: int) -> dict[str, int]:
+        """``{dim name: index}`` behind one flat store plane."""
+        if not self.plane_axes:
+            return {}
+        sizes = [n for _, n in self.plane_axes]
+        vals = np.unravel_index(int(np.clip(plane, 0, self.store.nz - 1)), sizes)
+        return {name: int(v) for (name, _n), v in zip(self.plane_axes, vals)}
+
+    def _goto_plane(self, plane: int):
+        """Move every scroll slider so the viewer shows ``plane``."""
+        for name, v in self._plane_pos(plane).items():
+            if int(self.iw.indices[name]) != v:
+                self.iw.indices[name] = v
+
+    def _plane_label(self, plane: int) -> str:
+        """``"2"`` for plain z planes, ``"c1·z2"`` when more dims key them."""
+        pos = self._plane_pos(plane)
+        if not pos:
+            return "1"
+        if len(pos) == 1:
+            return f"{next(iter(pos.values())) + 1}"
+        return "·".join(f"{name}{v + 1}" for name, v in pos.items())
 
     def _on_indices(self, _indices):
         z = self._current_z()
@@ -594,6 +668,7 @@ class ManualRoiWidget:
         self._row_index = {pair: row for row, pair in enumerate(self.rows)}
         if self.selected_derived is not None and self.selected_derived not in self._row_index:
             self.selected_derived = None
+        self.buffer = [pair for pair in self.buffer if pair in self._row_index]
         labels = np.full(len(self.rows), UNLABELED, np.int64)
         labels[: len(rois)] = [r.class_index for r in rois]
         for row in range(len(rois), len(self.rows)):
@@ -644,7 +719,7 @@ class ManualRoiWidget:
         def zplane(row):
             si, k = self.rows[row]
             z = self.store.rois[k].z if si < 0 else self.derived[si].result.z
-            return f"{z + 1}"
+            return self._plane_label(z)
 
         def ok(row):
             si, k = self.rows[row]
@@ -742,22 +817,55 @@ class ManualRoiWidget:
         if self.region_line is not None:
             self.region_line.visible = False
 
-    def _pick(self, row: int, col: int):
+    def _pick(self, row: int, col: int, mods: frozenset = frozenset()):
         """Select what the click shows: a visible derived component first
-        (the derived overlay draws on top), else the drawn ROI."""
+        (the derived overlay draws on top), else the drawn ROI. Ctrl+click
+        toggles it in the group buffer, shift+click adds it; a plain click
+        replaces the group with the single selection."""
         try:
+            hit: tuple[int, int] | None = None
             if self.show_derived and 0 <= row < self.ny and 0 <= col < self.nx:
                 for si, s in enumerate(self.derived):
                     if not s.visible or s.result.z != self.z:
                         continue
                     k = int(s.pick_map[row, col])
                     if k >= 0 and k not in s.discarded:
-                        self.select_derived(si, k)
-                        return
-            self.select_roi(self.store.roi_at(self.z, row, col))
+                        hit = (si, k)
+                        break
+            if hit is None:
+                index = self.store.roi_at(self.z, row, col)
+                if index >= 0:
+                    hit = (-1, index)
+            if "Ctrl" in mods:
+                if hit is not None:
+                    self.buffer_toggle(*hit)
+                return
+            if "Shift" in mods:
+                if hit is not None:
+                    self.buffer_add(*hit)
+                return
+            self.buffer_clear()
+            if hit is None:
+                self.select_roi(-1)
+            elif hit[0] < 0:
+                self.select_roi(hit[1])
+            else:
+                self.select_derived(*hit)
         except Exception as e:  # noqa: BLE001 - surfaced in the status row
             self.logger.exception("pick failed")
             self.status = f"pick failed: {type(e).__name__}: {e}"
+
+    def _row_grouped(self, item: int) -> bool:
+        return 0 <= item < len(self.rows) and self.rows[item] in self.buffer
+
+    def _table_select(self, item: int):
+        """Plain table click: single selection, group dropped."""
+        self.buffer_clear()
+        self.select_row(item)
+
+    def _table_ctrl(self, item: int):
+        if 0 <= item < len(self.rows):
+            self.buffer_toggle(*self.rows[item])
 
     def select_row(self, row: int | None):
         """Route a table-row selection to the right kind."""
@@ -788,8 +896,8 @@ class ManualRoiWidget:
             self._note_buf = record.note
             cleared = self.order.reveal(self.selected)
             self.status = f"ROI {self.selected}: {record.area} px" + _cleared_note(cleared)
-            if self.zdim is not None and record.z != self.z:
-                self.iw.indices[self.zdim] = record.z
+            if record.z != self.z:
+                self._goto_plane(record.z)
             if any(record.uid in ts.data for ts in self.trace_sets.values()):
                 self.trace_uid = record.uid
             if self.follow:
@@ -815,13 +923,108 @@ class ManualRoiWidget:
         npix = int(stat_row.get("npix", len(stat_row["ypix"])))
         tail = " · promoted" if (s.name, k) in self._promoted else ""
         self.status = f"{s.name} row {k}: {npix} px{tail}" + _cleared_note(cleared)
-        if self.zdim is not None and s.result.z != self.z:
-            self.iw.indices[self.zdim] = s.result.z
+        if s.result.z != self.z:
+            self._goto_plane(s.result.z)
         if self.follow:
             self._center_on(stat_row["ypix"], stat_row["xpix"])
         self._sync_trace_sel()
         self.refresh_overlay()
         self.refresh_derived_overlay()
+
+    # ------------------------------------------------------------------
+    # group buffer (ctrl / shift multi-select)
+    # ------------------------------------------------------------------
+
+    def in_buffer(self, si: int, k: int) -> bool:
+        return (si, k) in self.buffer
+
+    def _seed_buffer(self):
+        """A first ctrl / shift click keeps the current selection grouped,
+        so 'select one, ctrl+click another' makes a group of two."""
+        if self.buffer:
+            return
+        if self.selected >= 0:
+            self.buffer.append((-1, self.selected))
+        elif self.selected_derived is not None:
+            self.buffer.append(self.selected_derived)
+
+    def buffer_add(self, si: int, k: int):
+        """Add one row to the group and make it the shown one."""
+        self._seed_buffer()
+        if (si, k) not in self.buffer:
+            self.buffer.append((si, k))
+        self._after_buffer_change(si, k)
+
+    def buffer_toggle(self, si: int, k: int):
+        """Ctrl+click: flip one row's group membership."""
+        self._seed_buffer()
+        if (si, k) in self.buffer:
+            self.buffer.remove((si, k))
+            self._refresh_group_view()
+            self.status = f"{len(self.buffer)} in group"
+        else:
+            self.buffer.append((si, k))
+            self._after_buffer_change(si, k)
+
+    def buffer_extend_to(self, item: int):
+        """Shift+click in the table: group every row between the cursor and
+        ``item``, in the order the table shows."""
+        hits = np.flatnonzero(self.order.order == item)
+        if not len(hits):
+            return
+        self._seed_buffer()
+        a, b = sorted((self.order.pos, int(hits[0])))
+        for pos in range(a, b + 1):
+            pair = self.rows[int(self.order.order[pos])]
+            if pair not in self.buffer:
+                self.buffer.append(pair)
+        self._after_buffer_change(*self.rows[item])
+
+    def buffer_clear(self):
+        if self.buffer:
+            self.buffer = []
+            self._refresh_group_view()
+
+    def _after_buffer_change(self, si: int, k: int):
+        n = len(self.buffer)
+        if si < 0:
+            self.select_roi(k)
+        else:
+            self.select_derived(si, k)
+        if n > 1:
+            self.status = f"{n} in group · labels and color apply to all"
+
+    def _refresh_group_view(self):
+        self.refresh_overlay()
+        self.refresh_derived_overlay()
+
+    def set_group_color(self, rgb: tuple[float, float, float] | None):
+        """Give every grouped ROI (or just the selection) an explicit
+        display color, in masks, table and traces alike; None reverts to
+        the class / hue colors."""
+        targets = list(self.buffer)
+        if not targets:
+            if self.selected >= 0:
+                targets = [(-1, self.selected)]
+            elif self.selected_derived is not None:
+                targets = [self.selected_derived]
+        if not targets:
+            return
+        rgb255 = None if rgb is None else tuple(int(round(float(v) * 255)) for v in rgb)
+        for si, k in targets:
+            if si < 0:
+                self.store.set_color(k, rgb255)
+            elif rgb is None:
+                self.derived[si].colors.pop(k, None)
+            else:
+                self.derived[si].colors[k] = tuple(float(v) for v in rgb)
+        self._refresh_group_view()
+        self._autosave()
+        self._save_registry()
+        self.status = (
+            f"colored {len(targets)} ROI(s)" if rgb is not None
+            else f"reset {len(targets)} color(s)"
+        )
 
     def step(self, delta: int):
         """Up / down: the next or previous trace while the Traces panel is
@@ -891,6 +1094,12 @@ class ManualRoiWidget:
         for ts in self.trace_sets.values():
             ts.prune(live)
         self._feathers = {u: v for u, v in self._feathers.items() if u in live}
+        # drawn indices above the deleted one shift down by one
+        self.buffer = [
+            (si, k - (1 if si < 0 and k > index else 0))
+            for si, k in self.buffer
+            if not (si < 0 and k == index)
+        ]
         self._traces_changed()
         self._resync()
         self.select_roi(min(index, self.n_rois - 1))
@@ -908,6 +1117,7 @@ class ManualRoiWidget:
         self.store.clear()
         self.trace_sets.clear()
         self._feathers.clear()
+        self.buffer = []
         self._traces_changed()
         self._resync()
         self.select_roi(-1)
@@ -916,7 +1126,26 @@ class ManualRoiWidget:
 
     def assign_class(self, class_index: int):
         """Give the selected ROI - drawn or derived - a class label;
-        UNLABELED (-1) clears it."""
+        UNLABELED (-1) clears it. With a group of two or more (ctrl / shift
+        click) the label lands on every member."""
+        if len(self.buffer) > 1:
+            for si, k in self.buffer:
+                if si < 0:
+                    self.store.set_class(k, class_index)
+                elif class_index == UNLABELED:
+                    self.derived[si].classes.pop(k, None)
+                else:
+                    self.derived[si].classes[k] = int(class_index)
+            self._resync()
+            name = (
+                "unlabeled" if class_index == UNLABELED
+                else self.classes.names[class_index]
+            )
+            self.status = f"{len(self.buffer)} ROIs -> {name}"
+            self._refresh_group_view()
+            self._autosave()
+            self._save_registry()
+            return
         if self.selected >= 0:
             self.store.set_class(self.selected, class_index)
             self._resync()
@@ -976,12 +1205,14 @@ class ManualRoiWidget:
             return
         comps = []
         sel = None
+        grouped = {k for si, k in self.buffer if si < 0}
         for i, record in enumerate(self.store.rois):
             if record.z != self.z:
                 continue
             ypix, xpix, lam = self._feather(i)
             rgb = np.asarray(self.store.roi_rgb(i), np.float32) / 255.0
-            comps.append((ypix, xpix, lam, rgb, self.opacity))
+            fill = SELECTED_OPACITY if i in grouped else self.opacity
+            comps.append((ypix, xpix, lam, rgb, fill))
             if i == self.selected:
                 sel = (ypix, xpix, rgb)
         self.overlay.data = feathered_rgba((self.ny, self.nx), comps, sel)
@@ -1037,8 +1268,10 @@ class ManualRoiWidget:
             si, k = self.selected_derived
             if self.derived[si].result.z == self.z:
                 selected = (self.derived[si], k)
+        grouped = {(id(self.derived[si]), k) for si, k in self.buffer if si >= 0}
         self.derived_overlay.data = derived_rgba(
-            (self.ny, self.nx), sets_on_z, self.derived_opacity, selected
+            (self.ny, self.nx), sets_on_z, self.derived_opacity, selected,
+            grouped=grouped,
         )
 
     def toggle_derived_overlay(self):
@@ -1056,7 +1289,7 @@ class ManualRoiWidget:
             name += "~"
         return name
 
-    def _add_derived(self, res, discarded=(), classes=None) -> DerivedSet | None:
+    def _add_derived(self, res, discarded=(), classes=None, colors=None) -> DerivedSet | None:
         """Wrap a loaded run as a derived set (replacing an earlier load of
         the same dir) and merge its uid-keyed traces."""
         if tuple(res.shape) != (self.ny, self.nx):
@@ -1073,10 +1306,12 @@ class ManualRoiWidget:
             return None
         promoted_traces: dict = {}
         classes = dict(classes or {})
+        colors = dict(colors or {})
         for si, old in enumerate(self.derived):
             if old.result.path == res.path:
                 discarded = set(discarded) | old.discarded
                 classes = {**old.classes, **classes}
+                colors = {**old.colors, **colors}
                 ts = self.trace_sets.get(old.name)
                 if ts is not None:
                     uids = {
@@ -1088,7 +1323,9 @@ class ManualRoiWidget:
                 break
         s = DerivedSet(res, self._set_name(res.path), set_color(len(self.derived)),
                        discarded={int(k) for k in discarded},
-                       classes={int(k): int(v) for k, v in classes.items()})
+                       classes={int(k): int(v) for k, v in classes.items()},
+                       colors={int(k): tuple(float(x) for x in v)
+                               for k, v in colors.items()})
         self.derived.append(s)
         self._merge_run_traces(res, s.name)
         if promoted_traces:
@@ -1100,7 +1337,7 @@ class ManualRoiWidget:
         self._save_registry()
         return s
 
-    def load_run(self, path, discarded=(), classes=None) -> bool:
+    def load_run(self, path, discarded=(), classes=None, colors=None) -> bool:
         """Read one run dir into the widget: extract runs merge their
         traces, everything else loads as a derived set (every row, the
         rejected ones included - curation happens here)."""
@@ -1126,7 +1363,7 @@ class ManualRoiWidget:
                 )
             self._save_registry()
             return True
-        return self._add_derived(res, discarded, classes) is not None
+        return self._add_derived(res, discarded, classes, colors) is not None
 
     def unload_set(self, si: int):
         s = self.derived.pop(si)
@@ -1291,15 +1528,32 @@ class ManualRoiWidget:
             self.status = f"restore failed: {e}"
             return
         if (store.nz, store.ny, store.nx) != (self.store.nz, self.store.ny, self.store.nx):
-            self.logger.warning(
-                f"{target} is {store.labels.shape}, data wants "
-                f"{self.store.labels.shape}; starting fresh"
-            )
-            self.status = "saved labels do not match this data, starting fresh"
-            return
+            zsize = dict(self.plane_axes).get(self.zdim, 1)
+            if (
+                (store.ny, store.nx) == (self.store.ny, self.store.nx)
+                and not store.plane_axes
+                and store.nz == zsize < self.store.nz
+            ):
+                # a store saved before channels keyed planes: z is last in
+                # the flat order, so its planes are the first ones here
+                grown = np.zeros(self.store.labels.shape, np.uint16)
+                grown[: store.nz] = store.labels
+                store = RoiLabelStore(
+                    self.store.nz, self.store.ny, self.store.nx,
+                    label_names=store.label_names, labels=grown,
+                    rois=store.rois, next_uid=store.next_uid,
+                )
+            else:
+                self.logger.warning(
+                    f"{target} is {store.labels.shape}, data wants "
+                    f"{self.store.labels.shape}; starting fresh"
+                )
+                self.status = "saved labels do not match this data, starting fresh"
+                return
         for name in self.store.label_names:
             store.add_label_name(name)
         store.min_pixels = MIN_ROI_PIXELS
+        store.plane_axes = self.plane_axes
         self.store = store
         self.status = f"restored {len(store.rois)} ROIs"
         self.refresh_overlay()
@@ -1339,7 +1593,8 @@ class ManualRoiWidget:
                         entry = {**entry, "path": str(path)}
                 if run_dir_complete(path):
                     if self.load_run(path, discarded=entry.get("discarded", ()),
-                                     classes=entry.get("classes")):
+                                     classes=entry.get("classes"),
+                                     colors=entry.get("colors")):
                         continue
                 self._registry_extra.append(entry)
             own = labels_path(self.fpath).parent
@@ -1384,7 +1639,8 @@ class ManualRoiWidget:
         loaded = {str(s.result.path) for s in self.derived}
         entries = [
             {"path": str(s.result.path), "kind": s.result.kind,
-             "discarded": s.discarded, "classes": s.classes}
+             "discarded": s.discarded, "classes": s.classes,
+             "colors": {k: list(v) for k, v in s.colors.items()}}
             for s in self.derived
         ]
         entries += [e for e in self._registry_extra if str(e["path"]) not in loaded]
@@ -1413,13 +1669,20 @@ class ManualRoiWidget:
         return int(self.iw.indices[cdim]) if cdim is not None else 0
 
     def movie(self, z: int | None = None) -> PlaneMovie | None:
-        """``(T, Y, X)`` view of the viewer's array on plane ``z`` (default:
-        the plane on screen), or None when the array cannot be wrapped."""
-        z = self.z if z is None else int(z)
+        """``(T, Y, X)`` view of the viewer's array behind store plane ``z``
+        (default: the plane on screen), or None when the array cannot be
+        wrapped. The plane supplies every scroll dim it encodes (z, channel,
+        ...); dims outside the plane key follow the viewer."""
+        plane = self.z if z is None else int(z)
+        pos = self._plane_pos(plane)
+        zz = pos.get(self.zdim, 0) if self.zdim is not None else 0
+        cc = pos.get(self.cdim) if self.cdim is not None else 0
+        if cc is None:
+            cc = self._channel()
         try:
             arr = self.iw.data[0]
             nz = PlaneMovie(arr).nz
-            return PlaneMovie(arr, z=(z if nz > 1 else 0), c=self._channel())
+            return PlaneMovie(arr, z=(zz if nz > 1 else 0), c=cc)
         except (AttributeError, IndexError, TypeError, ValueError):
             return None
 
@@ -1568,19 +1831,25 @@ class ManualRoiWidget:
         process = self.process
         c = self._channel()
         planes = sorted({store.rois[i].z for i in indices})
+        # a plane keyed by more than z (a channel, say) needs its own movie
+        # view; a plain z plane keeps the raw array so ops lookup still works
+        multi = any(n != self.zdim for n, _ in self.plane_axes)
+        movies = {z: self.movie(z) for z in planes} if multi else {}
+        labels = {z: self._plane_label(z) for z in planes}
         logger = self.logger
 
         def fn(job):
             outs = []
             for i, z in enumerate(planes):
-                job.set_progress(i / len(planes), f"z{z + 1}")
+                job.set_progress(i / len(planes), labels[z])
                 on_plane = [j for j in indices if store.rois[j].z == z]
                 dest = out_dir if len(planes) == 1 else out_dir / f"z{z + 1:02d}"
+                src = movies.get(z) or arr
                 if process == "demix":
-                    out = demix_rois(arr, store, on_plane, z=z, c=c, out_dir=dest, tag=tag, logger=logger)
+                    out = demix_rois(src, store, on_plane, z=z, c=c, out_dir=dest, tag=tag, logger=logger)
                 else:
                     engine = "suite2p" if process == "extract-s2p" else "mean"
-                    out = extract_rois(arr, store, on_plane, z=z, c=c, out_dir=dest,
+                    out = extract_rois(src, store, on_plane, z=z, c=c, out_dir=dest,
                                        engine=engine, tag=tag, logger=logger)
                 if out is not None:
                     outs.append(Path(out))
@@ -1617,11 +1886,13 @@ class ManualRoiWidget:
         arr = self.iw.data[0]
         z = self.z
         c = self._channel()
+        multi = any(n != self.zdim for n, _ in self.plane_axes)
+        src = (self.movie(z) or arr) if multi else arr
         logger = self.logger
 
         def fn(job):
             job.set_progress(0.05, f"{engine} in {box[0]}:{box[1]}, {box[2]}:{box[3]}")
-            return discover_rois(arr, box, engine=engine, z=z, c=c, out_dir=out_dir, tag=tag, logger=logger)
+            return discover_rois(src, box, engine=engine, z=z, c=c, out_dir=out_dir, tag=tag, logger=logger)
 
         run = RoiRun(
             kind="discover", tag=tag,
@@ -1639,7 +1910,7 @@ class ManualRoiWidget:
         if self.fpath is None:
             self.status = "no data path to run on"
             return
-        plane = self.z + 1
+        plane = self._plane_pos(self.z).get(self.zdim, 0) + 1
         try:
             args = full_plane_args(kind, self.fpath, plane, self.iw)
         except ValueError as e:
@@ -1735,6 +2006,9 @@ class ManualRoiWidget:
                 self._arm_mode("off")
             elif self.region is not None:
                 self.clear_region()
+            elif self.buffer:
+                self.buffer_clear()
+                self.status = "group cleared"
         if io.key_ctrl and imgui.is_key_pressed(imgui.Key.z, False):
             self.delete_roi(self.n_rois - 1)
         if imgui.is_key_pressed(imgui.Key.delete, False):
@@ -2149,7 +2423,9 @@ class ManualRoiWidget:
         changed_any = False
         if self.store.nz > 1:
             on = self.order.plane is not None
-            changed, on = imgui.checkbox(f"this plane (z {self.z + 1}/{self.store.nz})", on)
+            changed, on = imgui.checkbox(
+                f"this plane ({self._plane_label(self.z)} of {self.store.nz})", on
+            )
             if changed:
                 self.order.plane = self.z if on else None
                 changed_any = True
@@ -2183,8 +2459,11 @@ class ManualRoiWidget:
                     self._formatters(),
                     self.scroll_to_selection,
                     table_id="manual_rois",
-                    on_select=self.select_row,
+                    on_select=self._table_select,
                     actions=self.row_actions,
+                    is_grouped=self._row_grouped,
+                    on_ctrl_select=self._table_ctrl,
+                    on_shift_select=self.buffer_extend_to,
                 )
                 if self.order.pos != pos and self.order.current is not None:
                     self.select_row(self.order.current)
@@ -2200,7 +2479,29 @@ class ManualRoiWidget:
                 self.discard_derived(si, k, advance=self.selected_derived == (si, k))
 
         imgui.separator()
-        if self.selected >= 0:
+        if len(self.buffer) > 1:
+            imgui.text_disabled(f"{len(self.buffer)} ROIs grouped")
+            imgui.same_line(0, 8)
+            changed, col = imgui.color_edit3(
+                "##group_color", list(self._group_color),
+                imgui.ColorEditFlags_.no_inputs,
+            )
+            if changed:
+                self._group_color = tuple(col)
+            imgui.same_line(0, 4)
+            if imgui.small_button("color group"):
+                self.set_group_color(self._group_color)
+            set_tooltip("Give every grouped ROI this color", show_mark=False)
+            imgui.same_line(0, 4)
+            if imgui.small_button("reset color"):
+                self.set_group_color(None)
+            set_tooltip("Back to class / hue colors", show_mark=False)
+            imgui.same_line(0, 4)
+            if imgui.small_button("ungroup"):
+                self.buffer_clear()
+            set_tooltip("Empty the group (esc)", show_mark=False)
+            imgui.text_disabled("label buttons and keys 1-9 apply to the whole group")
+        elif self.selected >= 0:
             imgui.set_next_item_width(-1)
             changed, self._note_buf = imgui.input_text_with_hint("##note", "note", self._note_buf)
             if changed:
@@ -2404,6 +2705,26 @@ class ManualRoiWidget:
         hit = self._set_by_name(name)
         return None if hit is None else self._derived_entry(hit[1].result, k)
 
+    def _key_to_pair(self, key) -> tuple[int, int] | None:
+        """``(si, k)`` behind one trace key, or None when the ROI is gone."""
+        origin, name, k = key
+        if origin == "uid":
+            index = self.store.uid_index(k)
+            return (-1, index) if index is not None else None
+        hit = self._set_by_name(name)
+        return (hit[0], k) if hit is not None else None
+
+    def _trace_color(self, key) -> tuple[float, float, float] | None:
+        """The mask color of the ROI behind one trace key, so plot lines and
+        table rows match the overlay."""
+        pair = self._key_to_pair(key)
+        if pair is None:
+            return None
+        si, k = pair
+        if si < 0:
+            return tuple(v / 255.0 for v in self.store.roi_rgb(k))
+        return component_color(self.derived[si], k)
+
     def _trace_shown(self, key) -> tuple[float, str]:
         """``(sort value, display text)`` for a key's roi column."""
         origin, name, k = key
@@ -2473,23 +2794,49 @@ class ManualRoiWidget:
         if self._trace_fit:
             implot.set_next_axes_to_fit()
             self._trace_fit = False
-        flags = implot.Flags_.no_title | implot.Flags_.no_legend
+        flags = implot.Flags_.no_title
+        if len(lines) <= 1:
+            flags |= implot.Flags_.no_legend
         if not implot.begin_plot("##roi_trace_plot", imgui.ImVec2(-1, height), flags):
             return
         try:
             # no auto-fit flags: the axes stay interactive between refits.
-            # this implot build has no per-line color hook; traces take the
-            # automatic colors, neuropil is always the same blue
+            # each line takes its ROI's mask color via a single-color
+            # colormap; neuropil is always the same blue
             implot.setup_axes("frame", "dF/F (%)")
+            ctrl = imgui.get_io().key_ctrl
             for label, tkey in lines:
                 y, yneu = self._display(tkey)
                 if y is None:
                     continue
+                rgb = self._trace_color(tkey)
+                if rgb is not None:
+                    implot.push_colormap(_line_colormap(rgb))
                 implot.plot_line(label, self._windowed(y))
+                if rgb is not None:
+                    implot.pop_colormap()
                 if yneu is not None:
                     implot.push_colormap(_fneu_colormap())
                     implot.plot_line(f"{label} Fneu", self._windowed(yneu))
                     implot.pop_colormap()
+                pair = self._key_to_pair(tkey)
+                if pair is not None:
+                    # ctrl+click a legend entry: toggle its ROI in the group
+                    if ctrl and implot.is_legend_entry_hovered(label) and imgui.is_mouse_clicked(0):
+                        self.buffer_toggle(*pair)
+                    if implot.begin_legend_popup(label):
+                        in_group = pair in self.buffer
+                        if imgui.menu_item_simple(
+                            "remove from group" if in_group else "add to group"
+                        ):
+                            self.buffer_toggle(*pair)
+                        if imgui.menu_item_simple("select this ROI"):
+                            self.buffer_clear()
+                            if pair[0] < 0:
+                                self.select_roi(pair[1])
+                            else:
+                                self.select_derived(*pair)
+                        implot.end_legend_popup()
             if self.tdim is not None:
                 moved, frame = implot.drag_line_x(0, float(self.current_frame()), _CURSOR_COLOR, 1.5)[:2]
                 if moved:
@@ -2606,10 +2953,15 @@ class ManualRoiWidget:
             imgui.table_next_column()
             _v, shown = self._trace_shown(key)
             picked = key in self.trace_sel
+            rgb = self._trace_color(key)
+            if rgb is not None:
+                imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(*rgb, 1.0))
             clicked, _ = imgui.selectable(
                 f"{shown}##tr_{origin}_{name}_{k}", picked,
                 imgui.SelectableFlags_.span_all_columns,
             )
+            if rgb is not None:
+                imgui.pop_style_color()
             if clicked:
                 if ctrl:
                     self.toggle_trace(key)

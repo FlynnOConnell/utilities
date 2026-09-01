@@ -249,7 +249,9 @@ class DerivedSet:
 
     ``accepted`` starts from the run's ``iscell`` and is the mutable
     curation state; the widget mirrors changes back into ``iscell.npy``.
-    ``classes`` maps a row to a class index in the shared label set.
+    ``classes`` maps a row to a class index in the shared label set;
+    ``colors`` maps a row to an explicit group color (float rgb in 0-1)
+    that wins over the class / hue color.
     """
 
     result: RunResult
@@ -258,6 +260,7 @@ class DerivedSet:
     visible: bool = True
     discarded: set[int] = field(default_factory=set)
     classes: dict[int, int] = field(default_factory=dict)
+    colors: dict[int, tuple[float, float, float]] = field(default_factory=dict)
     accepted: np.ndarray | None = None
     pick_map: np.ndarray | None = None
 
@@ -304,14 +307,16 @@ def derived_rgba(
     sets_on_z: list[DerivedSet],
     alpha: float,
     selected: tuple[DerivedSet, int] | None = None,
+    grouped: frozenset | set = frozenset(),
 ) -> np.ndarray:
     """``(ny, nx, 4)`` uint8 overlay for the derived sets of one plane.
 
     Each component's pixels get its own color (``component_color``) at
     ``lam / lam.max() * alpha``; where components overlap the higher alpha
     wins color and coverage. ``selected`` (a ``(set, row)`` pair) is filled
-    at ``SELECTED_ALPHA`` with a white rim. Discarded rows and invisible
-    sets are skipped; rejected rows draw dimmed.
+    at ``SELECTED_ALPHA`` with a white rim; ``grouped`` (``(id(set), row)``
+    pairs of a multi-selection) fills at ``SELECTED_ALPHA`` too. Discarded
+    rows and invisible sets are skipped; rejected rows draw dimmed.
     """
     comps = []
     sel = None
@@ -322,6 +327,8 @@ def derived_rgba(
             if k in s.discarded:
                 continue
             fill = alpha if s.accepted[k] else alpha * 0.35
+            if (id(s), k) in grouped:
+                fill = SELECTED_ALPHA
             comps.append((row["ypix"], row["xpix"], row["lam"], component_color(s, k), fill))
     if selected is not None:
         s, k = selected
@@ -358,8 +365,12 @@ def display_fneu(entry: dict) -> np.ndarray | None:
 
 
 def component_color(s: DerivedSet, k: int) -> tuple[float, float, float]:
-    """One component's rgb in 0-1: its class color when labeled, else a hue
-    of its own - the same treatment drawn ROIs get."""
+    """One component's rgb in 0-1: its explicit group color when set, its
+    class color when labeled, else a hue of its own - the same treatment
+    drawn ROIs get."""
+    rgb = s.colors.get(k)
+    if rgb is not None:
+        return tuple(rgb)
     ci = s.classes.get(k)
     if ci is not None:
         return class_color(ci)
@@ -548,13 +559,18 @@ def load_run_registry(path) -> list[dict]:
                         int(k): int(v)
                         for k, v in (row.get("classes") or {}).items()
                     },
+                    "colors": {
+                        int(k): tuple(float(x) for x in v)
+                        for k, v in (row.get("colors") or {}).items()
+                    },
                 }
             )
     return out
 
 
 def save_run_registry(path, entries: list[dict]) -> None:
-    """Write the sidecar: ``{"runs": [{"path", "kind", "discarded", "classes"}]}``."""
+    """Write the sidecar: ``{"runs": [{"path", "kind", "discarded", "classes",
+    "colors"}]}``."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     runs = [
@@ -564,6 +580,10 @@ def save_run_registry(path, entries: list[dict]) -> None:
             "discarded": sorted(int(i) for i in e.get("discarded", [])),
             "classes": {
                 str(k): int(v) for k, v in (e.get("classes") or {}).items()
+            },
+            "colors": {
+                str(k): [float(x) for x in v]
+                for k, v in (e.get("colors") or {}).items()
             },
         }
         for e in entries

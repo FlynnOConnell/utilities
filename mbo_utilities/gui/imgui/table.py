@@ -153,6 +153,9 @@ def draw_roi_table(
     table_id: str = "rois",
     on_select: Optional[Callable[[int], None]] = None,
     actions: Sequence[RowAction] = (),
+    is_grouped: Optional[Callable[[int], bool]] = None,
+    on_ctrl_select: Optional[Callable[[int], None]] = None,
+    on_shift_select: Optional[Callable[[int], None]] = None,
 ) -> bool:
     """
     Sortable, clipped ROI table. Returns the new scroll_to_current flag.
@@ -160,6 +163,9 @@ def draw_roi_table(
     column_names[0] is the id column; "label" is drawn in its class colour.
     `actions` adds a trailing, unsortable column of icon buttons per row. Buttons sit
     over the row's selectable, so clicking one does not change the selection.
+    `is_grouped` highlights extra rows beyond the cursor (a multi-selection);
+    ctrl / shift clicks route to `on_ctrl_select` / `on_shift_select` when
+    given, else fall back to a plain `on_select`.
     """
     flags = (
         imgui.TableFlags_.sortable
@@ -203,13 +209,20 @@ def draw_roi_table(
             sel_flags = imgui.SelectableFlags_.span_all_columns
             if actions:
                 sel_flags |= imgui.SelectableFlags_.allow_overlap
+            highlighted = row == order.pos or (is_grouped is not None and is_grouped(item))
             clicked, _ = imgui.selectable(
-                f"{item}##row{row}", row == order.pos, sel_flags,
+                f"{item}##row{row}", highlighted, sel_flags,
             )
             if clicked:
-                order.pos = row
-                if on_select is not None:
-                    on_select(item)
+                io = imgui.get_io()
+                if io.key_ctrl and on_ctrl_select is not None:
+                    on_ctrl_select(item)
+                elif io.key_shift and on_shift_select is not None:
+                    on_shift_select(item)
+                else:
+                    order.pos = row
+                    if on_select is not None:
+                        on_select(item)
             if row == order.pos and scroll_to_current:
                 imgui.set_scroll_here_y(0.5)
                 scroll_to_current = False

@@ -1699,10 +1699,12 @@ def draw_tab_frames(widget, n=2):
     return errors
 
 
-def send(widget, kind, x, y, button=1):
+def send(widget, kind, x, y, button=1, modifiers=()):
     import pygfx
 
-    event = pygfx.PointerEvent(type=kind, x=x, y=y, button=button)
+    event = pygfx.PointerEvent(
+        type=kind, x=x, y=y, button=button, modifiers=list(modifiers)
+    )
     widget.subplot.renderer.handle_event(event)
 
 
@@ -1716,10 +1718,10 @@ def screen_pos(widget, col, row):
     return x + 1 + fx * (w - 2), y + 1 + fy * (h - 2)
 
 
-def click(widget, col, row):
+def click(widget, col, row, modifiers=()):
     x, y = screen_pos(widget, col, row)
-    send(widget, "pointer_down", x, y)
-    send(widget, "pointer_up", x, y)
+    send(widget, "pointer_down", x, y, modifiers=modifiers)
+    send(widget, "pointer_up", x, y, modifiers=modifiers)
 
 
 def drag(widget, size=60):
@@ -2042,3 +2044,164 @@ class TestWidgetSelection:
                 result = CliRunner().invoke(main, ["/data/x.tif", *flags])
                 assert result.exit_code == 0, result.output
                 assert run.call_args.kwargs["widget"] == expected
+
+
+@pytest.fixture
+def cwidget():
+    """widget over 5D (T, C, Z, Y, X) data -> sliders ('t', 'c', 'z'),
+    every (c, z) pair keys its own mask plane, z fastest."""
+    from mbo_utilities.gui._ndviewer import MboNDViewer
+    from mbo_utilities.gui.manual_roi import ManualRoiWidget
+
+    data = np.random.default_rng(0).random((4, 2, 3, 64, 64)).astype(np.float32)
+    iw = MboNDViewer(data=data, figure_kwargs={"size": FIGURE_SIZE})
+    iw.show()
+    yield ManualRoiWidget(iw, fpath=None)
+    iw.close()
+
+
+class TestPlaneMapping:
+    """Masks key every scrolling dim, not just z: flipping the channel (or
+    any extra slider) swaps which masks show."""
+
+    def test_axes_and_store_size(self, cwidget):
+        assert cwidget.plane_axes == (("c", 2), ("z", 3))
+        assert cwidget.store.nz == 6
+        assert cwidget.store.plane_axes == (("c", 2), ("z", 3))
+
+    def test_plane_is_flat_index_with_z_fastest(self, cwidget):
+        assert cwidget.z == 0
+        cwidget.iw.indices["z"] = 2
+        assert cwidget.z == 2  # c 0 keeps plane == z
+        cwidget.iw.indices["c"] = 1
+        assert cwidget.z == 5
+        assert cwidget._plane_pos(5) == {"c": 1, "z": 2}
+        assert cwidget._plane_label(5) == "c2·z3"
+
+    def test_stroke_lands_on_the_channel_plane(self, cwidget):
+        cwidget.iw.indices["c"] = 1
+        cwidget.iw.indices["z"] = 2
+        cwidget.add_roi(square(10, 10, 9))
+        assert cwidget.store.rois[0].z == 5
+        assert cwidget.store.labels[5, 15, 15] == 1
+        assert cwidget.store.labels[2].max() == 0  # same z, other channel
+
+    def test_channel_flip_swaps_the_overlay(self, cwidget):
+        cwidget.add_roi(square(10, 10, 9))  # plane 0 = (c0, z0)
+        assert cwidget.overlay.data.value[..., 3].any()
+        cwidget.iw.indices["c"] = 1
+        assert not cwidget.overlay.data.value[..., 3].any()
+        cwidget.iw.indices["c"] = 0
+        assert cwidget.overlay.data.value[..., 3].any()
+
+    def test_selecting_jumps_both_sliders(self, cwidget):
+        cwidget.iw.indices["c"] = 1
+        cwidget.iw.indices["z"] = 2
+        cwidget.add_roi(square(10, 10, 9))
+        cwidget.iw.indices["c"] = 0
+        cwidget.iw.indices["z"] = 0
+        cwidget.select_roi(0)
+        assert cwidget.iw.indices["c"] == 1
+        assert cwidget.iw.indices["z"] == 2
+        assert cwidget.z == 5
+
+    def test_movie_decodes_z_and_channel(self, cwidget):
+        movie = cwidget.movie(5)
+        assert movie is not None
+        assert movie.z == 2 and movie.c == 1
+        assert movie.shape == (4, 64, 64)
+
+    def test_legacy_zarr_grows_into_channel_planes(self, tmp_path):
+        from mbo_utilities.annotation import LabelsZarr, RoiLabelStore
+        from mbo_utilities.gui._ndviewer import MboNDViewer
+        from mbo_utilities.gui.manual_roi import ManualRoiWidget, labels_path
+
+        fpath = tmp_path / "movie.tif"
+        old = RoiLabelStore(3, 64, 64)
+        mask = np.zeros((64, 64), bool)
+        mask[10:20, 10:20] = True
+        old.add_roi(1, mask)
+        LabelsZarr(labels_path(fpath)).save(old, source_path=fpath)
+
+        data = np.random.default_rng(0).random((4, 2, 3, 64, 64)).astype(np.float32)
+        iw = MboNDViewer(data=data, figure_kwargs={"size": FIGURE_SIZE})
+        iw.show()
+        try:
+            w = ManualRoiWidget(iw, fpath=fpath)
+            assert w.store.nz == 6
+            assert len(w.store.rois) == 1
+            # the old z1 plane is plane 1 here: (c0, z1)
+            assert w.store.rois[0].z == 1
+            assert w.store.labels[1, 15, 15] == 1
+        finally:
+            iw.close()
+
+
+class TestGroupBuffer:
+    """Ctrl / shift click builds a group; labels and colors apply to all."""
+
+    def _two(self, widget):
+        widget.add_roi(square(8, 8, 9))
+        widget.add_roi(square(40, 40, 9))
+        return widget
+
+    def test_ctrl_click_toggles_and_seeds_from_selection(self, widget):
+        self._two(widget)
+        widget.select_roi(0)
+        widget._pick(45, 45, frozenset({"Ctrl"}))
+        assert widget.buffer == [(-1, 0), (-1, 1)]
+        widget._pick(45, 45, frozenset({"Ctrl"}))
+        assert widget.buffer == [(-1, 0)]
+
+    def test_ctrl_click_through_real_pointer_events(self, widget):
+        self._two(widget)
+        widget.select_roi(0)
+        click(widget, 45, 45, modifiers=("Ctrl",))
+        assert widget.buffer == [(-1, 0), (-1, 1)]
+
+    def test_plain_click_drops_the_group(self, widget):
+        self._two(widget)
+        widget.select_roi(0)
+        widget._pick(45, 45, frozenset({"Ctrl"}))
+        click(widget, 12, 12)
+        assert widget.buffer == []
+        assert widget.selected == 0
+
+    def test_label_applies_to_every_member(self, widget):
+        widget.store.add_label_name("soma")
+        self._two(widget)
+        widget.select_roi(0)
+        widget.buffer_toggle(-1, 1)
+        widget.assign_class(0)
+        assert [r.class_index for r in widget.store.rois] == [0, 0]
+
+    def test_group_color_wins_and_resets(self, widget):
+        self._two(widget)
+        widget.buffer_add(-1, 0)
+        widget.buffer_add(-1, 1)
+        widget.set_group_color((1.0, 0.0, 0.0))
+        assert widget.store.roi_rgb(0) == (255, 0, 0)
+        assert widget.store.roi_rgb(1) == (255, 0, 0)
+        widget.set_group_color(None)
+        assert widget.store.roi_rgb(0) != (255, 0, 0)
+
+    def test_group_color_reaches_derived_rows(self, widget):
+        from mbo_utilities.gui.roi_runs import component_color
+
+        widget._add_derived(make_result(widget, [disc(30, 30)]))
+        widget.buffer_toggle(0, 0)
+        widget.set_group_color((0.0, 1.0, 0.0))
+        assert component_color(widget.derived[0], 0) == (0.0, 1.0, 0.0)
+
+    def test_delete_remaps_drawn_members(self, widget):
+        self._two(widget)
+        widget.buffer_add(-1, 0)
+        widget.buffer_add(-1, 1)
+        widget.delete_roi(0)
+        assert widget.buffer == [(-1, 0)]
+
+    def test_trace_color_matches_mask_color(self, widget):
+        widget.add_roi(square(8, 8, 9))
+        uid = widget.store.rois[0].uid
+        rgb = tuple(v / 255.0 for v in widget.store.roi_rgb(0))
+        assert widget._trace_color(("uid", "quick", uid)) == rgb

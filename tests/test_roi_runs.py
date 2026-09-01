@@ -437,16 +437,16 @@ def test_run_registry_round_trip(tmp_path):
 
     entries = [
         {"path": tmp_path / "rois_a", "kind": "extract", "discarded": {3, 1},
-         "classes": {2: 0}},
+         "classes": {2: 0}, "colors": {4: (1.0, 0.5, 0.0)}},
         {"path": tmp_path / "gone" / "rois_b", "kind": "demix"},  # dir never existed
     ]
     rr.save_run_registry(target, entries)
     got = rr.load_run_registry(target)
     assert got == [
         {"path": str(tmp_path / "rois_a"), "kind": "extract",
-         "discarded": [1, 3], "classes": {2: 0}},
+         "discarded": [1, 3], "classes": {2: 0}, "colors": {4: (1.0, 0.5, 0.0)}},
         {"path": str(tmp_path / "gone" / "rois_b"), "kind": "demix",
-         "discarded": [], "classes": {}},
+         "discarded": [], "classes": {}, "colors": {}},
     ]
     assert json.loads(target.read_text())["runs"][0]["discarded"] == [1, 3]
 
