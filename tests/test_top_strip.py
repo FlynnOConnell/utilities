@@ -226,3 +226,78 @@ class TestSignalQualitySplit:
             assert not errors, errors[0]
         finally:
             iw.close()
+
+
+class TestTopStripResize:
+    """The grab bar makes the strip adjustable and collapsible, the way
+    fastplotlib's right and bottom edge windows are."""
+
+    def test_collapse_shuts_to_the_menu_row_and_back(self, figure):
+        from mbo_utilities.gui._top_strip import TopStrip
+
+        strip = TopStrip(figure)
+        strip.register(panel("a", height=180))
+        tall = strip.size
+        assert not strip.collapsed
+
+        strip.toggle_collapsed()
+        assert strip.collapsed
+        assert strip.size == strip.shut_size < tall
+
+        strip.toggle_collapsed()
+        assert not strip.collapsed
+        assert strip.size == tall
+
+    def test_a_drag_pins_the_height_over_the_panel_request(self, figure):
+        from mbo_utilities.gui._top_strip import TopStrip
+
+        strip = TopStrip(figure)
+        roi = panel("a", height=180)
+        strip.register(roi)
+        strip.resize_to(320)
+        assert strip.size == 320
+
+        # a panel asking for more no longer moves it
+        roi.height = 600
+        strip._resize()
+        assert strip.size == 320
+
+        strip.reset_size()
+        assert strip.size != 320
+
+    def test_resize_never_goes_under_the_shut_height(self, figure):
+        from mbo_utilities.gui._top_strip import TopStrip
+
+        strip = TopStrip(figure)
+        strip.register(panel("a", height=180))
+        strip.resize_to(10)
+        assert strip.size == strip.shut_size
+
+    def test_collapse_remembers_a_pinned_height(self, figure):
+        from mbo_utilities.gui._top_strip import TopStrip
+
+        strip = TopStrip(figure)
+        strip.register(panel("a", height=180))
+        strip.resize_to(300)
+        strip.toggle_collapsed()
+        assert strip.size == strip.shut_size
+        strip.toggle_collapsed()
+        assert strip.size == 300
+
+    def test_reset_size_clears_a_collapse_too(self, figure):
+        from mbo_utilities.gui._top_strip import TopStrip
+
+        strip = TopStrip(figure)
+        strip.register(panel("a", height=180))
+        auto = strip.size
+        strip.toggle_collapsed()
+        strip.reset_size()
+        assert not strip.collapsed
+        assert strip.size == auto
+
+    def test_the_bare_strip_has_no_handle(self, figure):
+        from mbo_utilities.gui._top_strip import MENU_HEIGHT, TopStrip
+
+        # nothing registered: there is no panel to shut, so no bar is drawn
+        strip = TopStrip(figure)
+        assert strip.size == MENU_HEIGHT

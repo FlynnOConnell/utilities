@@ -2523,3 +2523,53 @@ class TestTracePlotView:
         widget.x_unit = "seconds"
         self._fits(widget)
         assert widget.x_unit == "frames"
+
+
+class TestStripCollapse:
+    """The strip's grab bar shuts the panels away without unregistering them."""
+
+    def test_collapsing_hides_the_cards_and_brings_them_back(self, widget):
+        from imgui_bundle import imgui
+
+        from mbo_utilities.gui.widgets.widget_toggles import set_widget_enabled
+
+        seen = []
+        real = imgui.begin_child
+
+        def spy(name, *args, **kwargs):
+            if isinstance(name, str):
+                seen.append(name)
+            return real(name, *args, **kwargs)
+
+        strip = widget.tools_window
+        set_widget_enabled("manual_roi", True, persist=False)
+        imgui.begin_child = spy
+        try:
+            assert not draw_frames(widget, 3)
+            assert "##nav" in seen, "the cards draw while the strip is open"
+
+            seen.clear()
+            strip.toggle_collapsed()
+            assert not draw_frames(widget, 3)
+            assert "##nav" not in seen, "shut: no card bodies"
+            # the window is still drawn and the panels stay registered, so
+            # reopening does not have to rebuild anything
+            assert "##main_ui" in seen
+            assert [p.key for p in strip.panels] == ["roi", "traces"]
+
+            seen.clear()
+            strip.toggle_collapsed()
+            assert not draw_frames(widget, 3)
+            assert "##nav" in seen
+        finally:
+            imgui.begin_child = real
+            set_widget_enabled("manual_roi", False, persist=False)
+
+    def test_a_pinned_height_survives_a_panel_asking_for_more(self, widget):
+        strip = widget.tools_window
+        strip.resize_to(260)
+        widget._roi_panel.height = 800
+        strip._resize()
+        assert strip.size == 260
+        strip.reset_size()
+        assert strip.size != 260
