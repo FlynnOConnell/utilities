@@ -92,6 +92,7 @@ from mbo_utilities.gui._theme import (
     section,
     to_vec4,
 )
+from mbo_utilities.gui import roi_runs
 from mbo_utilities.gui.roi_runs import (
     SELECTED_ALPHA,
     DerivedSet,
@@ -162,6 +163,9 @@ TRACE_COLUMNS = (
 # x axis units for the trace plot; the time ones need a sampling rate
 X_UNITS = ("frames", "seconds", "ms")
 X_AXIS_LABELS = {"frames": "frame", "seconds": "time (s)", "ms": "time (ms)"}
+
+# tri-state stage toggles, shared by both pipelines: 0 skip, 1 run, 2 force
+_STAGE_NAMES = ("skip", "run", "force")
 
 MIN_ROI_PIXELS = 9
 MIN_REGION_SIDE = 4
@@ -1872,6 +1876,97 @@ class ManualRoiWidget:
             self.trace_sets.pop(name, None)
         return merged
 
+    # ------------------------------------------------------------------
+    # pipeline parameters, shared with the Run tab
+    # ------------------------------------------------------------------
+
+    def pipeline_for(self, process: str | None = None) -> str | None:
+        """Which pipeline's parameters a process runs on, or None for one
+        that takes none (the numpy mean extractor)."""
+        process = self.process if process is None else process
+        if process == "demix":
+            return "masknmf"
+        if process == "extract-s2p":
+            return "suite2p"
+        return None
+
+    def masknmf_settings(self) -> dict | None:
+        """The masknmf parameters set in the Run tab, or None for defaults.
+
+        Runs started here go through the same settings the Run tab edits, so
+        there is one place to change them rather than two that disagree.
+        """
+        return roi_runs.masknmf_settings(self.host)
+
+    def suite2p_detection_settings(self) -> dict | None:
+        """The Run tab's suite2p detection section, for unseeded discovery."""
+        s2p = getattr(self.host, "s2p", None)
+        if s2p is None:
+            return None
+        try:
+            return (s2p.to_dict() or {}).get("detection") or None
+        except Exception:
+            self.logger.debug("suite2p settings unreadable", exc_info=True)
+            return None
+
+    def _pipeline_summary(self, kind: str) -> tuple[str, str]:
+        """``(label, tooltip)`` for what a run of ``kind`` would use."""
+        if kind == "masknmf":
+            instances = getattr(self.host, "_pipeline_instances", None) or {}
+            settings = getattr(instances.get("MaskNMF"), "settings", None)
+            if settings is None:
+                return "masknmf: defaults", (
+                    "The Run tab has not built masknmf yet, so this runs on "
+                    "its defaults. Open it to set registration, compression "
+                    "and demixing parameters."
+                )
+            from mbo_utilities.gui.widgets.pipelines.masknmf import _collect_modified
+
+            stages = " · ".join(
+                f"{name}:{_STAGE_NAMES[int(getattr(section, attr, 1)) % 3]}"
+                for name, section, attr in (
+                    ("reg", settings.registration, "do_registration"),
+                    ("pmd", settings.compression, "do_compression"),
+                    ("demix", settings.demixing, "do_demixing"),
+                )
+            )
+            changed = _collect_modified(settings)
+            label = f"masknmf: {len(changed)} changed" if changed else "masknmf: defaults"
+            detail = "\n".join(f"{n} = {v}  (default {d})" for n, v, d in changed[:12])
+            return label, f"{stages}\n{detail}" if detail else stages
+        s2p = getattr(self.host, "s2p", None)
+        if s2p is None:
+            return "suite2p: defaults", (
+                "The Run tab has not been opened yet, so this runs on "
+                "suite2p's defaults."
+            )
+        from mbo_utilities.gui.widgets.pipelines.settings import collect_modified_params
+
+        stages = " · ".join(
+            f"{name}:{_STAGE_NAMES[int(getattr(s2p, attr, 1)) % 3]}"
+            for name, attr in (("reg", "do_registration"), ("detect", "do_detection"))
+        )
+        try:
+            changed = collect_modified_params(
+                s2p, getattr(self.host, "s2p_db", None),
+                getattr(self.host, "s2p_extras", None),
+            )
+        except Exception:
+            changed = []
+        label = f"suite2p: {len(changed)} changed" if changed else "suite2p: defaults"
+        detail = "\n".join(f"{row[0]} = {row[1]}" for row in changed[:12])
+        return label, f"{stages}\n{detail}" if detail else stages
+
+    def open_pipeline_params(self, kind: str):
+        """Jump to the Run tab with ``kind`` selected - that is where these
+        parameters are edited."""
+        if self.host is None:
+            self.status = "no Run tab to open"
+            return
+        self.host._selected_pipeline_name = "MaskNMF" if kind == "masknmf" else "Suite2p"
+        self.host._force_run_tab = True
+        self.status = f"{kind} parameters are in the Run tab"
+
     def _run_out_dir(self, tag: str) -> Path | None:
         if self.fpath is None:
             self.status = "no data path to write beside"
@@ -1913,6 +2008,7 @@ class ManualRoiWidget:
         multi = any(n != self.zdim for n, _ in self.plane_axes)
         movies = {z: self.movie(z) for z in planes} if multi else {}
         labels = {z: self._plane_label(z) for z in planes}
+        settings = self.masknmf_settings() if process == "demix" else None
         logger = self.logger
 
         def fn(job):
@@ -1923,7 +2019,8 @@ class ManualRoiWidget:
                 dest = out_dir if len(planes) == 1 else out_dir / f"z{z + 1:02d}"
                 src = movies.get(z) or arr
                 if process == "demix":
-                    out = demix_rois(src, store, on_plane, z=z, c=c, out_dir=dest, tag=tag, logger=logger)
+                    out = demix_rois(src, store, on_plane, z=z, c=c, out_dir=dest,
+                                     settings=settings, tag=tag, logger=logger)
                 else:
                     engine = "suite2p" if process == "extract-s2p" else "mean"
                     out = extract_rois(src, store, on_plane, z=z, c=c, out_dir=dest,
@@ -1972,11 +2069,16 @@ class ManualRoiWidget:
         c = self._channel()
         multi = any(n != self.zdim for n, _ in self.plane_axes)
         src = (self.movie(z) or arr) if multi else arr
+        settings = (
+            self.masknmf_settings() if engine == "masknmf"
+            else self.suite2p_detection_settings()
+        )
         logger = self.logger
 
         def fn(job):
             job.set_progress(0.05, f"{engine} in {box[0]}:{box[1]}, {box[2]}:{box[3]}")
-            return discover_rois(src, box, engine=engine, z=z, c=c, out_dir=out_dir, tag=tag, logger=logger)
+            return discover_rois(src, box, engine=engine, z=z, c=c, out_dir=out_dir,
+                                 settings=settings, tag=tag, logger=logger)
 
         run = RoiRun(
             kind="discover", tag=tag,
@@ -1996,7 +2098,7 @@ class ManualRoiWidget:
             return
         plane = self._plane_pos(self.z).get(self.zdim, 0) + 1
         try:
-            args = full_plane_args(kind, self.fpath, plane, self.iw)
+            args = full_plane_args(kind, self.fpath, plane, self.iw, host=self.host)
         except ValueError as e:
             self.status = str(e)
             return
@@ -2451,10 +2553,33 @@ class ManualRoiWidget:
                         "open a file first" if no_path else
                         f"Full {kind} run of the plane on screen -> "
                         f"zplane{self._plane_pos(self.z).get(self.zdim, 0) + 1:02d}/ "
-                        "beside the data.\nRun tab for full volume / settings."
+                        "beside the data.\nRun tab for the full volume."
                     )
             if no_path:
                 imgui.end_disabled()
+            self._draw_params_row(cap)
+
+    def _draw_params_row(self, cap: float):
+        """What parameters the runs above will use, and where to change them.
+
+        Every run started from this card goes through the settings the Run
+        tab holds, so the skip / run / force stage toggles and every
+        parameter are set in one place.
+        """
+        kind = self.pipeline_for() or "masknmf"
+        self._caption("params", cap)
+        label, detail = self._pipeline_summary(kind)
+        imgui.align_text_to_frame_padding()
+        imgui.text_disabled(label)
+        set_tooltip(detail, show_mark=False)
+        imgui.same_line(0, em(0.4))
+        if imgui.small_button("Params##pipeline"):
+            self.open_pipeline_params(kind)
+        set_tooltip(
+            f"Open the Run tab on {kind} - runs started here use those "
+            "settings, including the skip / run / force stage toggles",
+            show_mark=False,
+        )
 
     def _status_message(self) -> tuple[tuple, str]:
         if self._save_error is not None:

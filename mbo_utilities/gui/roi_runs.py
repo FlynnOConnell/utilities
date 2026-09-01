@@ -507,9 +507,30 @@ def scan_run_dirs(fpath) -> list[dict]:
     return rows
 
 
-def full_plane_args(kind: str, fpath, plane_1based: int, iw) -> dict:
-    """Minimal ``task_suite2p`` / ``task_masknmf`` worker args for one
-    plane, writing beside the data; the worker fills in every default."""
+def full_plane_args(kind: str, fpath, plane_1based: int, iw, host=None) -> dict:
+    """``task_suite2p`` / ``task_masknmf`` worker args for one plane.
+
+    Parameters
+    ----------
+    kind : {"suite2p", "masknmf"}
+        Which pipeline to run.
+    fpath : path-like
+        The data to run on; outputs are written beside it.
+    plane_1based : int
+        The z-plane to run, 1-based.
+    iw : MboNDViewer
+        The viewer, for its reader settings.
+    host : PreviewDataWidget, optional
+        The widget holding the Run tab's live settings. Given one, the run
+        uses exactly the parameters configured there - including the
+        Registration / Detection skip / run / force toggles - instead of the
+        pipeline's defaults.
+
+    Returns
+    -------
+    dict
+        Worker args for the task named by ``kind``.
+    """
     if fpath is None:
         raise ValueError("no data path to run a full plane on")
     if kind not in ("suite2p", "masknmf"):
@@ -523,10 +544,41 @@ def full_plane_args(kind: str, fpath, plane_1based: int, iw) -> dict:
         "reader_kwargs": widget_reader_kwargs(iw),
     }
     if kind == "masknmf":
-        from mbo_utilities.masknmf.params import MasknmfSettings
-
-        args["settings"] = MasknmfSettings().to_dict()
+        args["settings"] = masknmf_settings(host) or _default_masknmf_settings()
+        return args
+    s2p = getattr(host, "s2p", None)
+    if s2p is None:
+        return args
+    args["settings"] = s2p.to_dict()
+    db = getattr(host, "s2p_db", None)
+    if db is not None:
+        args["db"] = db.to_dict()
+    # force is spelled as tri-state 2 in the settings but reaches lsp as its
+    # own kwarg, the same translation run_process does
+    args["s2p_settings"] = {
+        "force_reg": int(getattr(s2p, "do_registration", 1)) == 2,
+        "force_detect": int(getattr(s2p, "do_detection", 1)) == 2,
+    }
     return args
+
+
+def _default_masknmf_settings() -> dict:
+    from mbo_utilities.masknmf.params import MasknmfSettings
+
+    return MasknmfSettings().to_dict()
+
+
+def masknmf_settings(host) -> dict | None:
+    """The masknmf settings the Run tab is holding, or None when it has not
+    built that pipeline yet."""
+    instances = getattr(host, "_pipeline_instances", None) or {}
+    settings = getattr(instances.get("MaskNMF"), "settings", None)
+    if settings is None:
+        return None
+    try:
+        return settings.to_dict()
+    except Exception:
+        return None
 
 
 def registry_path(fpath) -> Path:
