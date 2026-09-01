@@ -5711,20 +5711,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-all = [
-    { name = "ipykernel", version = "6.31.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and sys_platform == 'win32'" },
-    { name = "ipykernel", version = "7.3.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' or sys_platform != 'win32'" },
-    { name = "ipywidgets" },
-    { name = "jupyter-rfb" },
-    { name = "jupyterlab" },
-    { name = "napari", version = "0.6.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' or sys_platform != 'win32'" },
-    { name = "napari", version = "0.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and sys_platform == 'win32'" },
-    { name = "napari-animation" },
-    { name = "napari-ome-zarr" },
-    { name = "pyqt6" },
-    { name = "qtpy" },
-    { name = "seaborn" },
-]
 docs = [
     { name = "docutils" },
     { name = "ipykernel", version = "6.31.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and sys_platform == 'win32'" },
@@ -5837,8 +5823,9 @@ requires-dist = [
     { name = "jupyterlab", marker = "extra == 'notebooks'", specifier = ">=4.2.6" },
     { name = "jupytext", marker = "extra == 'docs'" },
     { name = "llvmlite", specifier = ">=0.43.0" },
-    { name = "masknmf", extras = ["multisession"] },
+    { name = "masknmf", extras = ["multisession", "classification"] },
     { name = "matplotlib", specifier = ">=3.10.1" },
+    { name = "mbo-utilities", extras = ["napari", "notebooks"], marker = "extra == 'all'" },
     { name = "myst-nb", marker = "extra == 'docs'" },
     { name = "napari", marker = "extra == 'napari'" },
     { name = "napari-animation", marker = "extra == 'napari'" },
@@ -5874,7 +5861,6 @@ requires-dist = [
     { name = "submitit", specifier = ">=1.5.0" },
     { name = "tifffile", specifier = ">=2025.3.30" },
     { name = "tqdm" },
-    { name = "utilities", extras = ["napari", "notebooks"], marker = "extra == 'all'" },
     { name = "wgpu", specifier = ">=0.28.1" },
     { name = "zarr", specifier = ">=3.1.3" },
 ]
