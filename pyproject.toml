@@ -27,8 +27,6 @@ dependencies = [
 	"imageio[ffmpeg]",
 	"ffmpeg-python",
 	"matplotlib>=3.10.1",
-	# masknmf pins opencv-contrib-python-headless; both dists own `cv2`,
-	# so the contrib variant (a superset) is the single cv2 provider here
 	"opencv-contrib-python-headless",
 	"h5py",
 	"tqdm",
@@ -41,52 +39,9 @@ dependencies = [
 	"pygfx>=0.15.2",
 	"llvmlite>=0.43.0",
 	"numba>=0.60.0",
-	# NAMES ONLY — no direct URLs. The exact commits/branches live in the
-	# [dependency-groups] `pins` group at the bottom of this file, which is
-	# in default-groups so this repo's own `uv sync` is unchanged.
-	# Neither a `pkg @ git+...` here nor a [tool.uv.sources] entry can live
-	# in this file: both propagate to anything that depends on this package
-	# (sources included — uv reads them off local path dependencies), and a
-	# consumer cannot retarget either one, so a dev env wanting a local
-	# masknmf or fastplotlib dead-ends on "conflicting URLs for package".
-	# A dependency-group is the one form that stays local: PEP 735 groups
-	# are resolved only for the project being worked on, never transitively.
-	#
-	# fastplotlib: the ndwidget branch, pinned to the exact commit the
-	# MboNDViewer adapter was built against (the branch moves monthly with
-	# breaking refactors; masknmf requires this NDWidget API surface at
-	# import time). The floor is deliberately loose — masknmf already
-	# hard-pins `fastplotlib[imgui,notebook]==0.6.1`, so that is the single
-	# place to update on a version bump. PyPI 0.6.1 is a
-	# DIFFERENT tree without the NDWidget API — the source entry is what
-	# makes this correct, so a consumer that overrides it must supply the
-	# ndwidget branch too. mbo-fastplotlib must NOT be installed alongside —
-	# both dists own the `fastplotlib` import package.
 	"fastplotlib[imgui]>=0.6.1",
-	# masknmf: the curation-viz branch (xarray-compatability + the curation
-	# GUI that demixing_results.hdf5 files open in). [multisession] is
-	# required: the branch imports roicat at module load. Not published on
-	# PyPI, so a consumer MUST provide a source for it (git or local path);
-	# plain `pip install utilities` cannot resolve this name on its own:
-	#   pip install "masknmf[multisession] @ git+https://github.com/apasarkar/masknmf-toolbox.git@curation-viz"
-	# before installing this package.
-	"masknmf[multisession]",
-	# torch/torchvision are NOT declared here, deliberately: they arrive
-	# transitively (masknmf needs `torch>2`, roicat pulls torchvision) and the
-	# right build is per-machine (GPU arch dependent). PyPI's win/mac wheels
-	# are CPU-only, so a consumer that wants CUDA selects it in ITS OWN
-	# pyproject with an explicit index — declaring torch here would only fix
-	# the version, not the build, and would fight that selection:
-	#   [[tool.uv.index]]
-	#   name = "pytorch-cu128"
-	#   url = "https://download.pytorch.org/whl/cu128"
-	#   explicit = true
-	#   [tool.uv.sources]
-	#   torch = { index = "pytorch-cu128" }
+	"masknmf[multisession, classification]",
 	"rendercanvas>=2.4.2",
-	# <1.92.900: newer imgui-bundle drops ImDrawData.cmd_lists_count, which
-	# wgpu's imgui backend still reads; the dev fastplotlib needs >=1.92.801
-	# for the new add_polyline signature
 	"imgui-bundle>=1.92.801,<1.92.900",
 	"wgpu>=0.28.1",
 	"submitit>=1.5.0",
@@ -122,15 +77,6 @@ Repository = "https://github.com/FlynnOConnell/utilities"
 Issues = "https://github.com/MillerBrainObservatory/mbo_utilities/issues"
 
 [project.optional-dependencies]
-# no suite2p/isoview extras here: lbm-suite2p-python and isoview both
-# depend on PyPI mbo-utilities, which pins the pre-ndwidget graphics stack
-# (mbo-fastplotlib, imgui-bundle==1.92.5) and owns the same mbo_utilities
-# import package as this fork — pip has no way to drop those, so the extra
-# would be broken for pip users. In the uv dev env the [suite2p] dependency
-# group + tool.uv.override-dependencies below handle it; pip users
-# side-install after this package:
-#   uv pip install lbm-suite2p-python suite2p rastermap --no-deps
-# alternate napari viewer (needs a Qt binding).
 napari = [
     "napari",
     "napari-ome-zarr",
@@ -166,7 +112,6 @@ docs = [
     "myst_nb",
     "pygfx>=0.14.0",
 ]
-cloud = ["imgui_cloud>=0.1.0"]
 all = ["mbo_utilities[napari,notebooks]"]
 
 [tool.uv]
