@@ -26,6 +26,8 @@ from mbo_utilities.gui.widgets.process_manager import get_process_manager
 from mbo_utilities.preferences import (
     get_gpu_index,
     set_gpu_index,
+    get_mem_monitor_interval,
+    get_mem_warn_pct,
 )
 
 
@@ -144,22 +146,31 @@ def _cpu_temp() -> float | None:
 
 
 def _draw_cpu_meter(cpu_pct: float) -> None:
-    """Total CPU as a usage meter, formatted like the GPU meters (RAM
-    used/total and temperature in the caption)."""
-    caption = []
-    try:
-        import psutil
-        vm = psutil.virtual_memory()
-        used = (vm.total - vm.available) / 1024**3
-        total = vm.total / 1024**3
-        caption.append(f"{used:.1f}/{total:.1f} GB")
-    except Exception:
-        pass
+    """Total CPU as a usage meter, formatted like the GPU meters (temperature
+    in the caption). RAM has its own meter below."""
     temp = _cpu_temp()
-    if temp is not None:
-        caption.append(f"{temp:.0f}C")
-    caption_s = ("  " + " · ".join(caption)) if caption else ""
+    caption_s = f"  {temp:.0f}C" if temp is not None else ""
     _draw_meter("CPU", cpu_pct / 100.0, f"{cpu_pct:.0f}%", caption_s)
+
+
+def _draw_ram_meter(snap: dict, warn_pct: float) -> None:
+    """System RAM as a usage meter, with this process tree's share.
+
+    The bar is the Task-Manager headline (all processes); the caption adds
+    used/total GB and what the gui plus its running jobs account for, which
+    is the number that matters when a pipeline is the thing eating the box.
+    """
+    pct = snap.get("sys_pct", 0.0)
+    caption = [f"{snap['used_gb']:.1f}/{snap['total_gb']:.1f} GB"]
+    proc_gb = snap.get("proc_gb")
+    if proc_gb is not None:
+        caption.append(f"mbo {proc_gb:.1f} GB/{snap.get('nproc', 0)} proc")
+    _draw_meter("RAM", pct / 100.0, f"{pct:.0f}%", "  " + " · ".join(caption))
+    if warn_pct and pct >= warn_pct:
+        imgui.same_line()
+        imgui.text_colored(
+            imgui.ImVec4(0.95, 0.45, 0.45, 1.0), f"! over {warn_pct:.0f}%"
+        )
 
 
 def _draw_gpu_selectors(parent: Any, devices: list, show_render: bool) -> None:
@@ -206,10 +217,11 @@ def _draw_gpu_selectors(parent: Any, devices: list, show_render: bool) -> None:
 def _draw_system_info_header(parent: Any) -> None:
     """Compact system-capacity header for the Process Console.
 
-    Shows: CPU cores, a CPU usage meter (with live RAM and temperature),
-    one live-usage meter per physical GPU, and — on multi-GPU systems —
-    render/compute GPU pickers. Per-GPU usage and CPU% come from a ~1.5s
-    throttle (nvidia-smi is a subprocess); RAM is read with the meter.
+    Shows: CPU cores, a CPU usage meter, a RAM meter (system use plus this
+    process tree's share), one live-usage meter per physical GPU, and — on
+    multi-GPU systems — render/compute GPU pickers. Per-GPU usage and CPU%
+    come from a ~1.5s throttle (nvidia-smi is a subprocess); RAM follows the
+    memory-monitor tick rate.
     """
     if not imgui.collapsing_header("System", imgui.TreeNodeFlags_.default_open):
         return
@@ -235,6 +247,20 @@ def _draw_system_info_header(parent: Any) -> None:
         parent._sys_gpu_last_refresh = now
     gpu_devices_live = parent._sys_gpu_devices
     cpu_pct = getattr(parent, "_sys_cpu_pct", None)
+
+    # RAM on its own throttle: a snapshot costs a children walk (~8 ms), so it
+    # follows the user's tick rate rather than the frame rate or the slower
+    # nvidia-smi window.
+    tick = max(0.25, min(get_mem_monitor_interval(), 2.0))
+    if (not hasattr(parent, "_sys_mem")
+            or now - getattr(parent, "_sys_mem_last_refresh", 0.0) >= tick):
+        from mbo_utilities._sysmem import mem_snapshot
+        try:
+            parent._sys_mem = mem_snapshot()
+        except Exception:
+            parent._sys_mem = None
+        parent._sys_mem_last_refresh = now
+    mem_snap = parent._sys_mem
 
     # CPU core counts via psutil (static). Live RAM moves to the CPU meter.
     try:
@@ -310,10 +336,12 @@ def _draw_system_info_header(parent: Any) -> None:
 
         imgui.end_table()
 
-    if cpu_pct is not None or gpu_devices_live:
+    if cpu_pct is not None or mem_snap or gpu_devices_live:
         imgui.spacing()
         if cpu_pct is not None:
             _draw_cpu_meter(cpu_pct)
+        if mem_snap:
+            _draw_ram_meter(mem_snap, get_mem_warn_pct())
         for d in gpu_devices_live:
             _draw_gpu_meter(d)
 

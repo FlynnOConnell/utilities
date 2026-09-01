@@ -1,30 +1,30 @@
-"""installation status checker for mbo_utilities optional dependencies.
+"""Optional-dependency status for the launcher table and ``mbo --check-install``.
 
-checks for proper GPU configuration of suite2p (pytorch), cupy, and
-rastermap. provides structured data for CLI and GUI display.
-
-also provides HAS_* flags for quick import checks without actually importing.
-uses environment cache for faster repeated checks.
+Each feature reports what it is for, whether it works on this machine, and
+the command that fixes it. GPU checks compare the wheel against the driver's
+CUDA version and the card's compute capability, not just ``is_available()``.
 """
 
+from __future__ import annotations
+
+import contextlib
+import importlib.util
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
-import importlib.util
-import subprocess
-import sys
-import contextlib
+from importlib.metadata import version as _dist_version
 
 
-# quick import availability checks (no actual imports)
 def _check_import(module_name: str) -> bool:
-    """check if a module can be imported without actually importing it."""
+    """True when ``module_name`` is importable, without importing it."""
     return importlib.util.find_spec(module_name) is not None
 
 
-def _get_cached_flag(key: str, fallback_check: callable) -> bool:
-    """get flag from cache if valid, otherwise compute and return."""
+def _get_cached_flag(key: str, fallback_check) -> bool:
+    """Cached availability flag, else ``fallback_check()``."""
     try:
         from mbo_utilities.env_cache import get_cached_packages
+
         cached = get_cached_packages()
         if cached and key in cached:
             return cached[key].get("available", False)
@@ -33,34 +33,17 @@ def _get_cached_flag(key: str, fallback_check: callable) -> bool:
     return fallback_check()
 
 
-# HAS_* flags - use cache when available, fallback to direct check
 HAS_SUITE2P: bool = _get_cached_flag(
     "suite2p", lambda: _check_import("lbm_suite2p_python") and _check_import("suite2p")
 )
-HAS_CUPY: bool = _get_cached_flag(
-    "cupy", lambda: _check_import("cupy")
-)
-HAS_TORCH: bool = _get_cached_flag(
-    "torch", lambda: _check_import("torch")
-)
-HAS_RASTERMAP: bool = _get_cached_flag(
-    "rastermap", lambda: _check_import("rastermap")
-)
-HAS_MASKNMF: bool = _get_cached_flag(
-    "masknmf", lambda: _check_import("masknmf")
-)
-HAS_IMGUI: bool = _get_cached_flag(
-    "imgui_bundle", lambda: _check_import("imgui_bundle")
-)
-HAS_FASTPLOTLIB: bool = _get_cached_flag(
-    "fastplotlib", lambda: _check_import("fastplotlib")
-)
-HAS_PYQT6: bool = _get_cached_flag(
-    "pyqt6", lambda: _check_import("PyQt6")
-)
-HAS_NAPARI: bool = _get_cached_flag(
-    "napari", lambda: _check_import("napari")
-)
+HAS_CUPY: bool = _get_cached_flag("cupy", lambda: _check_import("cupy"))
+HAS_TORCH: bool = _get_cached_flag("torch", lambda: _check_import("torch"))
+HAS_RASTERMAP: bool = _get_cached_flag("rastermap", lambda: _check_import("rastermap"))
+HAS_MASKNMF: bool = _get_cached_flag("masknmf", lambda: _check_import("masknmf"))
+HAS_IMGUI: bool = _get_cached_flag("imgui_bundle", lambda: _check_import("imgui_bundle"))
+HAS_FASTPLOTLIB: bool = _get_cached_flag("fastplotlib", lambda: _check_import("fastplotlib"))
+HAS_PYQT6: bool = _get_cached_flag("pyqt6", lambda: _check_import("PyQt6"))
+HAS_NAPARI: bool = _get_cached_flag("napari", lambda: _check_import("napari"))
 HAS_NAPARI_OME_ZARR: bool = _get_cached_flag(
     "napari_ome_zarr", lambda: _check_import("napari_ome_zarr")
 )
@@ -70,40 +53,52 @@ HAS_NAPARI_ANIMATION: bool = _get_cached_flag(
 
 
 class Status(Enum):
-    """installation status for a feature."""
+    """Health of one feature."""
 
-    OK = "ok"           # installed and working
-    WARN = "warn"       # installed but degraded (e.g., no GPU)
-    ERROR = "error"     # installed but broken
-    MISSING = "missing" # not installed
+    OK = "ok"
+    WARN = "warn"
+    ERROR = "error"
+    MISSING = "missing"
 
 
 @dataclass
 class FeatureStatus:
-    """status of a single feature/package."""
+    """One package: what it is for, whether it works, and how to fix it.
+
+    Parameters
+    ----------
+    gpu_ok : bool or None
+        None for packages that never touch a GPU.
+    purpose : str
+        What the GUI uses it for; one line.
+    hint : str
+        Install command that fixes a missing or broken state.
+    """
 
     name: str
     status: Status
     version: str = ""
     message: str = ""
-    gpu_ok: bool | None = None  # None = n/a, True/False for GPU features
+    gpu_ok: bool | None = None
+    purpose: str = ""
+    hint: str = ""
 
 
 @dataclass
 class CudaInfo:
-    """cuda environment information."""
+    """What the driver, PyTorch and CuPy each think CUDA is."""
 
-    nvcc_version: str | None = None      # cuda toolkit version (nvcc)
-    driver_version: str | None = None    # nvidia driver cuda version (nvidia-smi)
-    pytorch_cuda: str | None = None      # pytorch compiled cuda version
-    cupy_cuda: str | None = None         # cupy cuda runtime version
-    device_name: str | None = None       # gpu name
+    driver_version: str | None = None
+    pytorch_cuda: str | None = None
+    cupy_cuda: str | None = None
+    device_name: str | None = None
     device_count: int = 0
+    capability: str | None = None
 
 
 @dataclass
 class InstallStatus:
-    """complete installation status."""
+    """Everything ``check_installation`` found."""
 
     mbo_version: str = ""
     python_version: str = ""
@@ -112,502 +107,312 @@ class InstallStatus:
 
     @property
     def all_ok(self) -> bool:
-        """True if all installed features are working properly."""
+        """True when every installed feature works."""
         return all(f.status in (Status.OK, Status.MISSING) for f in self.features)
+
+    def feature(self, name: str) -> FeatureStatus | None:
+        """The feature called ``name``, or None."""
+        return next((f for f in self.features if f.name == name), None)
+
+
+# ---------------------------------------------------------------------------
+# wheels that match this machine
+# ---------------------------------------------------------------------------
+
+_TORCH_INDEX = "https://download.pytorch.org/whl/"
+_SUITE2P_HINT = "uv pip install lbm-suite2p-python suite2p rastermap --no-deps"
+_MASKNMF_HINT = "uv pip install git+https://github.com/apasarkar/masknmf-toolbox.git"
+
+
+def _major(ver: str | None) -> int | None:
+    """Integer major of "12.4"-style versions, else None."""
+    try:
+        return int(str(ver).split(".")[0])
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def _cc(capability: str | None) -> float | None:
+    """Compute capability "6.1" as 6.1, else None."""
+    try:
+        return float(capability) if capability else None
+    except ValueError:
+        return None
 
 
 def recommended_cupy_package(driver_cuda: str | None = None) -> str:
-    """Pick the cupy wheel that matches the detected CUDA driver.
-
-    Parameters
-    ----------
-    driver_cuda : str | None
-        Driver-supported CUDA version (e.g. "12.4", "13.0"). If None, the
-        function probes nvidia-smi.
-
-    Returns
-    -------
-    str
-        The pip package name (e.g. "cupy-cuda12x"). Falls back to
-        "cupy-cuda12x" when the CUDA major version cannot be determined,
-        since CUDA 12 currently has the broadest cupy wheel coverage.
-    """
+    """CuPy wheel for the driver's CUDA major: cupy-cuda11x, 12x or 13x."""
     if driver_cuda is None:
-        driver_cuda = _get_nvidia_smi_cuda()
-    if driver_cuda:
-        try:
-            major = int(str(driver_cuda).split(".")[0])
-        except (ValueError, IndexError):
-            major = None
-        if major is not None:
-            # cupy ships separate wheels per CUDA major: cupy-cuda11x,
-            # cupy-cuda12x, cupy-cuda13x. anything older falls back to 11x.
-            if major >= 13:
-                return "cupy-cuda13x"
-            if major >= 12:
-                return "cupy-cuda12x"
-            return "cupy-cuda11x"
-    return "cupy-cuda12x"
+        from mbo_utilities.gpu import driver_cuda as _driver
+
+        driver_cuda = _driver()
+    major = _major(driver_cuda)
+    if major is None:
+        return "cupy-cuda12x"
+    return f"cupy-cuda{min(max(major, 11), 13)}x"
 
 
 def cupy_install_hint(driver_cuda: str | None = None) -> str:
-    """Human-readable install hint including the NVRTC + runtime wheels, e.g.
-    'uv pip install cupy-cuda12x nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12'.
-
-    The NVRTC + runtime wheels supply pip-managed CUDA so cupy's JIT kernels
-    compile without a system CUDA toolkit.
-    """
+    """CuPy plus the pip-managed NVRTC and runtime its kernels compile against."""
     pkg = recommended_cupy_package(driver_cuda)
     major = pkg.removeprefix("cupy-cuda").removesuffix("x")
-    return (
-        f"uv pip install {pkg} "
-        f"nvidia-cuda-nvrtc-cu{major} nvidia-cuda-runtime-cu{major}"
-    )
+    return f"uv pip install {pkg} nvidia-cuda-nvrtc-cu{major} nvidia-cuda-runtime-cu{major}"
 
 
-def _get_nvcc_version() -> str | None:
-    """Get cuda toolkit version from nvcc."""
-    try:
-        result = subprocess.run(
-            ["nvcc", "--version"],
-            check=False, capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            # parse "release X.Y" from output
-            for line in result.stdout.split("\n"):
-                if "release" in line.lower():
-                    parts = line.split("release")[-1].strip().split(",")[0]
-                    return parts.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return None
+def recommended_torch_tag(driver_cuda: str | None, capability: str | None = None) -> str:
+    """PyTorch wheel tag the driver and card can run: cu118, cu126, cu128 or cu130.
+
+    CUDA 13 wheels drop Pascal and Volta (compute capability < 7.5); Blackwell
+    (12.x) needs cu128 or later; a pre-12 driver only runs cu118.
+    """
+    major, cc = _major(driver_cuda), _cc(capability)
+    if cc is not None and cc >= 12.0:
+        return "cu128"
+    if major is None or major < 12:
+        return "cu118"
+    if major >= 13 and (cc is None or cc >= 7.5):
+        return "cu130"
+    return "cu126"
 
 
-def _get_nvidia_smi_cuda() -> str | None:
-    """Get driver-supported cuda version from nvidia-smi."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-            check=False, capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            # also get cuda version
-            result2 = subprocess.run(
-                ["nvidia-smi"],
-                check=False, capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if result2.returncode == 0:
-                # parse "CUDA Version: X.Y" from output
-                for line in result2.stdout.split("\n"):
-                    if "CUDA Version" in line:
-                        return line.split("CUDA Version:")[-1].strip().split()[0]
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return None
+def torch_install_hint(driver_cuda: str | None = None, capability: str | None = None) -> str:
+    """Install command for the PyTorch wheel this machine can run."""
+    return f"uv pip install torch --index-url {_TORCH_INDEX}{recommended_torch_tag(driver_cuda, capability)}"
 
 
-def _check_pytorch() -> tuple[FeatureStatus, str | None]:
-    """Check pytorch installation and cuda support."""
-    pytorch_cuda = None
+def _arch_supported(arches: list[str], capability: tuple[int, int]) -> bool:
+    """True when the wheel ships a kernel (sm_XY) or PTX (compute_XY <= card) for the card."""
+    want = capability[0] * 10 + capability[1]
+    for arch in arches:
+        kind, _, num = arch.partition("_")
+        if not num.isdigit():
+            continue
+        if (kind == "sm" and int(num) == want) or (kind == "compute" and int(num) <= want):
+            return True
+    return not arches
+
+
+# ---------------------------------------------------------------------------
+# checks
+# ---------------------------------------------------------------------------
+
+_TORCH_PURPOSE = "suite2p registration, cellpose and masknmf run on its device"
+_CUPY_PURPOSE = "z-registration of ScanImage tiffs only (imwrite register_z); numpy otherwise"
+
+
+def _check_pytorch(
+    driver_cuda: str | None, capability: str | None = None
+) -> tuple[FeatureStatus, str | None, str | None]:
+    """PyTorch and whether its CUDA build drives this card; returns (status, build, capability).
+
+    ``capability`` is the card's compute capability from the driver, so the
+    hint fits the card even when the installed wheel cannot see it.
+    """
+    hint = torch_install_hint(driver_cuda, capability)
+
+    def _feat(status, ver="", msg="", gpu_ok=None, hint=hint):
+        return FeatureStatus("PyTorch", status, ver, msg, gpu_ok, _TORCH_PURPOSE, hint)
+
+    if not _check_import("torch"):
+        return _feat(Status.MISSING, msg="not installed"), None, None
     try:
         import torch
-        version = torch.__version__
-        pytorch_cuda = getattr(torch.version, "cuda", None)
-
-        # gpu present and usable now
-        if torch.cuda.is_available():
-            device_name = torch.cuda.get_device_name(0)
-            return FeatureStatus(
-                name="PyTorch",
-                status=Status.OK,
-                version=version,
-                message=f"CUDA {pytorch_cuda}, {device_name}",
-                gpu_ok=True
-            ), pytorch_cuda
-        # cuda build installed but no gpu on this host (e.g. hpc login node)
-        if pytorch_cuda:
-            return FeatureStatus(
-                name="PyTorch",
-                status=Status.OK,
-                version=version,
-                message=f"CUDA {pytorch_cuda} build, no GPU on host",
-                gpu_ok=True
-            ), pytorch_cuda
-        # cpu-only build
-        return FeatureStatus(
-            name="PyTorch",
-            status=Status.WARN,
-            version=version,
-            message="CPU-only build (no CUDA)",
-            gpu_ok=False
-        ), pytorch_cuda
-    except ImportError:
-        return FeatureStatus(
-            name="PyTorch",
-            status=Status.MISSING,
-            message="pip install 'mbo_utilities[suite2p]'"
-        ), None
+    except Exception as e:
+        return _feat(Status.ERROR, msg=f"import failed: {str(e)[:60]}"), None, None
+    ver = torch.__version__
+    build = getattr(torch.version, "cuda", None)
+    if not build:
+        return _feat(Status.WARN, ver, "CPU-only build", gpu_ok=False), None, None
+    if not torch.cuda.is_available():
+        if driver_cuda is None:
+            msg = f"CUDA {build} build, no NVIDIA driver"
+        elif (_major(driver_cuda) or 0) < (_major(build) or 0):
+            msg = f"driver supports CUDA {driver_cuda}, wheel needs {build}"
+        else:
+            msg = f"CUDA {build} build, no usable GPU"
+        return _feat(Status.WARN, ver, msg, gpu_ok=False), build, None
+    try:
+        cap = tuple(torch.cuda.get_device_capability(0))
+        name = torch.cuda.get_device_name(0)
+        arches = list(torch.cuda.get_arch_list())
+    except Exception as e:
+        return _feat(Status.ERROR, ver, f"CUDA init failed: {str(e)[:60]}", gpu_ok=False), build, None
+    capability = f"{cap[0]}.{cap[1]}"
+    hint = torch_install_hint(driver_cuda, capability)
+    if not _arch_supported(arches, cap):
+        msg = f"{name} (sm_{cap[0]}{cap[1]}) has no kernels in the CUDA {build} wheel"
+        return _feat(Status.ERROR, ver, msg, gpu_ok=False, hint=hint), build, capability
+    return _feat(Status.OK, ver, f"CUDA {build}, {name}", gpu_ok=True, hint=hint), build, capability
 
 
-def _check_cupy(driver_cuda: str | None = None) -> tuple[FeatureStatus, str | None]:
-    """Check cupy installation and cuda support.
+def _check_cupy(driver_cuda: str | None) -> tuple[FeatureStatus, str | None]:
+    """CuPy, its CUDA runtime, and whether NVRTC can compile a kernel; returns (status, runtime)."""
+    hint = cupy_install_hint(driver_cuda)
 
-    When cupy is missing, broken, or built against a CUDA major version that
-    does not match the installed driver, the returned message embeds a
-    `uv pip install cupy-cudaXXx` hint matching the driver.
-    """
-    cupy_cuda = None
-    install_hint = cupy_install_hint(driver_cuda)
+    def _feat(status, ver="", msg="", gpu_ok=None):
+        return FeatureStatus("CuPy", status, ver, msg, gpu_ok, _CUPY_PURPOSE, hint)
+
+    if not _check_import("cupy"):
+        return _feat(Status.MISSING, msg="not installed"), None
     try:
         import cupy as cp
-        version = cp.__version__
-
-        # check cuda functionality
-        try:
-            # simple cuda test
-            _ = cp.array([1, 2, 3])
-            cuda_ver = cp.cuda.runtime.runtimeGetVersion()
-            cuda_major = cuda_ver // 1000
-            cuda_minor = (cuda_ver % 1000) // 10
-            cupy_cuda = f"{cuda_major}.{cuda_minor}"
-
-            # detect driver/cupy major mismatch (e.g. cupy-cuda11x on a CUDA 13 driver)
-            if driver_cuda:
-                try:
-                    drv_major = int(str(driver_cuda).split(".")[0])
-                    if drv_major != cuda_major:
-                        return FeatureStatus(
-                            name="CuPy",
-                            status=Status.ERROR,
-                            version=version,
-                            message=(
-                                f"CuPy built for CUDA {cuda_major}.x but driver "
-                                f"is CUDA {driver_cuda}. Reinstall: {install_hint}"
-                            ),
-                            gpu_ok=False,
-                        ), cupy_cuda
-                except (ValueError, IndexError):
-                    pass
-
-            # test nvrtc (required for cupy's jit-compiled kernels)
-            try:
-                kernel = cp.ElementwiseKernel(
-                    "float32 x", "float32 y", "y = x * 2", "test_kernel"
-                )
-                test_in = cp.array([1.0], dtype="float32")
-                test_out = cp.empty_like(test_in)
-                kernel(test_in, test_out)
-
-                device = cp.cuda.Device()
-                device_name = device.attributes.get("Name", "GPU")
-                return FeatureStatus(
-                    name="CuPy",
-                    status=Status.OK,
-                    version=version,
-                    message=f"CUDA {cupy_cuda}, {device_name}",
-                    gpu_ok=True
-                ), cupy_cuda
-            except Exception:
-                return FeatureStatus(
-                    name="CuPy",
-                    status=Status.ERROR,
-                    version=version,
-                    message=f"NVRTC missing (install CUDA toolkit, or: {install_hint})",
-                    gpu_ok=False
-                ), cupy_cuda
-        except Exception as e:
-            return FeatureStatus(
-                name="CuPy",
-                status=Status.ERROR,
-                version=version,
-                message=f"CUDA init failed: {str(e)[:40]} (try: {install_hint})",
-                gpu_ok=False
-            ), None
-    except ImportError:
-        return FeatureStatus(
-            name="CuPy",
-            status=Status.MISSING,
-            message=f"not installed ({install_hint})",
-        ), None
-
-
-def _check_suite2p() -> FeatureStatus:
-    """Check LBM-Suite2p-Python installation.
-
-    Uses find_spec/metadata instead of importing, so base suite2p (which prints
-    an unrelated pynwb warning on import) is never loaded.
-    """
-    import importlib.util
-    if importlib.util.find_spec("lbm_suite2p_python") is None:
-        return FeatureStatus(
-            name="LBM-Suite2p-Python",
-            status=Status.MISSING,
-            message="pip install 'mbo_utilities[suite2p]'"
-        )
+    except Exception as e:
+        return _feat(Status.ERROR, msg=f"import failed: {str(e)[:60]}"), None
+    ver = cp.__version__
     try:
-        from importlib.metadata import version
-        ver = version("lbm-suite2p-python")
+        cp.array([1, 2, 3])
+        rt = cp.cuda.runtime.runtimeGetVersion()
+        runtime = f"{rt // 1000}.{(rt % 1000) // 10}"
+    except Exception as e:
+        return _feat(Status.ERROR, ver, f"CUDA init failed: {str(e)[:60]}", gpu_ok=False), None
+    drv, cur = _major(driver_cuda), _major(runtime)
+    if drv is not None and cur is not None and drv < cur:
+        msg = f"built for CUDA {runtime}, driver supports {driver_cuda}"
+        return _feat(Status.ERROR, ver, msg, gpu_ok=False), runtime
+    try:
+        kernel = cp.ElementwiseKernel("float32 x", "float32 y", "y = x * 2", "mbo_probe")
+        kernel(cp.array([1.0], dtype="float32"), cp.empty(1, dtype="float32"))
     except Exception:
-        ver = "installed"
-    return FeatureStatus(
-        name="LBM-Suite2p-Python",
-        status=Status.OK,
-        version=ver,
-        message="ready"
-    )
+        return _feat(Status.ERROR, ver, "NVRTC missing, kernels cannot compile", gpu_ok=False), runtime
+    return _feat(Status.OK, ver, f"CUDA {runtime}", gpu_ok=True), runtime
 
 
-def _check_pkg_version(
-    import_name: str, dist_name: str, display: str, hint: str = ""
+def _check_pkg(
+    import_name: str, dist_name: str, display: str, purpose: str, hint: str
 ) -> FeatureStatus:
-    """Report a package's version without importing it.
-
-    Uses find_spec/metadata so packages with noisy imports (e.g. suite2p's
-    pynwb warning) are never loaded.
-    """
-    import importlib.util
-    if importlib.util.find_spec(import_name) is None:
-        msg = hint if hint else "not installed"
-        return FeatureStatus(name=display, status=Status.MISSING, message=msg)
+    """Version by metadata, so noisy packages (suite2p's pynwb warning) never import."""
+    if not _check_import(import_name):
+        return FeatureStatus(display, Status.MISSING, "", "not installed", None, purpose, hint)
     try:
-        from importlib.metadata import version
-        ver = version(dist_name)
+        ver = _dist_version(dist_name)
     except Exception:
-        ver = "installed"
-    return FeatureStatus(name=display, status=Status.OK, version=ver, message="ready")
+        ver = ""
+    return FeatureStatus(display, Status.OK, ver, "ready", None, purpose, hint)
 
 
-def _check_rastermap() -> FeatureStatus:
-    """Check rastermap installation."""
-    try:
-        import rastermap
-        version = getattr(rastermap, "__version__", "installed")
-        return FeatureStatus(
-            name="Rastermap",
-            status=Status.OK,
-            version=version,
-            message="ready"
-        )
-    except ImportError:
-        return FeatureStatus(
-            name="Rastermap",
-            status=Status.MISSING,
-            message="pip install 'mbo_utilities[suite2p]'"
-        )
+def _on_torch(feat: FeatureStatus, torch: FeatureStatus) -> FeatureStatus:
+    """Mark a package that computes on the PyTorch device with PyTorch's GPU state."""
+    if feat.status is not Status.OK:
+        return feat
+    feat.gpu_ok = torch.gpu_ok
+    if torch.status is Status.MISSING:
+        feat.status, feat.message, feat.hint = Status.WARN, "PyTorch not installed", torch.hint
+    elif not torch.gpu_ok:
+        feat.status, feat.message, feat.hint = Status.WARN, f"CPU: {torch.message}", torch.hint
+    return feat
 
 
-def _check_napari() -> FeatureStatus:
-    """Check napari installation."""
-    try:
-        import napari
-        version = getattr(napari, "__version__", "installed")
-        return FeatureStatus(
-            name="Napari",
-            status=Status.OK,
-            version=version,
-            message="ready"
-        )
-    except ImportError:
-        return FeatureStatus(
-            name="Napari",
-            status=Status.MISSING,
-            message="pip install 'mbo_utilities[napari]'"
-        )
+def check_installation(callback=None) -> InstallStatus:
+    """Probe every optional dependency; ``callback(progress, message)`` reports steps."""
 
-
-def _check_napari_ome_zarr() -> FeatureStatus:
-    """Check napari-ome-zarr plugin installation."""
-    try:
-        import napari_ome_zarr
-        version = getattr(napari_ome_zarr, "__version__", "installed")
-        return FeatureStatus(
-            name="napari-ome-zarr",
-            status=Status.OK,
-            version=version,
-            message="ready"
-        )
-    except ImportError:
-        return FeatureStatus(
-            name="napari-ome-zarr",
-            status=Status.MISSING,
-            message="not installed (pip install napari-ome-zarr)"
-        )
-
-
-def _check_napari_animation() -> FeatureStatus:
-    """Check napari-animation plugin installation."""
-    try:
-        import napari_animation
-        version = getattr(napari_animation, "__version__", "installed")
-        return FeatureStatus(
-            name="napari-animation",
-            status=Status.OK,
-            version=version,
-            message="ready"
-        )
-    except ImportError:
-        return FeatureStatus(
-            name="napari-animation",
-            status=Status.MISSING,
-            message="not installed (pip install napari-animation)"
-        )
-
-
-def check_installation(callback: type[object] | None = None) -> InstallStatus:
-    """Run full installation check and return structured status.
-
-    Args:
-        callback: optional callable(progress: float, message: str) for status updates
-    """
     def _update(p: float, msg: str):
         if callback:
             with contextlib.suppress(Exception):
                 callback(p, msg)
 
-    status = InstallStatus()
-    _update(0.1, "Checking Python version...")
+    from mbo_utilities.gpu import driver_cuda, gpu_devices
 
-    # basic info
+    status = InstallStatus()
     try:
         import mbo_utilities
+
         status.mbo_version = getattr(mbo_utilities, "__version__", "unknown")
     except ImportError:
         status.mbo_version = "not installed"
+    status.python_version = ".".join(str(v) for v in sys.version_info[:3])
 
-    status.python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    _update(0.1, "Checking NVIDIA driver...")
+    cuda = status.cuda_info
+    cuda.driver_version = driver_cuda()
+    devices = gpu_devices()
+    if devices:
+        cuda.device_name, cuda.device_count = devices[0]["name"], len(devices)
+        cuda.capability = devices[0].get("compute_cap")
 
-    # cuda environment
-    _update(0.2, "Checking CUDA environment...")
-    status.cuda_info.nvcc_version = _get_nvcc_version()
-    status.cuda_info.driver_version = _get_nvidia_smi_cuda()
-
-    # check pytorch (needed for suite2p GPU)
     _update(0.3, "Checking PyTorch...")
-    pytorch_status, pytorch_cuda = _check_pytorch()
-    status.cuda_info.pytorch_cuda = pytorch_cuda
-    status.features.append(pytorch_status)
+    torch, cuda.pytorch_cuda, seen = _check_pytorch(cuda.driver_version, cuda.capability)
+    cuda.capability = seen or cuda.capability
+    status.features.append(torch)
 
-    # check cupy (gpu backend for axial registration, optional)
     _update(0.5, "Checking CuPy...")
-    cupy_status, cupy_cuda = _check_cupy(driver_cuda=status.cuda_info.driver_version)
-    status.cuda_info.cupy_cuda = cupy_cuda
-    status.features.append(cupy_status)
+    cupy, cuda.cupy_cuda = _check_cupy(cuda.driver_version)
+    status.features.append(cupy)
 
-    # get gpu name from cupy if available
-    if cupy_status.gpu_ok:
-        try:
-            import cupy as cp
-            device = cp.cuda.Device()
-            status.cuda_info.device_name = device.attributes.get("Name", None)
-            status.cuda_info.device_count = cp.cuda.runtime.getDeviceCount()
-        except Exception:
-            pass
+    _update(0.7, "Checking pipelines...")
+    status.features += [
+        _on_torch(
+            _check_pkg(
+                "lbm_suite2p_python", "lbm-suite2p-python", "LBM-Suite2p-Python",
+                "suite2p pipeline; registration on the PyTorch device", _SUITE2P_HINT,
+            ),
+            torch,
+        ),
+        _check_pkg("suite2p", "suite2p", "Suite2p", "core of LBM-Suite2p-Python", _SUITE2P_HINT),
+        _on_torch(
+            _check_pkg(
+                "cellpose", "cellpose", "Cellpose",
+                "anatomical detection in suite2p, on the PyTorch device", "uv pip install cellpose",
+            ),
+            torch,
+        ),
+        _on_torch(
+            _check_pkg(
+                "masknmf", "masknmf", "MaskNMF",
+                "masknmf pipeline and curation GUI, on the PyTorch device", _MASKNMF_HINT,
+            ),
+            torch,
+        ),
+        _check_pkg("rastermap", "rastermap", "Rastermap", "sorts suite2p traces", _SUITE2P_HINT),
+    ]
 
-    # check pipelines
-    _update(0.7, "Checking LBM-Suite2p-Python...")
-    suite2p_status = _check_suite2p()
-    # if suite2p is installed but pytorch has no GPU, warn
-    if suite2p_status.status == Status.OK and pytorch_status.gpu_ok is False:
-        suite2p_status = FeatureStatus(
-            name="LBM-Suite2p-Python",
-            status=Status.WARN,
-            version=suite2p_status.version,
-            message="PyTorch has no GPU support",
-            gpu_ok=False
-        )
-    elif suite2p_status.status == Status.OK:
-        suite2p_status.gpu_ok = pytorch_status.gpu_ok
-    status.features.append(suite2p_status)
-    _proc_hint = "pip install 'mbo_utilities[suite2p]'"
-    status.features.append(_check_pkg_version("suite2p", "suite2p", "Suite2p", _proc_hint))
-    status.features.append(_check_pkg_version("cellpose", "cellpose", "Cellpose", _proc_hint))
-
-    _update(0.8, "Checking MaskNMF...")
-    status.features.append(
-        _check_pkg_version(
-            "masknmf",
-            "masknmf",
-            "MaskNMF",
-            "pip install git+https://github.com/apasarkar/masknmf-toolbox.git",
-        )
-    )
-
-    _update(0.85, "Checking Rastermap...")
-    status.features.append(_check_rastermap())
-
-    _update(0.9, "Checking Napari...")
-    napari_status = _check_napari()
-    status.features.append(napari_status)
-
-    # Only check napari plugins if napari is installed
-    if napari_status.status == Status.OK:
-        _update(0.93, "Checking napari-ome-zarr...")
-        status.features.append(_check_napari_ome_zarr())
-
-        _update(0.96, "Checking napari-animation...")
-        status.features.append(_check_napari_animation())
-
+    _update(0.9, "Checking napari...")
+    napari_hint = "uv pip install 'mbo_utilities[napari]'"
+    napari = _check_pkg("napari", "napari", "Napari", "the napari viewer mode", napari_hint)
+    status.features.append(napari)
+    if napari.status is Status.OK:
+        status.features += [
+            _check_pkg("napari_ome_zarr", "napari-ome-zarr", "napari-ome-zarr", "zarr in napari", napari_hint),
+            _check_pkg("napari_animation", "napari-animation", "napari-animation", "movies from napari", napari_hint),
+        ]
     _update(1.0, "Done")
     return status
 
 
+def gpu_summary(cuda: CudaInfo) -> str:
+    """One line: card and driver CUDA, or why there is none."""
+    if cuda.driver_version is None:
+        return "no NVIDIA driver"
+    card = cuda.device_name or "NVIDIA GPU"
+    if cuda.device_count > 1:
+        card += f" (+{cuda.device_count - 1})"
+    cc = f" sm {cuda.capability}" if cuda.capability else ""
+    return f"{card}{cc}, driver CUDA {cuda.driver_version}"
+
+
 def print_status_cli(status: InstallStatus):
-    """Print installation status to CLI with colors."""
+    """Print the status the way the launcher table shows it."""
     import click
 
     click.echo(f"\nmbo_utilities v{status.mbo_version} | Python {status.python_version}")
-    click.echo("=" * 50)
-
-    # cuda info
-    if status.cuda_info.nvcc_version or status.cuda_info.driver_version:
-        click.echo("\nCUDA Environment:")
-        if status.cuda_info.nvcc_version:
-            click.echo(f"  CUDA Toolkit (nvcc): {status.cuda_info.nvcc_version}")
-        if status.cuda_info.driver_version:
-            click.echo(f"  Driver CUDA:         {status.cuda_info.driver_version}")
-        if status.cuda_info.device_name:
-            click.echo(f"  GPU:                 {status.cuda_info.device_name}")
-
-    # features table
-    click.echo("\nFeatures:")
-    click.echo(click.style("  [ -] = optional, not installed", fg="bright_black"))
+    click.echo(f"GPU: {gpu_summary(status.cuda_info)}")
+    click.echo("=" * 60)
+    marks = {
+        Status.OK: ("[OK]", "green"),
+        Status.WARN: ("[! ]", "yellow"),
+        Status.ERROR: ("[X ]", "red"),
+        Status.MISSING: ("[ -]", "bright_black"),
+    }
     for f in status.features:
-        # format version string (skip 'v' prefix if version is 'installed')
-        if f.version and f.version != "installed":
-            ver = f" v{f.version}"
-        elif f.version == "installed":
-            ver = ""
-        else:
-            ver = ""
-
-        if f.status == Status.OK:
-            icon = click.style("[OK]", fg="green")
-            msg = click.style(f"{f.name}{ver}", fg="green")
-            extra = f" ({f.message})" if f.message and f.message != "ready" else ""
-        elif f.status == Status.WARN:
-            icon = click.style("[! ]", fg="yellow")
-            msg = click.style(f"{f.name}{ver}", fg="yellow")
-            extra = f" - {f.message}" if f.message else ""
-        elif f.status == Status.ERROR:
-            icon = click.style("[X ]", fg="red")
-            msg = click.style(f"{f.name}{ver}", fg="red")
-            extra = f" - {f.message}" if f.message else ""
-        else:  # MISSING
-            icon = click.style("[ -]", fg="bright_black")
-            msg = click.style(f"{f.name}", fg="bright_black")
-            extra = f" - {f.message}" if f.message else " (not installed)"
-
-        click.echo(f"  {icon} {msg}{extra}")
-
-    # summary
+        mark, color = marks[f.status]
+        ver = f" {f.version}" if f.version else ""
+        dev = {True: "  GPU", False: "  CPU"}.get(f.gpu_ok, "")
+        detail = "" if f.message in ("", "ready") else f"  {f.message}"
+        click.echo(f"  {click.style(mark, fg=color)} {click.style(f.name + ver, fg=color)}{dev}{detail}")
+        click.echo(click.style(f"       {f.purpose}", fg="bright_black"))
+        if f.status is not Status.OK and f.hint:
+            click.echo(click.style(f"       fix: {f.hint}", fg="cyan"))
     click.echo("")
     if status.all_ok:
         click.secho("Installation OK", fg="green", bold=True)
     else:
-        click.secho("Issues detected - see warnings above", fg="yellow")
+        click.secho("Issues detected - see above", fg="yellow")

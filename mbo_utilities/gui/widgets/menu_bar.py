@@ -7,12 +7,11 @@ This module contains the main menu bar and process status indicator.
 from __future__ import annotations
 
 import webbrowser
-from pathlib import Path
 from typing import Any
 
-from imgui_bundle import imgui, imgui_ctx, portable_file_dialogs as pfd
+from imgui_bundle import imgui, imgui_ctx
 
-from mbo_utilities.preferences import get_last_dir
+from mbo_utilities.gui._dialogs import start_open_prompt
 from mbo_utilities.gui._imgui_helpers import PopupAutoSize
 from mbo_utilities.gui.widgets.process_manager import get_process_manager
 from mbo_utilities.gui.widgets.widget_toggles import draw_widgets_menu
@@ -30,31 +29,12 @@ def draw_menu_bar(parent: Any):
     ):
         if imgui.begin_menu_bar():
             if imgui.begin_menu("File", True):
-                # Open File - iw-array API
+                # Open File / Open Folder: a typed path with the native
+                # dialog as a browse shortcut, so a remote kernel still works
                 if imgui.menu_item("Open File", "o", p_selected=False, enabled=True)[0]:
-                    # Handle fpath being a list or a string
-                    fpath = parent.fpath[0] if isinstance(parent.fpath, list) else parent.fpath
-                    if fpath and Path(fpath).exists():
-                        start_dir = str(Path(fpath).parent)
-                    else:
-                        # Use open_file context-specific preference
-                        start_dir = str(get_last_dir("open_file") or Path.home())
-                    parent._file_dialog = pfd.open_file(
-                        "Select Data File(s)",
-                        start_dir,
-                        ["Image Files", "*.tif *.tiff *.zarr *.npy *.bin", "All Files", "*"],
-                        pfd.opt.multiselect
-                    )
-                # Open Folder - iw-array API
+                    start_open_prompt(parent, "file")
                 if imgui.menu_item("Open Folder", "Shift+O", p_selected=False, enabled=True)[0]:
-                    # Handle fpath being a list or a string
-                    fpath = parent.fpath[0] if isinstance(parent.fpath, list) else parent.fpath
-                    if fpath and Path(fpath).exists():
-                        start_dir = str(Path(fpath).parent)
-                    else:
-                        # Use open_folder context-specific preference
-                        start_dir = str(get_last_dir("open_folder") or Path.home())
-                    parent._folder_dialog = pfd.select_folder("Select Data Folder", start_dir)
+                    start_open_prompt(parent, "folder")
                 imgui.separator()
                 if imgui.menu_item("Set Metadata", "Shift+M", p_selected=False, enabled=True)[0]:
                     parent._show_metadata_popup = True

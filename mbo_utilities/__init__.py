@@ -29,6 +29,12 @@ __all__ = [
     "get_last_save_dir",
     # File utilities
     "get_mbo_dirs",
+    # Memory monitoring
+    "MemoryMonitor",
+    "mem_snapshot",
+    "memory_monitor",
+    "start_memory_monitor",
+    "stop_memory_monitor",
     "get_metadata",
     "get_pipeline_info",
     # Preferences
@@ -52,6 +58,8 @@ __all__ = [
     "set_last_open_dir",
     "set_last_save_dir",
     # Visualization
+    "DataVis",
+    "run_gui",
     "to_video",
     "with_axial_shifts",
     "with_phasecorr",
@@ -88,6 +96,17 @@ def __getattr__(name):
     if name == "get_mbo_dirs":
         from .preferences import get_mbo_dirs
         return get_mbo_dirs
+
+    # Memory monitoring (psutil-backed; cheap import)
+    if name in (
+        "MemoryMonitor",
+        "mem_snapshot",
+        "memory_monitor",
+        "start_memory_monitor",
+        "stop_memory_monitor",
+    ):
+        from . import _sysmem
+        return getattr(_sysmem, name)
 
     if name == "files_to_dask":
         from .arrays import files_to_dask
@@ -145,6 +164,17 @@ def __getattr__(name):
     if name == "to_video":
         from ._writers import to_video
         return to_video
+
+    # The viewer. `from .gui import run_gui` cannot be used here: importing the
+    # submodule binds `mbo_utilities.gui.run_gui` to the MODULE, which then wins
+    # over that package's lazy __getattr__ and hands callers a module instead of
+    # the function. Reaching into the submodule directly is unambiguous.
+    if name == "run_gui":
+        from .gui.run_gui import run_gui
+        return run_gui
+    if name == "DataVis":
+        from .gui.data_vis import DataVis
+        return DataVis
 
     # File/folder selection (widgets -> imgui, wgpu)
     if name in ("select_folder", "select_files"):

@@ -11,6 +11,8 @@ from typing import Any
 import click
 import contextlib
 
+from mbo_utilities.gui._notebook import display_widget, in_notebook
+
 # Set AppUserModelID immediately for Windows
 try:
     import ctypes
@@ -504,7 +506,87 @@ def _squeeze_for_viewer(arr):
     return _ScrubTimingProxy(out)
 
 
-def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override=None):
+_NOTEBOOK_SIZE = (1400, 900)
+
+
+def _figure_kwargs_for_here(size: tuple[int, int] | None = None) -> dict:
+    """The canvas and size for wherever this process is running.
+
+    A notebook gets the jupyter canvas: it belongs in the output cell, not
+    in a Qt window the browser cannot see, which is what the pyqt6 branch
+    would build whenever PyQt6 happens to be installed (napari pulls it in).
+    jupyter_rfb streams the same wgpu frames over the kernel, so this is also
+    what makes a remote/JupyterHub session work. Its default size is a floor,
+    not a preference: the edge windows reserve fixed pixels (300 for the side
+    widget, the strip's menu row + panel, the NDWidget controls), and a canvas
+    too small for them leaves pygfx a negative viewport, which fails
+    validation and blanks the whole frame. A notebook cell has no screen to
+    measure, so ask for room.
+
+    A desktop window is clamped to the screen's available work area so
+    launches on shorter monitors (laptops, 1080p with a taskbar) don't run
+    past the bottom of the screen; (1000, 1000) when Qt can't be asked.
+    """
+    if in_notebook():
+        return {"canvas": "jupyter", "size": tuple(size or _NOTEBOOK_SIZE)}
+
+    import os
+
+    if os.environ.get("RENDERCANVAS_FORCE_OFFSCREEN"):
+        # tests and headless capture: rendercanvas.auto already resolved to
+        # the offscreen backend, and a Qt canvas would fight it
+        return {"size": tuple(size or (1000, 1000))}
+
+    try:
+        from rendercanvas.pyqt6 import RenderCanvas
+    except (ImportError, RuntimeError):  # RuntimeError if qt is already selected
+        RenderCanvas = None
+
+    if size is None:
+        fig_w, fig_h = 1000, 1000
+        try:
+            from PyQt6.QtGui import QGuiApplication
+            screen = QGuiApplication.primaryScreen()
+            if screen is not None:
+                avail = screen.availableGeometry()
+                # leave headroom for window chrome, side widget, and OS bars.
+                # PreviewDataWidget is ~300 px wide, added by add_gui — so the
+                # canvas itself wants the remaining width.
+                fig_w = max(400, min(fig_w, avail.width() - 360))
+                fig_h = max(400, min(fig_h, avail.height() - 120))
+        except Exception:
+            pass
+        size = (fig_w, fig_h)
+
+    if RenderCanvas is not None:
+        # present_method="screen" renders the wgpu surface directly. The
+        # "bitmap" method blits via QPainter inside paintEvent, which
+        # re-enters during Qt's resize loop ("Recursive repaint detected",
+        # paintEngine==0) and freezes the window on resize.
+        return {
+            "canvas": "pyqt6",
+            "canvas_kwargs": {"present_method": "screen"},
+            "size": tuple(size),
+        }
+    return {"size": tuple(size)}
+
+
+def _after_show(iw) -> None:
+    """Window title and icon; only meaningful once a desktop canvas exists."""
+    from mbo_utilities import __version__
+
+    canvas = iw.figure.canvas
+    if hasattr(canvas, "set_title"):
+        canvas.set_title(f"Miller Brain Studio v{__version__}")
+    _set_qt_icon()
+
+
+def _create_image_widget(
+    data_array,
+    widget: bool = True,
+    figure_kwargs_override=None,
+    show: bool = True,
+):
     """Create fastplotlib ImageWidget with an optional side widget.
 
     `widget` names which one to attach: "preview" (PreviewDataWidget),
@@ -513,48 +595,17 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
 
     `figure_kwargs_override` replaces the auto-selected canvas/size dict (used by
     scripts/capture_docs.py to build an offscreen viewer for headless capture).
+
+    `show=False` builds everything but leaves showing to the caller; that is
+    how ``DataVis`` separates construction from ``show()``.
     """
     import copy
     import numpy as np
-    import fastplotlib as fpl
-
-    try:
-        from rendercanvas.pyqt6 import RenderCanvas
-    except (ImportError, RuntimeError): # RuntimeError if qt is already selected
-        RenderCanvas = None
-
-    # Clamp the default figure size to the screen's available work area
-    # so launches on shorter monitors (laptops, 1080p with taskbar) don't
-    # spawn a window that runs past the bottom of the screen. Falls back
-    # to (1000, 1000) when Qt isn't available or the query fails.
-    fig_w, fig_h = 1000, 1000
-    try:
-        from PyQt6.QtGui import QGuiApplication
-        screen = QGuiApplication.primaryScreen()
-        if screen is not None:
-            avail = screen.availableGeometry()
-            # leave headroom for window chrome, side widget, and OS bars.
-            # PreviewDataWidget is ~300 px wide, added by add_gui — so the
-            # canvas itself wants the remaining width.
-            fig_w = max(400, min(fig_w, avail.width() - 360))
-            fig_h = max(400, min(fig_h, avail.height() - 120))
-    except Exception:
-        pass
 
     if figure_kwargs_override is not None:
         figure_kwargs = figure_kwargs_override
-    elif RenderCanvas is not None:
-        # present_method="screen" renders the wgpu surface directly. The
-        # "bitmap" method blits via QPainter inside paintEvent, which
-        # re-enters during Qt's resize loop ("Recursive repaint detected",
-        # paintEngine==0) and freezes the window on resize.
-        figure_kwargs = {
-            "canvas": "pyqt6",
-            "canvas_kwargs": {"present_method": "screen"},
-            "size": (fig_w, fig_h),
-        }
     else:
-        figure_kwargs = {"size": (fig_w, fig_h)}
+        figure_kwargs = _figure_kwargs_for_here()
 
     # Determine slider dimension names from array's dims property if available
     from mbo_utilities.arrays.features import get_slider_dims
@@ -635,14 +686,9 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
             graphic_kwargs=graphic_kwargs,
         )
 
-    iw.show()
-
-    # set qt window title and icon after canvas is created
-    from mbo_utilities import __version__
-    canvas = iw.figure.canvas
-    if hasattr(canvas, "set_title"):
-        canvas.set_title(f"Miller Brain Studio v{__version__}")
-    _set_qt_icon()
+    if show:
+        iw.show()
+        _after_show(iw)
 
     # Attach the requested side widget
     if isinstance(widget, bool) or widget is None:
@@ -686,14 +732,8 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
 
 
 def _is_jupyter() -> bool:
-    """Check if running in Jupyter environment."""
-    try:
-        from IPython import get_ipython
-        if get_ipython() is not None:
-            return True
-    except ImportError:
-        pass
-    return False
+    """Old name for ``in_notebook``; a plain ``ipython`` shell is not one."""
+    return in_notebook()
 
 
 def _run_gui_impl(
@@ -746,6 +786,15 @@ def _run_gui_impl(
 
         # Handle file selection if no path provided
         if data_in is None:
+            if in_notebook():
+                # the launcher is a desktop window with native dialogs; it
+                # would open on the kernel's machine, which for a hub session
+                # is not the one the user is looking at
+                raise ValueError(
+                    "run_gui() needs a path in a notebook: the file picker is a "
+                    "desktop window. Pass the file or folder, e.g. "
+                    'run_gui("/data/session.tif"), or build DataVis(path).'
+                )
             data_in, roi_from_dialog, widget, metadata_only, mode = _select_file(runner_params=runner_params)
             if not data_in:
                 return None
@@ -933,6 +982,17 @@ def _resolve_mesc_unit(data_in, unit):
     if not units:
         return {}, True  # let imread raise the real "nothing readable" error
 
+    if in_notebook():
+        # the picker is a Qt dialog on the kernel's machine; in a notebook
+        # the unit is an argument, and the error lists what there is to pick
+        if len(units) == 1:
+            return {"unit": units[0]}, True
+        listing = "\n".join(f"  {i}: {u}" for i, u in enumerate(units))
+        raise ValueError(
+            f"{path.name} holds {len(units)} measurement units; pass unit= "
+            f"(an index or key) to choose one:\n{listing}"
+        )
+
     chosen = _prompt_for_mesc_unit(path, units)
     if chosen is _PICKER_UNAVAILABLE:
         return {}, True
@@ -993,13 +1053,26 @@ def _launch_curation_gui(path):
     import fastplotlib as fpl
 
     vis = _open_curation_gui(path)
-    if _is_jupyter():
+    if in_notebook():
+        # show() already ran; the canvas it returned is what the cell needs
+        display_widget(vis.show())
         return vis
     fpl.loop.run()
     return None
 
 
-def _launch_standard_viewer(data_in, roi, widget, metadata_only, unit=None):
+class ViewerCancelled(Exception):
+    """The user dismissed a picker the viewer needed an answer from."""
+
+
+def _load_for_viewer(data_in, roi=None, unit=None):
+    """Open ``data_in`` the way the viewer wants it.
+
+    Resolves the ``.mesc`` unit, reads lazily, then wraps the array so the
+    viewer shows it aligned (per-plane axial shifts saved with the data) and
+    can toggle scan-phase correction on formats without a native control.
+    Raises ``ViewerCancelled`` when the unit picker was dismissed.
+    """
     from mbo_utilities.reader import imread
     from mbo_utilities.arrays import normalize_roi
     from mbo_utilities.log import get as get_logger
@@ -1010,7 +1083,7 @@ def _launch_standard_viewer(data_in, roi, widget, metadata_only, unit=None):
     # a .mesc holds many unrelated scans; pick one before opening anything
     mesc_kwargs, proceed = _resolve_mesc_unit(data_in, unit)
     if not proceed:
-        return None
+        raise ViewerCancelled(f"unit selection cancelled for {data_in}")
     t0 = _time.perf_counter()
     data_array = imread(data_in, roi=roi, **mesc_kwargs)
     t_imread = _time.perf_counter() - t0
@@ -1020,14 +1093,11 @@ def _launch_standard_viewer(data_in, roi, widget, metadata_only, unit=None):
         f"shape={getattr(data_array, 'shape', None)}  "
         f"dims={getattr(data_array, 'dims', None)}"
     )
+    return _wrap_for_viewer(data_array, logger)
 
-    if metadata_only:
-        metadata = data_array.metadata
-        if not metadata:
-            return None
-        _show_metadata_viewer(metadata)
-        return None
 
+def _wrap_for_viewer(data_array, logger):
+    """Axial alignment and scan-phase wraps; both transparent to the caller."""
     # if the dataset carries valid per-plane axial shifts (written by
     # imwrite(register_z=True)), show the aligned view by default. transparent
     # wrap: shape/dims/metadata/domain attrs forward to the source; only the
@@ -1072,18 +1142,49 @@ def _launch_standard_viewer(data_in, roi, widget, metadata_only, unit=None):
                 logger.debug("scan-phase correction available (disabled)")
     except Exception as e:
         logger.debug(f"phasecorr wrap skipped: {e}")
+    return data_array
 
-    import fastplotlib as fpl
+
+def _launch_standard_viewer(data_in, roi, widget, metadata_only, unit=None):
+    """Build a ``DataVis`` for the path and show it the way this process can.
+
+    A terminal gets a window and the event loop; a notebook gets the canvas
+    in the output cell and the ``DataVis`` back so the cell can close it.
+    """
+    from mbo_utilities.log import get as get_logger
+    import time as _time
+
+    logger = get_logger("gui.boot")
+
+    if metadata_only:
+        try:
+            data_array = _load_for_viewer(data_in, roi=roi, unit=unit)
+        except ViewerCancelled:
+            return None
+        metadata = data_array.metadata
+        if not metadata:
+            return None
+        _show_metadata_viewer(metadata)
+        return None
+
+    from mbo_utilities.gui.data_vis import DataVis
+
     t1 = _time.perf_counter()
-    iw = _create_image_widget(data_array, widget=widget)
-    t_widget = _time.perf_counter() - t1
+    try:
+        vis = DataVis(data_in, roi=roi, widget=widget, unit=unit)
+    except ViewerCancelled:
+        return None
     logger.debug(
-        f"[boot] _create_image_widget (incl. PreviewDataWidget): "
-        f"{t_widget*1000:.0f} ms"
+        f"[boot] DataVis (imread + widget): {(_time.perf_counter() - t1)*1000:.0f} ms"
     )
 
-    if _is_jupyter():
-        return iw
+    output = vis.show()
+    if in_notebook():
+        display_widget(output)
+        return vis
+
+    import fastplotlib as fpl
+
     fpl.loop.run()
     return None
 
@@ -1441,9 +1542,12 @@ def run_gui(
     """
     Open a GUI to preview data of any supported type.
 
-    Works both as a CLI command and as a Python function for Jupyter/scripts.
-    In Jupyter, returns the ImageWidget so you can interact with it.
-    In standalone mode, runs the event loop (blocking).
+    The one-call form of ``DataVis``: it builds the viewer, picks the canvas
+    and size for wherever it is running, and shows it. In a terminal or
+    script it opens a window and runs the event loop until it closes. In a
+    notebook it puts the canvas in the output cell and returns the
+    ``DataVis`` so the cell can reach the viewer and ``close()`` it. The
+    file picker is a desktop window, so a notebook has to pass the path.
 
     Parameters
     ----------
@@ -1469,23 +1573,30 @@ def run_gui(
 
     Returns
     -------
-    ImageWidget, Path, or None
-        In Jupyter: returns the ImageWidget (already shown via iw.show()).
-        In standalone: returns None (runs event loop until closed).
-        With select_only=True: returns the selected path (str or Path).
+    DataVis, Path, or None
+        In a notebook: the ``DataVis``, already shown in the output cell.
+        In standalone: None (runs the event loop until closed).
+        With select_only=True: the selected path (str or Path).
 
     Examples
     --------
-    From Python or Jupyter:
+    In a notebook:
 
-    >>> from mbo_utilities.gui import run_gui
-    >>> # just show the GUI
-    >>> run_gui("path/to/data.tif")
-    >>> # get a reference to manipulate it
-    >>> iw = run_gui("path/to/data.tif", roi=1, widget=False)
-    >>> iw.cmap = "viridis"
-    >>> # only return the path picked in the dialog
-    >>> path = run_gui(select_only=True)
+    >>> import mbo_utilities as mbo
+    >>> vis = mbo.run_gui("path/to/data.tif")
+    >>> vis.iw.cmap = "viridis"
+    >>> vis.close()
+
+    or with the class, the way masknmf's viewers work:
+
+    >>> from mbo_utilities import DataVis
+    >>> vis = DataVis("path/to/data.tif", roi=1, widget="none")
+    >>> vis.show()
+
+    From a script, ``run_gui`` blocks until the window closes:
+
+    >>> mbo.run_gui("path/to/data.tif")
+    >>> path = mbo.run_gui(select_only=True)  # only the picker
 
     From the command line::
 

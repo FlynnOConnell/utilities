@@ -1,4 +1,6 @@
+import socket
 import threading
+from pathlib import Path
 
 from imgui_bundle import (
     hello_imgui,
@@ -16,12 +18,9 @@ from mbo_utilities.preferences import (
     set_gpu_index,
     get_debug_logging,
     set_debug_logging,
-    get_mem_monitor,
-    set_mem_monitor,
-    get_mem_monitor_interval,
-    set_mem_monitor_interval,
 )
-from mbo_utilities.install import check_installation, cupy_install_hint, Status
+from mbo_utilities.install import Status, check_installation, gpu_summary
+from mbo_utilities.gui._files import NATIVE_DIALOGS, no_dialog_hint
 
 # re-export for backwards compatibility
 setup_imgui = _setup.setup_imgui
@@ -43,6 +42,15 @@ COL_OK = imgui.ImVec4(0.4, 1.0, 0.4, 1.0)
 COL_WARN = imgui.ImVec4(1.0, 0.8, 0.2, 1.0)
 COL_ERR = imgui.ImVec4(1.0, 0.4, 0.4, 1.0)
 COL_NA = imgui.ImVec4(0.5, 0.5, 0.5, 1.0)
+
+# launcher table rows, in order; the CLI prints every feature
+_DEP_ROWS = ("PyTorch", "LBM-Suite2p-Python", "Cellpose", "MaskNMF", "CuPy", "Rastermap", "Napari")
+_STATUS_GLYPH = {
+    Status.OK: (fa.ICON_FA_CIRCLE_CHECK, COL_OK),
+    Status.WARN: (fa.ICON_FA_CIRCLE_EXCLAMATION, COL_WARN),
+    Status.ERROR: (fa.ICON_FA_CIRCLE_XMARK, COL_ERR),
+    Status.MISSING: (fa.ICON_FA_CIRCLE_MINUS, COL_NA),
+}
 
 
 def _get_install_source() -> str:
@@ -134,15 +142,6 @@ def wrapped_tooltip(text: str, wrap_em: float = _TOOLTIP_WRAP_EM) -> None:
         imgui.end_tooltip()
 
 
-def text_wrapped_colored(color: imgui.ImVec4, text: str) -> None:
-    """Colored equivalent of imgui.text_wrapped()."""
-    imgui.push_style_color(imgui.Col_.text, color)
-    try:
-        imgui.text_wrapped(text)
-    finally:
-        imgui.pop_style_color()
-
-
 def icon_button(icon: str, label: str, size: imgui.ImVec2, tooltip: str = "") -> bool:
     """
     Draw a styled icon button with MBO theme.
@@ -193,6 +192,9 @@ class FileDialog:
         self.selected_path = None
         self._open_multi = None
         self._select_folder = None
+        # the typed route: works where no native dialog can be drawn
+        self._typed_path = ""
+        self._typed_status = ""
         self._widget_enabled = True
         self.metadata_only = False
         self.split_rois = False
@@ -215,8 +217,6 @@ class FileDialog:
         # Seed from persisted preferences so re-opens remember the user's choice.
         self.selected_gpu_index: int = get_gpu_index()
         self.debug_logging: bool = get_debug_logging()
-        self.mem_monitor: bool = get_mem_monitor()
-        self.mem_monitor_interval: float = get_mem_monitor_interval()
         self._show_options_popup: bool = False
         # nvidia-smi compute devices for the Compute GPU combo; refreshed once
         # per popup-open (subprocess), not per frame.
@@ -257,6 +257,9 @@ class FileDialog:
                 self._compute_devices = gpu_devices()
             except Exception:
                 self._compute_devices = []
+            # re-read prefs on open; they may have changed elsewhere
+            from mbo_utilities.gui._options_popup import sync_memory_options
+            sync_memory_options(self)
             imgui.open_popup("##options_popup")
             self._show_options_popup = False
 
@@ -294,6 +297,7 @@ class FileDialog:
                 compute_gpu_options,
                 compute_gpu_current_index,
                 apply_compute_gpu,
+                draw_memory_options,
             )
             imgui.text_colored(COL_TEXT_DIM, "Compute GPU (suite2p / cellpose)")
             if imgui.is_item_hovered():
@@ -333,22 +337,7 @@ class FileDialog:
                 except Exception:
                     pass
 
-            changed, new_mem = imgui.checkbox("Log memory usage", self.mem_monitor)
-            if imgui.is_item_hovered():
-                wrapped_tooltip("Sample RAM use to logs/mem_<id>.csv each tick.")
-            if changed:
-                self.mem_monitor = new_mem
-                set_mem_monitor(self.mem_monitor)
-            imgui.same_line()
-            imgui.begin_disabled(not self.mem_monitor)
-            imgui.set_next_item_width(hello_imgui.em_size(5))
-            changed, new_iv = imgui.input_float(
-                "tick (s)##mem_interval", self.mem_monitor_interval, 0.0, 0.0, "%.1f"
-            )
-            imgui.end_disabled()
-            if changed:
-                self.mem_monitor_interval = max(0.25, new_iv)
-                set_mem_monitor_interval(self.mem_monitor_interval)
+            draw_memory_options(self, tooltip=wrapped_tooltip)
 
             imgui.dummy(hello_imgui.em_to_vec2(0, 0.3))
             if imgui.button("Close", imgui.ImVec2(hello_imgui.em_size(6), 0)):
@@ -368,44 +357,33 @@ class FileDialog:
         pass
 
     def _start_dependency_check(self):
-        """Start background thread to check dependencies."""
+        """Probe dependencies once, on a thread, from the cache when it is fresh."""
         if self._check_thread is not None:
             return
 
         def _run_check():
-            # try to use fully cached install status first
             try:
                 from mbo_utilities.env_cache import (
-                    get_cached_install_status,
                     build_full_cache_with_install_status,
+                    get_cached_install_status,
                     save_cache,
                 )
-                cached_status = get_cached_install_status()
-                if cached_status:
-                    # cache is valid - use it directly, no need to recompute
-                    self._install_status = cached_status
-                    return
 
-                # cache invalid or missing - run full check and cache result
-                cache = build_full_cache_with_install_status()
-                save_cache(cache)
-                # get the status we just built
-                self._install_status = get_cached_install_status() or check_installation()
+                cached = get_cached_install_status()
+                if cached is None:
+                    save_cache(build_full_cache_with_install_status())
+                    cached = get_cached_install_status()
+                self._install_status = cached or check_installation()
             except Exception:
-                # fallback to regular check on any error
                 self._install_status = check_installation()
 
         self._check_thread = threading.Thread(target=_run_check, daemon=True)
         self._check_thread.start()
 
-    def _get_feature(self, name: str):
-        """Get feature status by name from install status."""
-        if self._install_status is None:
-            return None
-        for f in self._install_status.features:
-            if f.name == name:
-                return f
-        return None
+    def _dep_rows(self) -> list:
+        """Features the launcher table shows, in ``_DEP_ROWS`` order."""
+        found = map(self._install_status.feature, _DEP_ROWS)
+        return [f for f in found if f is not None]
 
     def _draw_version_status(self):
         """Draw version with install source inline."""
@@ -416,60 +394,6 @@ class FileDialog:
         if source:
             label += f" ({source})"
         imgui.text_colored(COL_TEXT_DIM, label)
-
-    def _draw_dependency_group(self, name: str, pipeline_feature: str, requires: list[tuple[str, str]]):
-        """Draw a single dependency group inline: Name - Requirement vX.X (GPU/CPU)."""
-        pipeline = self._get_feature(pipeline_feature)
-
-        # not installed
-        if pipeline is None or pipeline.status == Status.MISSING:
-            text_wrapped_colored(COL_NA, f"{name} - not installed")
-            return
-
-        # build the line: "Suite2p - PyTorch v2.1.0 (GPU)"
-        parts = [name]
-
-        # add requirement info inline
-        for req_name, feature_name in requires:
-            feat = self._get_feature(feature_name)
-            if feat is None or feat.status == Status.MISSING:
-                parts.append(f"- {req_name}: missing")
-            else:
-                ver_str = f"v{feat.version}" if feat.version and feat.version != "installed" else ""
-                gpu_str = ""
-                if feat.gpu_ok is True:
-                    gpu_str = "GPU"
-                elif feat.gpu_ok is False:
-                    gpu_str = "CPU"
-
-                req_parts = [f"- {req_name}"]
-                if ver_str:
-                    req_parts.append(ver_str)
-                if gpu_str:
-                    req_parts.append(f"({gpu_str})")
-                parts.append(" ".join(req_parts))
-
-        line = " ".join(parts)
-
-        # color based on status (wrapped so long dep chains stay in-bounds)
-        if pipeline.status == Status.OK:
-            text_wrapped_colored(COL_OK, line)
-        elif pipeline.status == Status.WARN:
-            text_wrapped_colored(COL_WARN, line)
-        else:
-            text_wrapped_colored(COL_ERR, line)
-
-        # tooltip with detailed info
-        if imgui.is_item_hovered():
-            tooltip_parts = []
-            if pipeline.version and pipeline.version != "installed":
-                tooltip_parts.append(f"{name} v{pipeline.version}")
-            for req_name, feature_name in requires:
-                feat = self._get_feature(feature_name)
-                if feat and feat.message:
-                    tooltip_parts.append(f"{req_name}: {feat.message}")
-            if tooltip_parts:
-                wrapped_tooltip("\n".join(tooltip_parts))
 
     def _draw_formats_card_content(self):
         """Draw supported formats - always shown immediately."""
@@ -529,102 +453,109 @@ class FileDialog:
         self._draw_dependency_status_line()
 
     def _draw_dependency_status_line(self):
-        """Draw compact dependency status with popup for details."""
-        checking = self._install_status is None
-
-        if checking:
-            # show spinner while checking
+        """One-line summary that opens the dependency table."""
+        if self._install_status is None:
             imgui.text_colored(COL_TEXT_DIM, f"{fa.ICON_FA_CIRCLE_NOTCH}  checking dependencies...")
-        else:
-            # count ok/warn/missing
-            ok_count = 0
-            issue_count = 0
-            deps = ["LBM-Suite2p-Python", "Rastermap", "PyTorch", "CuPy"]
-            for name in deps:
-                feat = self._get_feature(name)
-                if feat is None or feat.status == Status.MISSING:
-                    continue
-                if feat.status == Status.OK:
-                    ok_count += 1
-                else:
-                    issue_count += 1
+            return
+        rows = self._dep_rows()
+        ready = sum(f.status is Status.OK for f in rows)
+        issues = sum(f.status in (Status.WARN, Status.ERROR) for f in rows)
+        icon, color = _STATUS_GLYPH[Status.WARN if issues else Status.OK]
+        imgui.text_colored(color, icon)
+        imgui.same_line()
+        label = f"{ready} of {len(rows)} ready" + (f", {issues} to fix" if issues else "")
+        push_button_style(primary=False)
+        if imgui.small_button(f"dependencies: {label}"):
+            self._show_deps_popup = True
+        pop_button_style()
+        if imgui.is_item_hovered():
+            wrapped_tooltip("Pipelines and GPU backends the GUI can use")
+        self._draw_dependency_popup(rows)
 
-            # status icon and text
-            if issue_count > 0:
-                imgui.text_colored(COL_WARN, f"{fa.ICON_FA_CIRCLE_EXCLAMATION}")
-            else:
-                imgui.text_colored(COL_OK, f"{fa.ICON_FA_CIRCLE_CHECK}")
-            imgui.same_line()
-
-            # clickable text to show popup
-            push_button_style(primary=False)
-            if imgui.small_button(f"dependencies ({ok_count} installed)"):
-                self._show_deps_popup = True
-            pop_button_style()
-
-            if imgui.is_item_hovered():
-                wrapped_tooltip("Click for details")
-
-        # popup with full dependency info
+    def _draw_dependency_popup(self, rows: list):
+        """Table of the GUI's optional packages: version, compute device, fix."""
         if self._show_deps_popup:
             imgui.open_popup("##deps_popup")
             self._show_deps_popup = False
+        if not imgui.begin_popup("##deps_popup", imgui.WindowFlags_.always_auto_resize):
+            return
+        em = hello_imgui.em_size
+        imgui.text_colored(COL_ACCENT, "Dependencies")
+        gpu = gpu_summary(self._install_status.cuda_info)
+        imgui.text_colored(COL_TEXT_DIM, f"{fa.ICON_FA_MICROCHIP}  {gpu}")
+        imgui.dummy(hello_imgui.em_to_vec2(0, 0.2))
+        widths = (em(10), em(5.5), em(3.6), em(1.8))
+        flags = (
+            imgui.TableFlags_.borders_inner_v
+            | imgui.TableFlags_.row_bg
+            | imgui.TableFlags_.no_host_extend_x
+        )
+        if imgui.begin_table("##deps", 4, flags, imgui.ImVec2(sum(widths), 0)):
+            for title, w in zip(("Package", "Version", "Device", ""), widths):
+                imgui.table_setup_column(title, imgui.TableColumnFlags_.width_fixed, w)
+            imgui.table_headers_row()
+            for f in rows:
+                self._draw_dependency_row(f)
+            imgui.end_table()
+        imgui.dummy(hello_imgui.em_to_vec2(0, 0.2))
+        imgui.end_popup()
 
-        popup_flags = imgui.WindowFlags_.always_auto_resize
-        if imgui.begin_popup("##deps_popup", popup_flags):
-            imgui.text_colored(COL_ACCENT, "Optional Dependencies")
-            imgui.separator()
-            imgui.dummy(hello_imgui.em_to_vec2(0, 0.2))
+    def _draw_dependency_row(self, f):
+        """One feature: the row carries the tooltip, the last cell copies the fix."""
+        icon, color = _STATUS_GLYPH[f.status]
+        installed = f.status is not Status.MISSING
+        imgui.table_next_row()
+        imgui.table_next_column()
+        imgui.selectable(
+            f"##dep-{f.name}",
+            False,
+            imgui.SelectableFlags_.span_all_columns | imgui.SelectableFlags_.allow_overlap,
+        )
+        hovered = imgui.is_item_hovered()
+        imgui.same_line(0, 0)
+        imgui.text_colored(color, icon)
+        imgui.same_line()
+        imgui.text_colored(COL_TEXT if installed else COL_NA, f.name)
+        imgui.table_next_column()
+        imgui.text_colored(COL_TEXT_DIM, f.version if installed else "-")
+        imgui.table_next_column()
+        if installed and f.gpu_ok is not None:
+            imgui.text_colored(COL_OK if f.gpu_ok else COL_WARN, "GPU" if f.gpu_ok else "CPU")
+        imgui.table_next_column()
+        fixable = bool(f.hint) and f.status is not Status.OK
+        if fixable:
+            push_button_style(primary=False)
+            if imgui.small_button(f"{fa.ICON_FA_COPY}##fix-{f.name}"):
+                imgui.set_clipboard_text(f.hint)
+            pop_button_style()
+            if imgui.is_item_hovered():
+                wrapped_tooltip(f"copy: {f.hint}")
+                hovered = False
+        if hovered:
+            lines = [f.purpose]
+            if f.message and f.message != "ready":
+                lines.append(f.message)
+            if fixable:
+                lines.append(f"fix: {f.hint}")
+            wrapped_tooltip("\n".join(lines))
 
-            # suite2p group
-            self._draw_dependency_group(
-                "LBM-Suite2p-Python",
-                "LBM-Suite2p-Python",
-                [("PyTorch", "PyTorch")]
-            )
-
-            # cupy install hint when cupy is unhealthy. the most common
-            # cause is the wrong cupy wheel for the installed cuda driver, so
-            # show the recommended `uv pip install cupy-cudaXXx` command.
-            cupy_feat = self._get_feature("CuPy")
-            cupy_unhealthy = (
-                cupy_feat is None
-                or cupy_feat.status in (Status.MISSING, Status.ERROR)
-            )
-            if cupy_unhealthy:
-                driver_cuda = None
-                if self._install_status is not None:
-                    driver_cuda = self._install_status.cuda_info.driver_version
-                hint = cupy_install_hint(driver_cuda)
-                imgui.indent(hello_imgui.em_size(0.6))
-                imgui.text_colored(COL_TEXT_DIM, "Common fix:")
-                # Hint is a `uv pip install cupy-cudaXXx` command that can
-                # easily exceed the dialog width; put it on its own line
-                # and let it wrap rather than running off the right edge.
-                text_wrapped_colored(COL_ACCENT, hint)
-                push_button_style(primary=False)
-                if imgui.small_button(f"{fa.ICON_FA_COPY}  Copy##cupy_hint"):
-                    imgui.set_clipboard_text(hint)
-                pop_button_style()
-                if imgui.is_item_hovered():
-                    wrapped_tooltip("Copy command to clipboard")
-                if cupy_feat is not None and cupy_feat.message:
-                    text_wrapped_colored(COL_TEXT_DIM, cupy_feat.message)
-                imgui.unindent(hello_imgui.em_size(0.6))
-
-            # rastermap
-            rastermap = self._get_feature("Rastermap")
-            if rastermap is None or rastermap.status == Status.MISSING:
-                text_wrapped_colored(COL_NA, "Rastermap - not installed")
-            else:
-                ver = f" v{rastermap.version}" if rastermap.version and rastermap.version != "installed" else ""
-                if rastermap.status == Status.OK:
-                    text_wrapped_colored(COL_OK, f"Rastermap{ver}")
-                else:
-                    text_wrapped_colored(COL_WARN, f"Rastermap{ver}")
-
-            imgui.dummy(hello_imgui.em_to_vec2(0, 0.2))
-            imgui.end_popup()
+    def _open_typed_path(self) -> None:
+        """Accept the typed path the way a dialog result is accepted."""
+        raw = self._typed_path.strip().strip('"')
+        if not raw:
+            self._typed_status = "type a file or folder path"
+            return
+        p = Path(raw).expanduser()
+        if not p.exists():
+            self._typed_status = f"not found on this machine: {p}"
+            return
+        self._typed_status = ""
+        self.selected_path = str(p)
+        kind = "folder" if p.is_dir() else "file"
+        add_recent_file(self.selected_path, file_type=kind)
+        set_last_dir(f"open_{kind}", self.selected_path)
+        self._save_gui_preferences()
+        hello_imgui.get_runner_params().app_shall_exit = True
 
     def _center_text(self, text, color=None):
         """Draw centered text."""
@@ -689,12 +620,16 @@ class FileDialog:
 
             imgui.dummy(hello_imgui.em_to_vec2(0, 0.2))
 
+            # native dialogs, disabled where nothing can draw one (a linux
+            # box without zenity/kdialog); the typed field below always works
+            if not NATIVE_DIALOGS:
+                imgui.begin_disabled()
             self._center_widget(btn_w)
             if icon_button(
                 fa.ICON_FA_FILE_IMAGE,
                 "Open File(s)",
                 imgui.ImVec2(btn_w, btn_h),
-                "Select one or more image files"
+                "Select one or more image files" if NATIVE_DIALOGS else no_dialog_hint()
             ):
                 self._open_multi = pfd.open_file(
                     "Select files",
@@ -711,9 +646,33 @@ class FileDialog:
                 fa.ICON_FA_FOLDER_OPEN,
                 "Select Folder",
                 imgui.ImVec2(btn_w, btn_h),
-                "Select folder with image data"
+                "Select folder with image data" if NATIVE_DIALOGS else no_dialog_hint()
             ):
                 self._select_folder = pfd.select_folder("Select folder", self._default_dir)
+            if not NATIVE_DIALOGS:
+                imgui.end_disabled()
+
+            imgui.dummy(hello_imgui.em_to_vec2(0, 0.2))
+
+            # typed path: file or folder, opened on enter or the button
+            self._center_widget(btn_w)
+            imgui.set_next_item_width(btn_w - hello_imgui.em_size(3.2))
+            entered, self._typed_path = imgui.input_text_with_hint(
+                "##typed_path",
+                "or type a path",
+                self._typed_path,
+                imgui.InputTextFlags_.enter_returns_true,
+            )
+            if imgui.is_item_hovered():
+                wrapped_tooltip(
+                    f"A file or folder on {socket.gethostname()}, where this "
+                    "process runs. Enter opens it."
+                )
+            imgui.same_line()
+            if imgui.button("Open", imgui.ImVec2(hello_imgui.em_size(3), 0)) or entered:
+                self._open_typed_path()
+            if self._typed_status:
+                self._center_text(self._typed_status, COL_TEXT_DIM)
 
             imgui.dummy(hello_imgui.em_to_vec2(0, 0.4))
 

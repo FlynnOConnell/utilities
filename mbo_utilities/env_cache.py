@@ -73,6 +73,8 @@ def clear_cache() -> bool:
 
 
 _CUPY_DIST_VARIANTS = ("cupy-cuda13x", "cupy-cuda12x", "cupy-cuda11x", "cupy")
+# bump when the cached install-status shape changes; older caches are rebuilt
+_CACHE_SCHEMA = 2
 
 
 def _find_installed_dist(candidates: tuple[str, ...]) -> tuple[str, str] | None:
@@ -96,8 +98,8 @@ def get_env_fingerprint() -> str:
         from importlib.metadata import version, PackageNotFoundError
         # check specific packages directly (faster than iterating all)
         key_packages = [
-            "mbo-utilities", "torch", "lbm-suite2p-python",
-            "rastermap", "imgui-bundle", "fastplotlib", "pyqt6", "napari",
+            "mbo-utilities", "torch", "lbm-suite2p-python", "suite2p", "cellpose",
+            "masknmf", "rastermap", "imgui-bundle", "fastplotlib", "pyqt6", "napari",
         ]
         installed = []
         for pkg in key_packages:
@@ -130,6 +132,8 @@ def is_cache_valid(cache: dict | None, max_age_hours: int = 168) -> bool:
         from mbo_utilities import __version__
         # check mbo version
         if cache.get("mbo_version") != __version__:
+            return False
+        if cache.get("schema") != _CACHE_SCHEMA:
             return False
         # check env fingerprint (detects package installs/updates)
         cached_fingerprint = cache.get("env_fingerprint")
@@ -193,6 +197,7 @@ def build_full_cache() -> dict:
         "install_type": _detect_install_type(),
         "packages": _check_all_packages(),
         "env_fingerprint": get_env_fingerprint(),
+        "schema": _CACHE_SCHEMA,
     }
     return cache
 
@@ -212,34 +217,21 @@ def build_full_cache_with_install_status() -> dict:
         "install_type": _detect_install_type(),
         "packages": _check_all_packages(),
         "env_fingerprint": get_env_fingerprint(),
+        "schema": _CACHE_SCHEMA,
         "install_status": _serialize_install_status(status),
     }
     return cache
 
 
 def _serialize_install_status(status) -> dict:
-    """serialize InstallStatus to dict for caching."""
+    """InstallStatus as plain dicts; dataclass fields are the schema."""
+    from dataclasses import asdict
+
     return {
         "mbo_version": status.mbo_version,
         "python_version": status.python_version,
-        "cuda_info": {
-            "nvcc_version": status.cuda_info.nvcc_version,
-            "driver_version": status.cuda_info.driver_version,
-            "pytorch_cuda": status.cuda_info.pytorch_cuda,
-            "cupy_cuda": status.cuda_info.cupy_cuda,
-            "device_name": status.cuda_info.device_name,
-            "device_count": status.cuda_info.device_count,
-        },
-        "features": [
-            {
-                "name": f.name,
-                "status": f.status.value,
-                "version": f.version,
-                "message": f.message,
-                "gpu_ok": f.gpu_ok,
-            }
-            for f in status.features
-        ],
+        "cuda_info": asdict(status.cuda_info),
+        "features": [{**asdict(f), "status": f.status.value} for f in status.features],
     }
 
 
@@ -255,33 +247,22 @@ def get_cached_install_status():
 
 
 def _deserialize_install_status(data: dict):
-    """deserialize dict to InstallStatus object."""
-    from mbo_utilities.install import InstallStatus, FeatureStatus, Status, CudaInfo
+    """InstallStatus from the cached dicts; unknown keys are dropped."""
+    from dataclasses import fields
 
-    cuda_data = data.get("cuda_info", {})
-    cuda_info = CudaInfo(
-        nvcc_version=cuda_data.get("nvcc_version"),
-        driver_version=cuda_data.get("driver_version"),
-        pytorch_cuda=cuda_data.get("pytorch_cuda"),
-        cupy_cuda=cuda_data.get("cupy_cuda"),
-        device_name=cuda_data.get("device_name"),
-        device_count=cuda_data.get("device_count", 0),
-    )
+    from mbo_utilities.install import CudaInfo, FeatureStatus, InstallStatus, Status
 
-    features = []
-    for f in data.get("features", []):
-        features.append(FeatureStatus(
-            name=f["name"],
-            status=Status(f["status"]),
-            version=f.get("version", ""),
-            message=f.get("message", ""),
-            gpu_ok=f.get("gpu_ok"),
-        ))
+    def _pick(cls, d):
+        return {f.name: d[f.name] for f in fields(cls) if f.name in d}
 
+    features = [
+        FeatureStatus(**{**_pick(FeatureStatus, f), "status": Status(f["status"])})
+        for f in data.get("features", [])
+    ]
     return InstallStatus(
         mbo_version=data.get("mbo_version", ""),
         python_version=data.get("python_version", ""),
-        cuda_info=cuda_info,
+        cuda_info=CudaInfo(**_pick(CudaInfo, data.get("cuda_info", {}))),
         features=features,
     )
 

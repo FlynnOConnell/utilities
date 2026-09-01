@@ -481,6 +481,36 @@ def set_mem_monitor_interval(seconds: float) -> None:
     _set_option("mem_monitor_interval", max(0.25, float(seconds)))
 
 
+def get_mem_log_interval() -> float:
+    """Seconds between memory log lines (default 30.0).
+
+    Separate from the tick: a fast tick makes the high-memory warning useful
+    without putting that rate in the task log. 0 means log every tick.
+    """
+    try:
+        return max(0.0, float(_get_options().get("mem_log_interval", 30.0)))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def set_mem_log_interval(seconds: float) -> None:
+    """Persist the interval between memory log lines, in seconds."""
+    _set_option("mem_log_interval", max(0.0, float(seconds)))
+
+
+def get_mem_warn_pct() -> float:
+    """System-memory percent that triggers a WARNING (default 90.0, 0 = off)."""
+    try:
+        return min(100.0, max(0.0, float(_get_options().get("mem_warn_pct", 90.0))))
+    except (TypeError, ValueError):
+        return 90.0
+
+
+def set_mem_warn_pct(pct: float) -> None:
+    """Persist the high-memory warning threshold in percent (0 disables)."""
+    _set_option("mem_warn_pct", min(100.0, max(0.0, float(pct))))
+
+
 def get_compute_gpu() -> str:
     """Return the persisted compute-GPU policy ('auto', 'cpu', or '0'/'1'…).
 

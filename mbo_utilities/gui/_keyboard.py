@@ -6,12 +6,11 @@ This module contains keyboard shortcut handling for the PreviewDataWidget.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
-from imgui_bundle import imgui, portable_file_dialogs as pfd
+from imgui_bundle import imgui
 
-from mbo_utilities.preferences import get_last_dir
+from mbo_utilities.gui._dialogs import start_open_prompt
 import contextlib
 
 
@@ -24,32 +23,17 @@ def handle_keyboard_shortcuts(parent: Any):
     if io.want_text_input:
         return
 
-    # o: open file (no modifiers)
+    # o: open file (no modifiers); typed path with the native dialog as browse
     if not io.key_ctrl and not io.key_shift and imgui.is_key_pressed(imgui.Key.o, False):
         if parent._file_dialog is None and parent._folder_dialog is None:
             parent.logger.info("Shortcut: 'o' (Open File)")
-            fpath = parent.fpath[0] if isinstance(parent.fpath, list) else parent.fpath
-            if fpath and Path(fpath).exists():
-                start_dir = str(Path(fpath).parent)
-            else:
-                start_dir = str(get_last_dir("open_file") or Path.home())
-            parent._file_dialog = pfd.open_file(
-                "Select Data File(s)",
-                start_dir,
-                ["Image Files", "*.tif *.tiff *.zarr *.npy *.bin", "All Files", "*"],
-                pfd.opt.multiselect
-            )
+            start_open_prompt(parent, "file")
 
     # O (Shift + O): open folder (no ctrl)
     if not io.key_ctrl and io.key_shift and imgui.is_key_pressed(imgui.Key.o, False):
         if parent._folder_dialog is None and parent._file_dialog is None:
             parent.logger.info("Shortcut: 'Shift+O' (Open Folder)")
-            fpath = parent.fpath[0] if isinstance(parent.fpath, list) else parent.fpath
-            if fpath and Path(fpath).exists():
-                start_dir = str(Path(fpath).parent)
-            else:
-                start_dir = str(get_last_dir("open_folder") or Path.home())
-            parent._folder_dialog = pfd.select_folder("Select Data Folder", start_dir)
+            start_open_prompt(parent, "folder")
 
     # s: open save as popup (no modifiers)
     if not io.key_ctrl and not io.key_shift and imgui.is_key_pressed(imgui.Key.s, False):
