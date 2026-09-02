@@ -38,6 +38,16 @@ Image processing utilities for the [Miller Brain Observatory](https://github.com
 
 ## Installation
 
+### This fork, from git
+
+```bash
+pip install git+https://github.com/FlynnOConnell/utilities
+```
+
+Python 3.12 or 3.13. On Ubuntu see [docs/install_ubuntu.md](docs/install_ubuntu.md)
+for the apt packages (`python3-tk`, Qt's X11 libraries) and the uv form of the install.
+The sections below describe the upstream PyPI release.
+
 We recommend [uv](https://docs.astral.sh/uv/) for managing environments.
 
 Simply remove the `uv` from the below commands if using a different python package manager.
