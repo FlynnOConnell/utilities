@@ -1,0 +1,190 @@
+name: Ubuntu install check
+
+# What a new Ubuntu user gets from `pip install git+https://github.com/FlynnOConnell/utilities`,
+# on stock Ubuntu pythons, on a supported python, through pip and through uv,
+# on GitHub's Ubuntu runners and inside bare ubuntu:24.04 / ubuntu:26.04 containers.
+# Each job writes a result table to the run summary; ci/ubuntu_install_check.sh does the work.
+
+on:
+  push:
+    branches: [ubuntu-install-ci]
+  workflow_dispatch:
+    inputs:
+      util_ref:
+        description: utilities ref to install
+        default: main
+      masknmf_ref:
+        description: masknmf-toolbox ref to install first
+        default: imgui-traces
+
+env:
+  UTIL_REF: ${{ inputs.util_ref || 'main' }}
+  MASKNMF_REF: ${{ inputs.masknmf_ref || 'imgui-traces' }}
+  ARTIFACTS: ${{ github.workspace }}/artifacts
+  # Qt6 xcb plugin + a software Vulkan adapter for offscreen wgpu; names differ
+  # slightly between releases so the install step tolerates missing ones.
+  RUNTIME_LIBS: >-
+    mesa-vulkan-drivers libegl1 libgl1 libopengl0 libxkbcommon0 libxkbcommon-x11-0
+    libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0
+    libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libxcb-xfixes0
+    libdbus-1-3 libfontconfig1 libfreetype6 libglib2.0-0t64 libglib2.0-0 libx11-xcb1
+    libxrender1 libxi6 libsm6 libice6 xvfb ffmpeg
+
+jobs:
+  stock-python:
+    name: "${{ matrix.os }} · stock python3 · pip one-step"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv python3-pip
+      - run: bash ci/ubuntu_install_check.sh one_step /usr/bin/python3
+
+  pip-one-step:
+    name: "ubuntu-24.04 · python 3.12 · pip one-step"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: bash ci/ubuntu_install_check.sh one_step python
+
+  pip-two-step:
+    name: "${{ matrix.os }} · python ${{ matrix.python }} · pip two-step · ${{ matrix.ref }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, python: "3.12", ref: main,        pytest: true }
+          - { os: ubuntu-24.04, python: "3.13", ref: main,        pytest: true }
+          - { os: ubuntu-22.04, python: "3.12", ref: main,        pytest: false }
+          - { os: ubuntu-24.04, python: "3.12", ref: masknmf-api, pytest: true }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      UTIL_REF: ${{ matrix.ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          path: src
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: install
+        run: bash ci/ubuntu_install_check.sh two_step python
+      - name: Qt libs as shipped on the runner
+        if: always()
+        run: bash ci/ubuntu_install_check.sh qt_libs "$HOME/venv"
+      - name: runtime libs (Qt xcb, software Vulkan, ffmpeg)
+        if: always()
+        run: |
+          sudo apt-get update -qq
+          for p in $RUNTIME_LIBS; do sudo apt-get install -y -qq --no-install-recommends "$p" >/dev/null 2>&1 || echo "no package $p"; done
+      - name: smoke
+        if: always()
+        run: bash ci/ubuntu_install_check.sh smoke "$HOME/venv"
+      - name: pytest
+        if: always() && matrix.pytest
+        run: bash ci/ubuntu_install_check.sh pytest "$HOME/venv" "$GITHUB_WORKSPACE/src"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pip-two-step-${{ matrix.os }}-py${{ matrix.python }}-${{ matrix.ref }}
+          path: ${{ env.ARTIFACTS }}
+          if-no-files-found: ignore
+
+  uv-two-step:
+    name: "ubuntu-24.04 · uv python 3.12 · uv two-step"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: install
+        run: bash ci/ubuntu_install_check.sh uv_two_step 3.12
+      - name: Qt libs as shipped on the runner
+        if: always()
+        run: bash ci/ubuntu_install_check.sh qt_libs "$HOME/venv"
+      - name: runtime libs
+        if: always()
+        run: |
+          sudo apt-get update -qq
+          for p in $RUNTIME_LIBS; do sudo apt-get install -y -qq --no-install-recommends "$p" >/dev/null 2>&1 || echo "no package $p"; done
+      - name: smoke
+        if: always()
+        run: bash ci/ubuntu_install_check.sh smoke "$HOME/venv"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uv-two-step-ubuntu-24.04
+          path: ${{ env.ARTIFACTS }}
+          if-no-files-found: ignore
+
+  container-2404-minimal:
+    name: "bare ubuntu:24.04 container · stock 3.12.3, then uv 3.12"
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    timeout-minutes: 90
+    steps:
+      - run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ca-certificates curl git python3 python3-venv python3-pip binutils
+      - uses: actions/checkout@v4
+      - name: stock python3 one-step
+        run: bash ci/ubuntu_install_check.sh one_step /usr/bin/python3
+      - name: uv two-step
+        if: always()
+        run: bash ci/ubuntu_install_check.sh uv_two_step 3.12
+      - name: Qt libs in a bare container
+        if: always()
+        run: bash ci/ubuntu_install_check.sh qt_libs "$HOME/venv"
+      - name: runtime libs
+        if: always()
+        run: |
+          for p in $RUNTIME_LIBS; do DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "$p" >/dev/null 2>&1 || echo "no package $p"; done
+      - name: smoke
+        if: always()
+        run: bash ci/ubuntu_install_check.sh smoke "$HOME/venv"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: container-ubuntu-24.04
+          path: ${{ env.ARTIFACTS }}
+          if-no-files-found: ignore
+
+  container-2604:
+    name: "bare ubuntu:26.04 container · stock 3.14, then uv 3.12"
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    timeout-minutes: 90
+    steps:
+      - run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ca-certificates curl git python3 python3-venv python3-pip binutils
+      - uses: actions/checkout@v4
+      - name: stock python3 one-step
+        run: bash ci/ubuntu_install_check.sh one_step /usr/bin/python3
+      - name: uv two-step
+        if: always()
+        run: bash ci/ubuntu_install_check.sh uv_two_step 3.12
+      - name: runtime libs
+        if: always()
+        run: |
+          for p in $RUNTIME_LIBS; do DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "$p" >/dev/null 2>&1 || echo "no package $p"; done
+      - name: smoke
+        if: always()
+        run: bash ci/ubuntu_install_check.sh smoke "$HOME/venv"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: container-ubuntu-26.04
+          path: ${{ env.ARTIFACTS }}
+          if-no-files-found: ignore
