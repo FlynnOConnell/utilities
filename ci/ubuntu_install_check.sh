@@ -2,6 +2,7 @@
 # The install paths an Ubuntu user follows, and a smoke test of what they get.
 #
 #   ubuntu_install_check.sh one_step    PYTHON       fresh venv, `pip install git+utilities` alone
+#   ubuntu_install_check.sh one_cmd     pip|uv PY    both specs in a single install command
 #   ubuntu_install_check.sh two_step    PYTHON       masknmf from git first, then utilities
 #   ubuntu_install_check.sh uv_two_step PYVER        the same through `uv venv` / `uv pip`
 #   ubuntu_install_check.sh qt_libs     VENV         what Qt's xcb plugin cannot find on this box
@@ -115,7 +116,35 @@ scenario_one_step() {
   check "python -m venv" "$python" -m venv "$VENV"
   check "pip upgrade" "$VENV/bin/python" -m pip install -q --upgrade pip
   check "pip version" "$VENV/bin/python" -m pip --version
-  expect_fail "pip install $UTIL_URL" "$VENV/bin/python" -m pip install "$UTIL_URL"
+  if [ "${EXPECT:-fail}" = "pass" ]; then
+    check "pip install $UTIL_URL" "$VENV/bin/python" -m pip install "$UTIL_URL"
+  else
+    expect_fail "pip install $UTIL_URL" "$VENV/bin/python" -m pip install "$UTIL_URL"
+  fi
+  finish
+}
+
+# one command, both specs: pip resolves utilities' bare `masknmf[...]` against the URL given beside it
+scenario_one_cmd() {
+  local tool=$1 python=$2
+  heading "one command, two specs ($tool): install \"$MASKNMF_REQ\" $UTIL_URL"
+  rm -rf "$VENV"
+  if [ "$tool" = uv ]; then
+    if ! command -v uv >/dev/null 2>&1; then
+      curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+      export PATH="$HOME/.local/bin:$PATH"
+    fi
+    check "uv venv --python $python" uv venv --python "$python" "$VENV"
+    check "interpreter" pyinfo "$VENV/bin/python"
+    check "uv pip install both specs" uv pip install --python "$VENV/bin/python" "$MASKNMF_REQ" "$UTIL_URL"
+    uv pip install --python "$VENV/bin/python" pip >/dev/null 2>&1 || true
+  else
+    check "interpreter" pyinfo "$python"
+    check "python -m venv" "$python" -m venv "$VENV"
+    check "pip upgrade" "$VENV/bin/python" -m pip install -q --upgrade pip
+    check "pip install both specs" "$VENV/bin/python" -m pip install "$MASKNMF_REQ" "$UTIL_URL"
+  fi
+  check "disk after install" df -h "$HOME"
   finish
 }
 
@@ -341,10 +370,11 @@ scenario_pytest() {
 
 case "${1:-}" in
   one_step)    scenario_one_step "$2" ;;
+  one_cmd)     scenario_one_cmd "$2" "$3" ;;
   two_step)    scenario_two_step "$2" ;;
   uv_two_step) scenario_uv_two_step "$2" ;;
   qt_libs)     scenario_qt_libs "$2" ;;
   smoke)       scenario_smoke "$2" ;;
   pytest)      scenario_pytest "$2" "$3" ;;
-  *) echo "usage: $0 {one_step PYTHON|two_step PYTHON|uv_two_step PYVER|qt_libs VENV|smoke VENV|pytest VENV SRCDIR}"; exit 2 ;;
+  *) echo "usage: $0 {one_step PYTHON|one_cmd pip|uv PY|two_step PYTHON|uv_two_step PYVER|qt_libs VENV|smoke VENV|pytest VENV SRCDIR}"; exit 2 ;;
 esac
