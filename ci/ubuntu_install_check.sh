@@ -128,6 +128,28 @@ scenario_one_step() {
   finish
 }
 
+# uv one-step: `uv venv --python PYVER` (whatever interpreter uv picks) then `uv pip install git+utilities` alone
+scenario_uv_one_step() {
+  local pyver=$1
+  if ! command -v uv >/dev/null 2>&1; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+    export PATH="$HOME/.local/bin:$PATH"
+  fi
+  heading "uv one-step: uv venv --python $pyver; uv pip install ${UTIL_URL}"
+  check "uv version" uv --version
+  rm -rf "$VENV"
+  check "uv venv --python $pyver" uv venv --python "$pyver" "$VENV"
+  check "interpreter" pyinfo "$VENV/bin/python"
+  if [ "${EXPECT:-fail}" = "pass" ]; then
+    check "uv pip install $UTIL_URL" uv pip install --python "$VENV/bin/python" "$UTIL_URL"
+  else
+    expect_fail "uv pip install $UTIL_URL" uv pip install --python "$VENV/bin/python" "$UTIL_URL"
+  fi
+  uv pip install --python "$VENV/bin/python" pip >/dev/null 2>&1 || true
+  check "disk after install" df -h "$HOME"
+  finish
+}
+
 # one command, both specs: pip resolves utilities' bare `masknmf[...]` against the URL given beside it
 scenario_one_cmd() {
   local tool=$1 python=$2
@@ -378,6 +400,7 @@ scenario_pytest() {
 case "${1:-}" in
   one_step)    scenario_one_step "$2" ;;
   one_cmd)     scenario_one_cmd "$2" "$3" ;;
+  uv_one_step) scenario_uv_one_step "$2" ;;
   two_step)    scenario_two_step "$2" ;;
   uv_two_step) scenario_uv_two_step "$2" ;;
   qt_libs)     scenario_qt_libs "$2" ;;

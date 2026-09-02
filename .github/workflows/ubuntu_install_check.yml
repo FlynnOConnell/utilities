@@ -219,6 +219,57 @@ jobs:
           path: ${{ env.ARTIFACTS }}
           if-no-files-found: ignore
 
+  # Variant B of the fix additionally pins fastplotlib to the same ndwidget commit
+  # masknmf pins, so both git dependencies are direct requirements of utilities
+  # (uv rejects URL dependencies that only appear transitively).
+  proposed-fix-variants:
+    name: "proposed fix · ${{ matrix.ref }} · ${{ matrix.tool }} one-step · ${{ matrix.python }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { ref: ubuntu-install-ci-fixes,   tool: uv,  python: "3.12", pytest: false }
+          - { ref: ubuntu-install-ci-fixes-b, tool: uv,  python: "3.12", pytest: false }
+          - { ref: ubuntu-install-ci-fixes-b, tool: pip, python: stock,  pytest: true }
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      UTIL_REF: ${{ matrix.ref }}
+      EXPECT: pass
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          path: src
+      - uses: astral-sh/setup-uv@v5
+        if: matrix.tool == 'uv'
+      - name: install (one step)
+        run: |
+          if [ "${{ matrix.tool }}" = uv ]; then
+            bash ci/ubuntu_install_check.sh uv_one_step "${{ matrix.python }}"
+          else
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv python3-pip
+            bash ci/ubuntu_install_check.sh one_step /usr/bin/python3
+          fi
+      - name: runtime libs
+        if: always()
+        run: |
+          sudo apt-get update -qq
+          for p in $RUNTIME_LIBS; do sudo apt-get install -y -qq --no-install-recommends "$p" >/dev/null 2>&1 || echo "no package $p"; done
+      - name: smoke
+        if: always()
+        run: bash ci/ubuntu_install_check.sh smoke "$HOME/venv"
+      - name: pytest
+        if: always() && matrix.pytest
+        run: bash ci/ubuntu_install_check.sh pytest "$HOME/venv" "$GITHUB_WORKSPACE/src"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: proposed-fix-${{ matrix.ref }}-${{ matrix.tool }}-py${{ matrix.python }}
+          path: ${{ env.ARTIFACTS }}
+          if-no-files-found: ignore
+
   container-2404-minimal:
     name: "bare ubuntu:24.04 container · stock 3.12.3, then uv 3.12"
     runs-on: ubuntu-latest
