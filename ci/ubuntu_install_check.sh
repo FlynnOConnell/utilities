@@ -309,13 +309,25 @@ print("\n".join(bad))
 sys.exit(1 if bad else 0)
 EOF
   check "import GUI (offscreen): run_gui, manual_roi, file_dialog" env RENDERCANVAS_FORCE_OFFSCREEN=1 "$py" -c "import mbo_utilities.gui.run_gui; from mbo_utilities.gui.manual_roi import roi_widgets_available; import mbo_utilities.gui.widgets.file_dialog; print('roi widgets available:', roi_widgets_available())"
-  check "wgpu adapters (python -m wgpu.diagnostics)" "$py" -m wgpu.diagnostics
+  check "wgpu adapters" "$py" -c "
+import wgpu
+ads = wgpu.gpu.enumerate_adapters_sync()
+for a in ads:
+    print(getattr(a, 'summary', None) or a.info)
+assert ads, 'no wgpu adapter (install mesa-vulkan-drivers for a software one)'"
   check "fastplotlib offscreen render" env RENDERCANVAS_FORCE_OFFSCREEN=1 "$py" -c "import numpy as np, fastplotlib as fpl; fig = fpl.Figure(size=(300, 300)); fig[0, 0].add_image(np.random.rand(64, 64).astype('f4')); fig.show(); fig.canvas.draw(); print('offscreen render ok, adapter:', fig.canvas.__class__.__module__)"
-  check "DataVis offscreen show/draw/close" env RENDERCANVAS_FORCE_OFFSCREEN=1 "$py" -c "
+  check "viewer offscreen show/draw/close (DataVis where the ref has it, else MboNDViewer)" env RENDERCANVAS_FORCE_OFFSCREEN=1 "$py" -c "
 import numpy as np
-from mbo_utilities import DataVis
-v = DataVis(np.random.randint(0, 4000, (6, 1, 64, 64), dtype='int16'), size=(1000, 800))
-v.show(); v.iw.figure.canvas.draw(); v.iw.figure.canvas.draw(); v.close(); print('DataVis ok')"
+data = np.random.randint(0, 4000, (6, 1, 64, 64), dtype='int16')
+try:
+    from mbo_utilities import DataVis
+except ImportError:
+    from mbo_utilities.gui._ndviewer import MboNDViewer
+    iw = MboNDViewer(data=data[:, 0], figure_kwargs={'size': (1000, 800)})
+    iw.show(); iw.figure.canvas.draw(); iw.close(); print('MboNDViewer ok (no DataVis in this ref)')
+else:
+    v = DataVis(data, size=(1000, 800))
+    v.show(); v.iw.figure.canvas.draw(); v.iw.figure.canvas.draw(); v.close(); print('DataVis ok')"
   check "PyQt6 QApplication offscreen" env QT_QPA_PLATFORM=offscreen "$py" -c "from PyQt6.QtWidgets import QApplication; QApplication([]); print('qt ok')"
   check "rendercanvas.pyqt6 imports (the Linux desktop canvas)" env QT_QPA_PLATFORM=offscreen "$py" -c "from rendercanvas.pyqt6 import RenderCanvas; print(RenderCanvas)"
 

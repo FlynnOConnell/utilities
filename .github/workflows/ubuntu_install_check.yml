@@ -162,28 +162,29 @@ jobs:
           path: ${{ env.ARTIFACTS }}
           if-no-files-found: ignore
 
-  # The proposed pyproject fix (branch ubuntu-install-ci-fixes: masknmf as a git URL
-  # dependency, python floor 3.12): a plain one-step pip install must now succeed,
-  # including on Ubuntu 24.04's stock python 3.12.3.
+  # The proposed pyproject fix (branch ubuntu-install-ci-fixes-b: masknmf AND fastplotlib
+  # as git URL dependencies, the latter on the same commit masknmf pins; python floor
+  # 3.12; the dangling pml_utilities gitlink removed): a plain one-step pip install must
+  # succeed, including on Ubuntu 24.04's stock python 3.12.3.
   proposed-fix:
-    name: "proposed fix · ${{ matrix.os }} · python ${{ matrix.python }} · pip one-step"
+    name: "proposed fix B · ${{ matrix.os }} · python ${{ matrix.python }} · pip one-step"
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: ubuntu-24.04, python: stock,  pytest: true }
-          - { os: ubuntu-24.04, python: "3.13", pytest: false }
+          - { os: ubuntu-24.04, python: "3.13", pytest: true }
           - { os: ubuntu-22.04, python: "3.12", pytest: false }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:
-      UTIL_REF: ubuntu-install-ci-fixes
+      UTIL_REF: ubuntu-install-ci-fixes-b
       EXPECT: pass
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          ref: ubuntu-install-ci-fixes
+          ref: ubuntu-install-ci-fixes-b
           path: src
       - uses: actions/setup-python@v5
         if: matrix.python != 'stock'
@@ -220,18 +221,17 @@ jobs:
           path: ${{ env.ARTIFACTS }}
           if-no-files-found: ignore
 
-  # Variant B of the fix additionally pins fastplotlib to the same ndwidget commit
-  # masknmf pins, so both git dependencies are direct requirements of utilities
-  # (uv rejects URL dependencies that only appear transitively).
+  # Variant A (masknmf URL only, fastplotlib left as a name) is kept to document why it
+  # fails; uv one-step on both variants shows how uv treats the transitive git URLs.
   proposed-fix-variants:
     name: "proposed fix · ${{ matrix.ref }} · ${{ matrix.tool }} one-step · ${{ matrix.python }}"
     strategy:
       fail-fast: false
       matrix:
         include:
+          - { ref: ubuntu-install-ci-fixes,   tool: pip, python: stock,  pytest: false }
           - { ref: ubuntu-install-ci-fixes,   tool: uv,  python: "3.12", pytest: false }
           - { ref: ubuntu-install-ci-fixes-b, tool: uv,  python: "3.12", pytest: false }
-          - { ref: ubuntu-install-ci-fixes-b, tool: pip, python: stock,  pytest: true }
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
