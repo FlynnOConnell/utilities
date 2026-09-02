@@ -223,13 +223,17 @@ def draw_process_status_indicator(parent: Any, in_menu_bar: bool = False):
     else:
         clicked = imgui.button(status_text + "##process_status")
     if clicked:
-        parent._show_process_console = True
+        # the console is a plain window now, so the status button toggles it
+        if getattr(parent, "_process_console_open", False):
+            parent._process_console_open = False
+        else:
+            parent._show_process_console = True
 
     imgui.pop_style_color(4)  # button, text, hovered, active
 
     if imgui.is_item_hovered():
         imgui.set_mouse_cursor(imgui.MouseCursor_.hand)
-        imgui.set_tooltip("Click to view process console")
+        imgui.set_tooltip("Toggle the process console (tasks + live CPU / RAM / GPU)")
 
     # 2. Metadata / help / keybinds buttons, all in the same dark grey with
     # their hotkeys greyed out beside them. Help and Keybinds are one button

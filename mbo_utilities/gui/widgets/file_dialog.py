@@ -42,6 +42,9 @@ COL_OK = imgui.ImVec4(0.4, 1.0, 0.4, 1.0)
 COL_WARN = imgui.ImVec4(1.0, 0.8, 0.2, 1.0)
 COL_ERR = imgui.ImVec4(1.0, 0.4, 0.4, 1.0)
 COL_NA = imgui.ImVec4(0.5, 0.5, 0.5, 1.0)
+# the dependency popup sits below the window and the formats card in tone
+COL_BG_POPUP = imgui.ImVec4(0.06, 0.06, 0.07, 1.0)
+COL_ROW_ALT = imgui.ImVec4(0.10, 0.10, 0.11, 1.0)
 
 # launcher table rows, in order; the CLI prints every feature
 _DEP_ROWS = ("PyTorch", "LBM-Suite2p-Python", "Cellpose", "MaskNMF", "CuPy", "Rastermap", "Napari")
@@ -477,28 +480,39 @@ class FileDialog:
         if self._show_deps_popup:
             imgui.open_popup("##deps_popup")
             self._show_deps_popup = False
-        if not imgui.begin_popup("##deps_popup", imgui.WindowFlags_.always_auto_resize):
-            return
-        em = hello_imgui.em_size
+        # darker than the formats card so the two surfaces read as different
+        imgui.push_style_color(imgui.Col_.popup_bg, COL_BG_POPUP)
+        imgui.push_style_color(imgui.Col_.border, COL_ACCENT)
+        imgui.push_style_color(imgui.Col_.table_row_bg_alt, COL_ROW_ALT)
+        imgui.push_style_var(imgui.StyleVar_.window_border_size, 1.0)
+        imgui.push_style_var(imgui.StyleVar_.window_padding, hello_imgui.em_to_vec2(1.0, 0.8))
+        try:
+            if imgui.begin_popup("##deps_popup", imgui.WindowFlags_.always_auto_resize):
+                self._draw_dependency_table(rows)
+                imgui.end_popup()
+        finally:
+            imgui.pop_style_var(2)
+            imgui.pop_style_color(3)
+
+    def _draw_dependency_table(self, rows: list):
+        """Header and table; the table sizes itself so nothing is clipped."""
         imgui.text_colored(COL_ACCENT, "Dependencies")
         gpu = gpu_summary(self._install_status.cuda_info)
         imgui.text_colored(COL_TEXT_DIM, f"{fa.ICON_FA_MICROCHIP}  {gpu}")
-        imgui.dummy(hello_imgui.em_to_vec2(0, 0.2))
-        widths = (em(10), em(5.5), em(3.6), em(1.8))
+        imgui.dummy(hello_imgui.em_to_vec2(0, 0.3))
         flags = (
             imgui.TableFlags_.borders_inner_v
             | imgui.TableFlags_.row_bg
+            | imgui.TableFlags_.sizing_fixed_fit
             | imgui.TableFlags_.no_host_extend_x
         )
-        if imgui.begin_table("##deps", 4, flags, imgui.ImVec2(sum(widths), 0)):
-            for title, w in zip(("Package", "Version", "Device", ""), widths):
-                imgui.table_setup_column(title, imgui.TableColumnFlags_.width_fixed, w)
+        if imgui.begin_table("##deps", 4, flags):
+            for title in ("Package", "Version", "Device", ""):
+                imgui.table_setup_column(title, imgui.TableColumnFlags_.width_fixed)
             imgui.table_headers_row()
             for f in rows:
                 self._draw_dependency_row(f)
             imgui.end_table()
-        imgui.dummy(hello_imgui.em_to_vec2(0, 0.2))
-        imgui.end_popup()
 
     def _draw_dependency_row(self, f):
         """One feature: the row carries the tooltip, the last cell copies the fix."""

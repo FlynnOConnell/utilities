@@ -20,20 +20,41 @@ mbo /path/to/data      # opens specific file
 mbo /path --metadata   # metadata only
 ```
 
-From Python:
+From Python, the one-call form builds and shows the viewer for wherever it is running:
 
 ```python
-from mbo_utilities.gui import run_gui
+import mbo_utilities as mbo
 
-run_gui("/path/to/data")
+mbo.run_gui("/path/to/data")
 
 # or from a numpy array
 import numpy as np
 data = np.random.rand(100, 512, 512)
-run_gui(data)
+mbo.run_gui(data)
 ```
 
-If no input is provided and Qt is available, a file dialog opens automatically.
+In a terminal or script this opens a window and blocks until it closes. With no input it opens the launcher, where you pick a file or folder, or type a path.
+
+### Notebooks
+
+The same viewer is a class, built the way masknmf's viewers are: construct it with the data, `show()` it, `close()` it. Construct and show in the same cell; the canvas is the cell's output and the kernel drives it, so do not call `fpl.loop.run()`.
+
+```python
+from mbo_utilities import DataVis
+
+vis = DataVis("/path/to/data", roi=1)   # widget="manualroi" adds the ROI tools
+vis.show()
+```
+
+```python
+vis.iw.cmap = "viridis"   # the NDViewer underneath: sliders, cmap, window functions
+vis.widget                # the side panel
+vis.close()
+```
+
+`run_gui` does the same and returns the `DataVis`, already displayed. It needs a path in a notebook: the launcher is a desktop window. A `.mesc` needs `unit=` when it holds more than one measurement unit, since the picker is a desktop dialog too. Pass `size=(w, h)` to change the canvas size; the notebook default of 1400x900 leaves room for the side panel and top strip.
+
+The notebook canvas streams frames over the kernel, so this is also how the viewer runs on a remote server or JupyterHub. Native file dialogs open on the machine the kernel runs on, so every place the GUI asks for a path (File > Open, `o`, `Shift+O`, the launcher, Save As) takes a typed path first and offers the native dialog as a browse shortcut, disabled when the machine cannot draw one.
 
 (gui-open-data)=
 ## Opening Data

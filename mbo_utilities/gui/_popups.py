@@ -13,7 +13,7 @@ from typing import Any
 
 from imgui_bundle import imgui, imgui_ctx, ImVec2
 
-from mbo_utilities.gui._imgui_helpers import PopupAutoSize, begin_popup_size
+from mbo_utilities.gui._imgui_helpers import begin_popup_size
 from mbo_utilities.gui._metadata import draw_metadata_inspector
 from mbo_utilities.gui._options_popup import (
     _ensure_gpu_list,
@@ -401,9 +401,17 @@ def draw_tools_popups(parent: Any):
 
 
 def draw_process_console_popup(parent: Any):
-    """Draw popup showing active tasks and background processes."""
+    """Draw the Process Console: active tasks, background processes, System.
+
+    A plain window rather than a modal, so it can be left open (or collapsed
+    to just its title bar) beside the viewer without dimming it — the System
+    meters are worth watching while a job runs. Position, size and collapsed
+    state persist through imgui's ini.
+    """
     if not hasattr(parent, "_show_process_console"):
         parent._show_process_console = False
+    if not hasattr(parent, "_process_console_open"):
+        parent._process_console_open = False
     if not hasattr(parent, "_process_console_size"):
         parent._process_console_size = ImVec2(500, 350)
     if not hasattr(parent, "_process_console_content_h"):
@@ -414,22 +422,38 @@ def draw_process_console_popup(parent: Any):
         parent._proc_log_fixed_h = 0.0
     if not hasattr(parent, "_proc_log_count"):
         parent._proc_log_count = 0
-    if not hasattr(parent, "_process_console_sizer"):
-        parent._process_console_sizer = PopupAutoSize(
-            "Process Console", auto_resize=False
-        )
 
+    # open request from the menu-bar status button
     if parent._show_process_console:
-        parent._process_console_sizer.before_open()
-        imgui.open_popup("Process Console")
+        parent._process_console_open = True
+        parent._process_console_focus = True
         parent._show_process_console = False
+    if not parent._process_console_open:
+        return
 
-    work = imgui.get_main_viewport().work_size
+    viewport = imgui.get_main_viewport()
+    work = viewport.work_size
     max_w = max(400.0, work.x - 40.0)
     max_h = max(300.0, work.y - 40.0)
 
+    if getattr(parent, "_process_console_focus", False):
+        # a second click on the status button raises it instead of doing
+        # nothing when it's already open behind the viewer
+        imgui.set_next_window_focus()
+        parent._process_console_focus = False
+
+    imgui.set_next_window_pos(
+        ImVec2(
+            viewport.work_pos.x
+            + max(0.0, (work.x - parent._process_console_size.x) * 0.5),
+            viewport.work_pos.y + 40.0,
+        ),
+        imgui.Cond_.first_use_ever,
+    )
     imgui.set_next_window_size(parent._process_console_size, imgui.Cond_.appearing)
-    imgui.set_next_window_size_constraints(imgui.ImVec2(350, 200), imgui.ImVec2(max_w, max_h))
+    # low minimum height on purpose: the window can be shrunk down to just
+    # the System meters and parked next to the viewer.
+    imgui.set_next_window_size_constraints(imgui.ImVec2(340, 120), imgui.ImVec2(max_w, max_h))
 
     # grow to fit content (requested last frame); width preserved, height bounded
     if parent._process_console_grow_to is not None:
@@ -439,17 +463,18 @@ def draw_process_console_popup(parent: Any):
         )
         parent._process_console_grow_to = None
 
-    # use resizable modal (no auto_resize flag)
-    opened, visible = imgui.begin_popup_modal(
+    # a normal window: no dimmed background, collapsible, and the viewer
+    # stays clickable underneath.
+    expanded, still_open = imgui.begin(
         "Process Console",
         p_open=True,
         flags=imgui.WindowFlags_.none,
     )
+    parent._process_console_open = still_open
 
-    if opened:
-        if not visible:
-            imgui.close_current_popup()
-        else:
+    try:
+        # collapsed -> title bar only; skip the body (and its process polling)
+        if expanded and still_open:
             # save current size for next time
             parent._process_console_size = imgui.get_window_size()
 
@@ -592,15 +617,15 @@ def draw_process_console_popup(parent: Any):
             total_w = close_w + (dismiss_w + spacing if finished else 0.0)
             imgui.set_cursor_pos_x((imgui.get_window_width() - total_w) * 0.5)
             if imgui.button("Close", ImVec2(close_w, 0)):
-                imgui.close_current_popup()
+                parent._process_console_open = False
             if finished:
                 imgui.same_line()
                 if imgui.button(f"Dismiss finished ({len(finished)})", ImVec2(dismiss_w, 0)):
                     for p in finished:
                         pm._processes.pop(p.pid, None)
                     pm._save()
-
-        imgui.end_popup()
+    finally:
+        imgui.end()
 
 
 def _draw_process_entry(pm: Any, proc: Any, log_fill_h: float = 0.0) -> float:
