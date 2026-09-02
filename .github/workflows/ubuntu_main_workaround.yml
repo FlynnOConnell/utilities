@@ -1,0 +1,64 @@
+name: Ubuntu install, main as-is, three-spec command
+
+# No pyproject change: the user names all three git trees in one install command.
+# Dispatched by hand; it does not run on push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      util_ref:
+        description: utilities ref to install
+        default: main
+
+env:
+  UTIL_REF: ${{ inputs.util_ref || 'main' }}
+  ARTIFACTS: ${{ github.workspace }}/artifacts
+  RUNTIME_LIBS: >-
+    mesa-vulkan-drivers libegl1 libgl1 libopengl0 libxkbcommon0 libxkbcommon-x11-0
+    libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0
+    libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libxcb-xfixes0
+    libdbus-1-3 libfontconfig1 libfreetype6 libglib2.0-0t64 libglib2.0-0 libx11-xcb1
+    libxrender1 libxi6 libsm6 libice6 xvfb ffmpeg python3-tk
+
+jobs:
+  three-spec:
+    name: "ubuntu-24.04 · ${{ matrix.tool }} python ${{ matrix.python }} · fastplotlib + masknmf + utilities in one command"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { tool: pip, python: "3.12" }
+          - { tool: uv,  python: "3.13" }
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.UTIL_REF }}
+          path: src
+      - uses: actions/setup-python@v5
+        if: matrix.tool == 'pip'
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v5
+        if: matrix.tool == 'uv'
+      - name: install
+        run: bash ci/ubuntu_install_check.sh one_cmd ${{ matrix.tool }} ${{ matrix.tool == 'pip' && 'python' || matrix.python }} fpl
+      - name: runtime libs
+        if: always()
+        run: |
+          sudo apt-get update -qq
+          for p in $RUNTIME_LIBS; do sudo apt-get install -y -qq --no-install-recommends "$p" >/dev/null 2>&1 || echo "no package $p"; done
+      - name: smoke
+        if: always()
+        run: bash ci/ubuntu_install_check.sh smoke "$HOME/venv"
+      - name: pytest
+        if: always() && matrix.tool == 'pip'
+        run: bash ci/ubuntu_install_check.sh pytest "$HOME/venv" "$GITHUB_WORKSPACE/src"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: three-spec-${{ matrix.tool }}-py${{ matrix.python }}
+          path: ${{ env.ARTIFACTS }}
+          if-no-files-found: ignore

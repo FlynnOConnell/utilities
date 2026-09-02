@@ -8,6 +8,7 @@ name: Ubuntu install check
 on:
   push:
     branches: [ubuntu-install-ci]
+    paths-ignore: [.github/workflows/ubuntu_main_workaround.yml]
   workflow_dispatch:
     inputs:
       util_ref:
@@ -28,7 +29,7 @@ env:
     libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0
     libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libxcb-xfixes0
     libdbus-1-3 libfontconfig1 libfreetype6 libglib2.0-0t64 libglib2.0-0 libx11-xcb1
-    libxrender1 libxi6 libsm6 libice6 xvfb ffmpeg
+    libxrender1 libxi6 libsm6 libice6 xvfb ffmpeg python3-tk
 
 jobs:
   stock-python:

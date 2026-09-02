@@ -20,6 +20,10 @@ UTIL_REF="${UTIL_REF:-main}"
 UTIL_URL="git+https://github.com/FlynnOConnell/utilities@${UTIL_REF}"
 MASKNMF_REF="${MASKNMF_REF:-imgui-traces}"
 MASKNMF_REQ="masknmf[multisession,classification] @ git+https://github.com/apasarkar/masknmf-toolbox.git@${MASKNMF_REF}"
+# the ndwidget commit masknmf pins; naming it explicitly is what lets pip/uv satisfy
+# utilities' bare `fastplotlib[imgui]` with the git tree instead of the PyPI wheel
+FPL_REF="${FPL_REF:-b2132e3d11b9e2bd641e0bbfc0bbee3d413d1d88}"
+FPL_REQ="fastplotlib[imgui,notebook] @ git+https://github.com/fastplotlib/fastplotlib@${FPL_REF}"
 VENV="${VENV:-$HOME/venv}"
 ARTIFACTS="${ARTIFACTS:-$HOME/artifacts}"
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
@@ -152,8 +156,14 @@ scenario_uv_one_step() {
 
 # one command, both specs: pip resolves utilities' bare `masknmf[...]` against the URL given beside it
 scenario_one_cmd() {
-  local tool=$1 python=$2
-  heading "one command, two specs ($tool): install \"$MASKNMF_REQ\" $UTIL_URL"
+  local tool=$1 python=$2 with_fpl=${3:-}
+  local specs=("$MASKNMF_REQ" "$UTIL_URL")
+  if [ "$with_fpl" = fpl ]; then
+    specs=("$FPL_REQ" "$MASKNMF_REQ" "$UTIL_URL")
+    heading "one command, three specs ($tool): install \"$FPL_REQ\" \"$MASKNMF_REQ\" $UTIL_URL"
+  else
+    heading "one command, two specs ($tool): install \"$MASKNMF_REQ\" $UTIL_URL"
+  fi
   rm -rf "$VENV"
   if [ "$tool" = uv ]; then
     if ! command -v uv >/dev/null 2>&1; then
@@ -162,13 +172,13 @@ scenario_one_cmd() {
     fi
     check "uv venv --python $python" uv venv --python "$python" "$VENV"
     check "interpreter" pyinfo "$VENV/bin/python"
-    check "uv pip install both specs" uv pip install --python "$VENV/bin/python" "$MASKNMF_REQ" "$UTIL_URL"
+    check "uv pip install ${#specs[@]} specs" uv pip install --python "$VENV/bin/python" "${specs[@]}"
     uv pip install --python "$VENV/bin/python" pip >/dev/null 2>&1 || true
   else
     check "interpreter" pyinfo "$python"
     check "python -m venv" "$python" -m venv "$VENV"
     check "pip upgrade" "$VENV/bin/python" -m pip install -q --upgrade pip
-    check "pip install both specs" "$VENV/bin/python" -m pip install "$MASKNMF_REQ" "$UTIL_URL"
+    check "pip install ${#specs[@]} specs" "$VENV/bin/python" -m pip install "${specs[@]}"
   fi
   check "disk after install" df -h "$HOME"
   finish
@@ -399,7 +409,7 @@ scenario_pytest() {
 
 case "${1:-}" in
   one_step)    scenario_one_step "$2" ;;
-  one_cmd)     scenario_one_cmd "$2" "$3" ;;
+  one_cmd)     scenario_one_cmd "$2" "$3" "${4:-}" ;;
   uv_one_step) scenario_uv_one_step "$2" ;;
   two_step)    scenario_two_step "$2" ;;
   uv_two_step) scenario_uv_two_step "$2" ;;
