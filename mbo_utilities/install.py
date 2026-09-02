@@ -534,7 +534,7 @@ def check_installation(callback: type[object] | None = None) -> InstallStatus:
             "masknmf",
             "masknmf",
             "MaskNMF",
-            "pip install git+https://github.com/apasarkar/masknmf-toolbox.git",
+            "pip install 'masknmf[multisession,classification] @ git+https://github.com/apasarkar/masknmf-toolbox.git@imgui-traces'",
         )
     )
 
