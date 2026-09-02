@@ -234,14 +234,20 @@ _qt_plugin_missing_libs() {
   echo "every shared library Qt's xcb plugin needs is present"
 }
 
+# informational: what a machine without the desktop apt packages is missing. Recorded,
+# never counted as a failure — the runtime-libs step that follows is the remedy.
 scenario_qt_libs() {
   local venv=$1 py="$1/bin/python"
-  heading "Qt runtime libs on this machine (before any extra apt packages)"
+  heading "Qt runtime libs on this machine (before any extra apt packages; informational)"
   check "system libs Qt xcb plugin links against" _qt_plugin_missing_libs "$py"
   check "PyQt6 QApplication, QT_QPA_PLATFORM=offscreen" env QT_QPA_PLATFORM=offscreen "$py" -c "from PyQt6.QtWidgets import QApplication; QApplication([]); print('offscreen QApplication ok')"
   if command -v xvfb-run >/dev/null 2>&1; then
     check "PyQt6 QApplication on xcb under Xvfb" xvfb-run -a env QT_QPA_PLATFORM=xcb "$py" -c "from PyQt6.QtWidgets import QApplication; QApplication([]); print('xcb QApplication ok')"
   fi
+  if [ ${#FAILED[@]} -gt 0 ]; then
+    echo "(missing on this machine before apt: ${FAILED[*]}; the runtime libs step installs them)" | tee -a "$SUMMARY"
+  fi
+  FAILED=()
   finish
 }
 
