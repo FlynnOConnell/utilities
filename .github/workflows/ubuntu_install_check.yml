@@ -281,11 +281,14 @@ jobs:
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ca-certificates curl git python3 python3-venv python3-pip binutils
       - uses: actions/checkout@v4
-      - name: stock python3 one-step
+      - name: stock python3 one-step, main
         run: bash ci/ubuntu_install_check.sh one_step /usr/bin/python3
-      - name: uv two-step
+      - name: stock python3 one-step, proposed fix B
         if: always()
-        run: bash ci/ubuntu_install_check.sh uv_two_step 3.12
+        env:
+          UTIL_REF: ubuntu-install-ci-fixes-b
+          EXPECT: pass
+        run: bash ci/ubuntu_install_check.sh one_step /usr/bin/python3
       - name: Qt libs in a bare container
         if: always()
         run: bash ci/ubuntu_install_check.sh qt_libs "$HOME/venv"
@@ -313,11 +316,23 @@ jobs:
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ca-certificates curl git python3 python3-venv python3-pip binutils
       - uses: actions/checkout@v4
-      - name: stock python3 one-step
+      - name: stock python3 (3.14) one-step, main
         run: bash ci/ubuntu_install_check.sh one_step /usr/bin/python3
-      - name: uv two-step
+      - name: stock python3 (3.14) one-step, proposed fix B (still <3.14 because of masknmf)
         if: always()
-        run: bash ci/ubuntu_install_check.sh uv_two_step 3.12
+        env:
+          UTIL_REF: ubuntu-install-ci-fixes-b
+        run: bash ci/ubuntu_install_check.sh one_step /usr/bin/python3
+      - name: uv-managed python 3.13, pip one-step, proposed fix B
+        if: always()
+        env:
+          UTIL_REF: ubuntu-install-ci-fixes-b
+          EXPECT: pass
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+          export PATH="$HOME/.local/bin:$PATH"
+          uv python install 3.13
+          bash ci/ubuntu_install_check.sh one_step "$(uv python find 3.13)"
       - name: runtime libs
         if: always()
         run: |
