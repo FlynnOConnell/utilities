@@ -520,8 +520,20 @@ def _create_image_widget(data_array, widget: bool = True, figure_kwargs_override
 
     try:
         from rendercanvas.pyqt6 import RenderCanvas
-    except (ImportError, RuntimeError): # RuntimeError if qt is already selected
+    except (ImportError, RuntimeError) as exc:  # RuntimeError if qt is already selected
         RenderCanvas = None
+        if isinstance(exc, ImportError) and ".so" in str(exc):
+            # PyQt6 is installed but a system library is not (server or minimal
+            # Ubuntu): say which apt packages give Qt what it links against
+            import warnings
+
+            warnings.warn(
+                f"PyQt6 cannot load ({exc}). On Ubuntu: sudo apt install libegl1 libgl1 "
+                "libglib2.0-0t64 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 "
+                "libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 "
+                "libxcb-xkb1 libdbus-1-3 libfontconfig1",
+                stacklevel=2,
+            )
 
     # Clamp the default figure size to the screen's available work area
     # so launches on shorter monitors (laptops, 1080p with taskbar) don't
