@@ -529,14 +529,21 @@ def check_installation(callback: type[object] | None = None) -> InstallStatus:
     status.features.append(_check_pkg_version("cellpose", "cellpose", "Cellpose", _proc_hint))
 
     _update(0.8, "Checking MaskNMF...")
-    status.features.append(
-        _check_pkg_version(
-            "masknmf",
-            "masknmf",
-            "MaskNMF",
-            "pip install 'masknmf[multisession,classification] @ git+https://github.com/apasarkar/masknmf-toolbox.git@imgui-traces'",
-        )
+    masknmf_status = _check_pkg_version(
+        "masknmf",
+        "masknmf",
+        "MaskNMF",
+        "pip install 'masknmf[multisession,classification] @ git+https://github.com/apasarkar/masknmf-toolbox.git@imgui-traces'",
     )
+    if masknmf_status.status is Status.OK and importlib.util.find_spec("tkinter") is None:
+        # roicat (masknmf[multisession]) imports tkinter at import time, and the
+        # system python on Ubuntu ships without it
+        masknmf_status.status = Status.WARN
+        masknmf_status.message = (
+            "installed, but this python has no tkinter (roicat needs it): "
+            "sudo apt install python3-tk"
+        )
+    status.features.append(masknmf_status)
 
     _update(0.85, "Checking Rastermap...")
     status.features.append(_check_rastermap())
