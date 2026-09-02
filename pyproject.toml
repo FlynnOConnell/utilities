@@ -39,7 +39,7 @@ dependencies = [
 	"pygfx>=0.15.2",
 	"llvmlite>=0.43.0",
 	"numba>=0.60.0",
-	"fastplotlib[imgui]>=0.6.1",
+	"fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib@b2132e3d11b9e2bd641e0bbfc0bbee3d413d1d88",
 	"masknmf[multisession, classification] @ git+https://github.com/apasarkar/masknmf-toolbox.git@imgui-traces",
 	"rendercanvas>=2.4.2",
 	"imgui-bundle>=1.92.801,<1.92.900",
