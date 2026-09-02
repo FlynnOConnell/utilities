@@ -206,8 +206,8 @@ exclude_lines = [
 # Consumers that just want what this repo uses can copy these two lines into
 # their own [tool.uv.sources]; pip users install them before this package.
 pins = [
-	"fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@ff32546722af09081833640c4e7957f7d3e648aa",
-	"masknmf[multisession] @ git+https://github.com/apasarkar/masknmf-toolbox.git@curation-viz",
+	"fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib@b2132e3d11b9e2bd641e0bbfc0bbee3d413d1d88",
+	"masknmf[multisession, classification] @ git+https://github.com/apasarkar/masknmf-toolbox.git@imgui-traces",
 ]
 # mirror the heavy optional-dependencies so the repo dev env (default-groups)
 # resolves the full stack for `uv run mbo`. pip users get these via extras.
@@ -254,7 +254,7 @@ dev = [
 # resolvable only under uv thanks to tool.uv.override-dependencies (see the
 # optional-dependencies comment); in default-groups so `uv sync` gets it.
 suite2p = [
-    "lbm-suite2p-python[rastermap]>=3.3.2",
+    "lbm-suite2p-python[rastermap]>=3.3.2 ; python_full_version >= '3.12.7'",
     "suite2p>=1.1.0",
     "rastermap>=0.9",
 ]
