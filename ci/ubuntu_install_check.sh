@@ -25,6 +25,9 @@ ARTIFACTS="${ARTIFACTS:-$HOME/artifacts}"
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 WORK="${WORK:-$HOME/work}"
 mkdir -p "$ARTIFACTS" "$WORK"
+# never run from the checkout: `python -c` puts the cwd on sys.path and the repo's
+# own mbo_utilities/ would shadow the installed package
+cd "$WORK"
 
 export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 UV_NO_CACHE=1 PYTHONUNBUFFERED=1
 export MPLBACKEND=Agg
@@ -64,7 +67,8 @@ check() {
     _record PASS "$name" "$dt" "$(tail -n 1 "$log" | cut -c1-160)"
   else
     FAILED+=("$name")
-    _record FAIL "$name" "$dt" "rc=$rc: $(grep -iE 'error|Traceback|not found|No matching|requires' "$log" | tail -n 2 | tr '\n' ' ' | cut -c1-220)"
+    _record FAIL "$name" "$dt" "rc=$rc: $(grep -iE 'error|Traceback|not found|No matching|requires|because|conflict' "$log" | tail -n 3 | tr '\n' ' ' | cut -c1-300)"
+    { echo; echo "<details><summary>FAIL: $name (last 30 lines)</summary>"; echo; echo '```'; tail -n 30 "$log" | cut -c1-300; echo '```'; echo '</details>'; } >> "$SUMMARY"
   fi
   rm -f "$log"
   return 0
@@ -342,6 +346,9 @@ scenario_pytest() {
   check "install pytest" "$py" -m pip install -q pytest pytest-timeout
   local log="$ARTIFACTS/pytest.log"
   local t0=$SECONDS rc=0
+  # the tests import `tests.*`, so the source root must be the cwd; move its
+  # mbo_utilities/ aside so the installed package is the one under test
+  [ -d "$src/mbo_utilities" ] && mv "$src/mbo_utilities" "$src/_mbo_utilities_source"
   (
     cd "$src" && RENDERCANVAS_FORCE_OFFSCREEN=1 QT_QPA_PLATFORM=offscreen \
       timeout 3000 "$py" -m pytest tests -q -rfEs --timeout=900 -p no:cacheprovider \
