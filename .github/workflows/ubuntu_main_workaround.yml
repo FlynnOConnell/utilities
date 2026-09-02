@@ -1,9 +1,12 @@
 name: Ubuntu install, main as-is, three-spec command
 
 # No pyproject change: the user names all three git trees in one install command.
-# Dispatched by hand; it does not run on push.
+# Runs when this file changes (dispatch needs the default branch).
 
 on:
+  push:
+    branches: [ubuntu-install-ci]
+    paths: [.github/workflows/ubuntu_main_workaround.yml]
   workflow_dispatch:
     inputs:
       util_ref:
