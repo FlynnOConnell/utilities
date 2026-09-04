@@ -23,11 +23,18 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+    env:
+      # Ubuntu 24.04 ships CPython 3.12.3 at /usr/bin/python3.12, which does
+      # NOT satisfy requires-python = ">=3.12.7" -- uv would happily build a
+      # venv on it and only fail at install time. Force a uv-managed
+      # interpreter so both runners get a patch release that qualifies.
+      UV_PYTHON_PREFERENCE: only-managed
     steps:
       - name: Setup uv
         uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.12"
+          # no python-version here: it makes setup-uv create its own .venv on
+          # linux, which then collides with the `uv venv` below.
           enable-cache: true
           # nothing is checked out, so there is no lockfile to key the cache on
           # and no workdir to inspect; both of these are warnings otherwise.
@@ -49,7 +56,7 @@ jobs:
           set +e
           {
             echo "--- uv version"; uv --version
-            echo "--- uv venv"; uv venv --python 3.12
+            echo "--- uv venv"; uv venv --clear --python 3.12
             echo "--- uv pip install"
             uv pip install "utilities[all] @ git+https://github.com/${{ github.repository }}@${{ github.sha }}"
           } > install.log 2>&1
