@@ -19,7 +19,7 @@ from mbo_utilities import log
 from mbo_utilities.arrays._base import _imwrite_base, _normalize_key, ReductionMixin, Shape5DMixin
 from mbo_utilities.lazy_array import register_array_class
 
-from mbo_utilities.metadata import get_param
+from mbo_utilities.metadata import get_param, normalize_ops_arrays
 from mbo_utilities.pipeline_registry import PipelineInfo, register_pipeline
 from mbo_utilities.file_io import load_npy
 from typing import TYPE_CHECKING
@@ -125,7 +125,10 @@ class _SinglePlaneReader:
 
     def __init__(self, ops_path: Path, use_raw: bool = False):
         self.ops_path = ops_path
-        self.metadata = load_npy(ops_path).item()
+        # an ops.npy written before the images were normalized holds them as
+        # JSON lists; everything downstream (the summary-image widget,
+        # suite2p's own plotting) indexes them as arrays
+        self.metadata = normalize_ops_arrays(load_npy(ops_path).item())
 
         ops_dir = ops_path.parent
         self.raw_file = ops_dir / "data_raw.bin"
@@ -204,7 +207,7 @@ class _Suite2pRegTifPlaneReader:
         from mbo_utilities.arrays.tiff import _SingleTiffPlaneReader
 
         self.ops_path = ops_path
-        self.metadata = load_npy(ops_path).item()
+        self.metadata = normalize_ops_arrays(load_npy(ops_path).item())
         plane_dir = ops_path.parent
         self.reg_tif_dir = plane_dir / "reg_tif"
         self._channel = channel
@@ -424,7 +427,7 @@ class _Suite2pReconstructReader:
     def __init__(self, ops_path: Path):
         self.ops_path = Path(ops_path)
         plane_dir = self.ops_path.parent
-        self.metadata = load_npy(self.ops_path).item()
+        self.metadata = normalize_ops_arrays(load_npy(self.ops_path).item())
 
         reg_file = plane_dir / "reg_outputs.npy"
         reg = load_npy(reg_file).item()

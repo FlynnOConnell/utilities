@@ -5,10 +5,12 @@ label volume, per-ROI records (plane, area, class, note) and the
 user-defined class-label set — with no GUI imports, so the same model can
 back a widget, a script, or a batch tool.
 
-The volume is ``(Z, Y, X)`` uint16 following the repo's canonical TCZYX
-rules: every ``LazyArray`` reports ``nz/ny/nx``, arrays without depth get
-``Z == 1``, and T/C are ignored (masks are shared across time and
-channels). ROI ``i`` owns label value ``i + 1``; 0 is background. ROIs can
+The volume is ``(P, Y, X)`` uint16: one plane per combination of the
+data's scrolling dims (plain z for most data — arrays without depth get a
+single plane). When channels or other scroll axes key their own masks,
+``plane_axes`` records the layout ``((dim, size), ...)`` with z last, so
+``nz`` is the product and a z-only store keeps ``plane == z``. T is always
+shared. ROI ``i`` owns label value ``i + 1``; 0 is background. ROIs can
 never overlap: pixels already claimed by another ROI are dropped from a new
 one. Deleting an ROI renumbers the labels above it, so values stay
 contiguous ``1..N``.
@@ -82,6 +84,7 @@ class RoiRecord:
     note: str = ""
     uid: int = 0  # persistent id, never reused; 0 = unassigned
     source: str = ""  # "" = drawn by hand; "<run name>:<row>" = promoted
+    color: tuple[int, int, int] | None = None  # explicit group color, uint8 rgb
 
 
 class RoiLabelStore:
@@ -117,6 +120,9 @@ class RoiLabelStore:
                 f"{len(self.rois)} records were given"
             )
         self.label_names: tuple[str, ...] = tuple(str(n) for n in label_names)
+        # what the plane axis means: ((dim name, size), ...) over the data's
+        # scrolling dims with z last, so nz == product; empty = plain z planes
+        self.plane_axes: tuple[tuple[str, int], ...] = ()
         self.min_pixels = int(min_pixels)
         self.dirty_planes: set[int] = set()
         self.next_uid = max(
@@ -190,7 +196,7 @@ class RoiLabelStore:
     def snapshot(self) -> RoiLabelStore:
         """Deep copy (volume, records, names, ``next_uid``) that later
         mutations of either store cannot reach."""
-        return RoiLabelStore(
+        out = RoiLabelStore(
             self.nz,
             self.ny,
             self.nx,
@@ -200,6 +206,8 @@ class RoiLabelStore:
             rois=[replace(r) for r in self.rois],
             next_uid=self.next_uid,
         )
+        out.plane_axes = self.plane_axes
+        return out
 
     # ------------------------------------------------------------------
     # labels / notes
@@ -224,6 +232,11 @@ class RoiLabelStore:
 
     def set_note(self, index: int, note: str) -> None:
         self.rois[index].note = str(note)
+
+    def set_color(self, index: int, rgb: tuple[int, int, int] | None) -> None:
+        """Give ROI ``index`` an explicit display color; None reverts it to
+        the class / hue color."""
+        self.rois[index].color = None if rgb is None else tuple(int(v) for v in rgb)
 
     # ------------------------------------------------------------------
     # queries
@@ -259,11 +272,14 @@ class RoiLabelStore:
         return [r.area for r in self.rois]
 
     def roi_rgb(self, index: int) -> tuple[int, int, int]:
-        """display color of one ROI: its class color when classified, else
-        its own hue from ``ROI_COLORS`` (uint8 rgb)"""
-        ci = self.rois[index].class_index
-        if ci >= 0:
-            return tuple(int(round(c * 255)) for c in class_color(ci))
+        """display color of one ROI: its explicit group color when set, else
+        its class color when classified, else its own hue from
+        ``ROI_COLORS`` (uint8 rgb)"""
+        record = self.rois[index]
+        if record.color is not None:
+            return tuple(int(v) for v in record.color)
+        if record.class_index >= 0:
+            return tuple(int(round(c * 255)) for c in class_color(record.class_index))
         return tuple(int(v) for v in ROI_COLORS[index % len(ROI_COLORS)])
 
     def color_lut(self) -> np.ndarray:

@@ -9,11 +9,94 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from imgui_bundle import imgui
+from imgui_bundle import imgui, portable_file_dialogs as pfd
 
 from mbo_utilities.reader import imread
 from mbo_utilities.arrays import ScanImageArray
-from mbo_utilities.preferences import add_recent_file, set_last_dir
+from mbo_utilities.gui._files import PathPrompt, draw_path_prompt
+from mbo_utilities.preferences import add_recent_file, get_last_dir, set_last_dir
+
+_IMAGE_FILTERS = ["Image Files", "*.tif *.tiff *.zarr *.npy *.bin", "All Files", "*"]
+
+
+def open_prompts(parent: Any) -> tuple[PathPrompt, PathPrompt]:
+    """The typed-path popups for Open File and Open Folder, made on first use."""
+    file_prompt = getattr(parent, "_open_file_prompt", None)
+    if file_prompt is None:
+        file_prompt = PathPrompt(
+            "Open file", action="open", hint="one image file, read by this process"
+        )
+        parent._open_file_prompt = file_prompt
+    folder_prompt = getattr(parent, "_open_folder_prompt", None)
+    if folder_prompt is None:
+        folder_prompt = PathPrompt(
+            "Open folder",
+            action="open",
+            hint="a folder of image files, read by this process",
+        )
+        parent._open_folder_prompt = folder_prompt
+    return file_prompt, folder_prompt
+
+
+def _open_start_dir(parent: Any, kind: str) -> str:
+    fpath = parent.fpath[0] if isinstance(parent.fpath, list) else parent.fpath
+    if fpath and Path(fpath).exists():
+        return str(Path(fpath).parent)
+    return str(get_last_dir(f"open_{kind}") or Path.home())
+
+
+def start_open_prompt(parent: Any, kind: str = "file") -> None:
+    """Ask for a path to open: a typed field, with the native dialog as a
+    browse shortcut. ``kind`` is ``"file"`` or ``"folder"``.
+
+    The dialog opens where the process runs, which for a notebook served
+    from another machine is the wrong one, so the field is the route that
+    always works. Nothing happens while a native dialog is already up.
+    """
+    if parent._file_dialog is not None or parent._folder_dialog is not None:
+        return
+    file_prompt, folder_prompt = open_prompts(parent)
+    prompt = folder_prompt if kind == "folder" else file_prompt
+    other = file_prompt if kind == "folder" else folder_prompt
+    other.open = False
+    prompt.start(_open_start_dir(parent, kind))
+
+
+def _browse(parent: Any, kind: str, start: str) -> None:
+    """Launch the native dialog for the prompt's browse button."""
+    if parent._file_dialog is not None or parent._folder_dialog is not None:
+        return
+    start = start if start and Path(start).exists() else _open_start_dir(parent, kind)
+    if Path(start).is_file():
+        start = str(Path(start).parent)
+    if kind == "folder":
+        parent._folder_dialog = pfd.select_folder("Select Data Folder", start)
+    else:
+        parent._file_dialog = pfd.open_file(
+            "Select Data File(s)", start, _IMAGE_FILTERS, pfd.opt.multiselect
+        )
+
+
+def _draw_open_prompts(parent: Any) -> None:
+    """Draw the two path popups and act on what they return."""
+    file_prompt, folder_prompt = open_prompts(parent)
+    for kind, prompt in (("file", file_prompt), ("folder", folder_prompt)):
+        path, browse = draw_path_prompt(prompt)
+        if browse:
+            _browse(parent, kind, prompt.path)
+        if path is None:
+            continue
+        p = Path(path).expanduser()
+        if not p.exists():
+            prompt.status = f"not found on this machine: {p}"
+            continue
+        if kind == "folder" and not p.is_dir():
+            prompt.status = f"not a folder: {p}"
+            continue
+        prompt.open = False
+        add_recent_file(str(p), file_type=kind)
+        set_last_dir(f"open_{kind}", str(p))
+        load_new_data(parent, str(p))
 
 
 def _resolve_plane_dir(p: Path) -> Path | None:
@@ -146,6 +229,20 @@ def _try_hydrate_s2p_from_binary(parent: Any, path: str | Path) -> bool:
             "leaving pipeline settings untouched."
         )
         return False
+
+    # The Skip / Run / Force gates say what one past run did, not what the
+    # user wants next. A registration pass writes roidetect=0 into the plane
+    # dir's ops.npy (register() runs suite2p with detection off), so
+    # hydrating that key turned Detection to Skip for every later run and
+    # suite2p quietly regenerated figures instead of finding ROIs
+    # ("Suite2p disabled by user toggles"). Restore parameters, not gates.
+    for _gate in ("do_detection", "do_registration"):
+        if _gate in loaded:
+            loaded.pop(_gate)
+            parent.logger.debug(
+                f"suite2p hydrate: ignoring {_gate} from the run's records; "
+                "the Skip/Run/Force gates stay where the user left them"
+            )
 
     # dead custom file paths recorded on another machine fail deep inside
     # suite2p later; drop them so the run falls back to defaults.
@@ -291,12 +388,17 @@ def _try_hydrate_s2p_from_binary(parent: Any, path: str | Path) -> bool:
 
 
 def check_file_dialogs(parent: Any):
-    """Check if file/folder dialogs have results and load data if so."""
+    """Draw the open prompts, and load whatever a native dialog returned."""
+    _draw_open_prompts(parent)
+    file_prompt, folder_prompt = open_prompts(parent)
+
     # Check file dialog
     if parent._file_dialog is not None and parent._file_dialog.ready():
         result = parent._file_dialog.result()
         parent.logger.info(f"File dialog result: {result}")
         if result and len(result) > 0:
+            file_prompt.open = False
+            file_prompt.path = result[0]
             # Save to recent files and context-specific preferences
             add_recent_file(result[0], file_type="file")
             set_last_dir("open_file", result[0])
@@ -309,6 +411,8 @@ def check_file_dialogs(parent: Any):
     if parent._folder_dialog is not None and parent._folder_dialog.ready():
         result = parent._folder_dialog.result()
         if result:
+            folder_prompt.open = False
+            folder_prompt.path = result
             # Save to recent files and context-specific preferences
             add_recent_file(result, file_type="folder")
             set_last_dir("open_folder", result)

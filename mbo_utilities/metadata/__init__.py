@@ -16,6 +16,9 @@ from .base import (
     get_canonical_name,
     IMAGING_METADATA_KEYS,
     EXPORT_DENYLIST,
+    normalize_ops_arrays,
+    repair_ops_file,
+    repair_ops_tree,
     strip_for_export,
 )
 from mbo_utilities.arrays.features._roi import RoiMode
@@ -77,6 +80,9 @@ __all__ = [
     "IMAGING_METADATA_KEYS",
     # writer denylist + helper (suite2p-only fields stripped from non-suite2p output)
     "EXPORT_DENYLIST",
+    "normalize_ops_arrays",
+    "repair_ops_file",
+    "repair_ops_tree",
     "strip_for_export",
     "METADATA_PARAMS",
     # base types

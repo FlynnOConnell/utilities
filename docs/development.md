@@ -403,31 +403,30 @@ exts = get_readable_extensions()  # {"tif", "tiff", "zarr", "h5", ...}
 Validates installation, GPU configuration, and optional dependencies.
 
 ```python
-from mbo_utilities.install_checker import check_installation, Status
+from mbo_utilities.install import check_installation, gpu_summary, Status
 
 status = check_installation()
 
-print(f"mbo_utilities v{status.mbo_version}")
-print(f"Python {status.python_version}")
+print(f"mbo_utilities v{status.mbo_version}, Python {status.python_version}")
+print(f"GPU: {gpu_summary(status.cuda_info)}")  # card, compute capability, driver CUDA
 
-# check cuda
-if status.cuda_info.device_name:
-    print(f"GPU: {status.cuda_info.device_name}")
-    print(f"CUDA Toolkit: {status.cuda_info.nvcc_version}")
+# each feature knows what it is for, whether it works, and the command that fixes it
+for f in status.features:
+    if f.status is Status.OK:
+        print(f"ok  {f.name} {f.version}  {f.purpose}")
+    elif f.status is Status.MISSING:
+        print(f"--  {f.name}: {f.hint}")
+    else:
+        print(f"!!  {f.name}: {f.message}  fix: {f.hint}")
 
-# check features
-for feature in status.features:
-    if feature.status == Status.OK:
-        print(f"✓ {feature.name} v{feature.version}")
-    elif feature.status == Status.WARN:
-        print(f"! {feature.name}: {feature.message}")
-    elif feature.status == Status.MISSING:
-        print(f"- {feature.name} not installed")
-
-# overall status
 if status.all_ok:
     print("Installation OK")
 ```
+
+PyTorch is judged against the driver's CUDA version and the card's compute
+capability (a CUDA 13 wheel has no Pascal kernels), so `hint` is the wheel this
+machine can run. Packages that compute on the PyTorch device (suite2p
+registration, cellpose, masknmf) inherit its GPU state and its fix.
 
 #### Status Enums
 

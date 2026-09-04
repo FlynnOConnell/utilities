@@ -19,6 +19,7 @@ from mbo_utilities.metadata import get_param
 from mbo_utilities.arrays import _sanitize_suffix
 from mbo_utilities.arrays.features import DimensionTag, TAG_REGISTRY, parse_timepoint_selection, TimeSelection
 from mbo_utilities.preferences import get_last_dir, set_last_dir
+from mbo_utilities.gui._files import NATIVE_DIALOGS, no_dialog_hint
 from mbo_utilities.gui._imgui_helpers import (
     PopupAutoSize,
     set_tooltip,
@@ -190,9 +191,15 @@ def draw_saveas_popup(parent: Any):
                     parent._saveas_outdir = new_str
 
                 imgui.same_line()
+                if not NATIVE_DIALOGS:
+                    imgui.begin_disabled()
                 if imgui.button("Browse"):
                     default_dir = parent._saveas_outdir or str(get_last_dir("save_as") or Path.home())
                     parent._saveas_folder_dialog = pfd.select_folder("Select output folder", default_dir)
+                if not NATIVE_DIALOGS:
+                    imgui.end_disabled()
+                    if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
+                        imgui.set_tooltip(no_dialog_hint())
 
                 # Check if async folder dialog has a result
                 if parent._saveas_folder_dialog is not None and parent._saveas_folder_dialog.ready():

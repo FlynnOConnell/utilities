@@ -22,6 +22,7 @@ __all__ = [
     "GridSearchViewer",
     "PreviewDataWidget",
     # Entry points
+    "DataVis",
     "get_default_ini_path",
     "run_gui",
     "set_qt_icon",
@@ -36,6 +37,9 @@ def __getattr__(name):
     if name == "run_gui":
         from .run_gui import run_gui
         return run_gui
+    if name == "DataVis":
+        from .data_vis import DataVis
+        return DataVis
     if name == "PreviewDataWidget":
         from . import _setup  # triggers setup on import
         from .widgets.preview_data import PreviewDataWidget

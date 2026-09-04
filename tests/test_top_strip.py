@@ -125,6 +125,15 @@ class TestTopStrip:
 class TestSignalQualitySplit:
     """The plot goes on the top strip, the table stays in the right tab."""
 
+    @pytest.fixture(autouse=True)
+    def _signal_quality_on(self):
+        """The widget ships off; these tests are about it being on."""
+        from mbo_utilities.gui.widgets.widget_toggles import set_widget_enabled
+
+        set_widget_enabled("signal_quality", True, persist=False)
+        yield
+        set_widget_enabled("signal_quality", False, persist=False)
+
     @staticmethod
     def _gui(shape=(4, 1, 5, 32, 32)):
         from mbo_utilities.arrays.numpy import NumpyArray
@@ -198,7 +207,6 @@ class TestSignalQualitySplit:
             gui._sync_top_panels()
             assert not gui.top_strip.has("zstats")
         finally:
-            set_widget_enabled("signal_quality", True, persist=False)
             iw.close()
 
     def test_the_two_halves_draw_and_pair_with_the_right_tab(self):
@@ -224,5 +232,155 @@ class TestSignalQualitySplit:
             for _ in range(2):
                 iw.figure.canvas.draw()
             assert not errors, errors[0]
+        finally:
+            iw.close()
+
+
+class TestTopStripResize:
+    """The grab bar makes the strip adjustable and collapsible, the way
+    fastplotlib's right and bottom edge windows are."""
+
+    def test_collapse_shuts_to_the_menu_row_and_back(self, figure):
+        from mbo_utilities.gui._top_strip import TopStrip
+
+        strip = TopStrip(figure)
+        strip.register(panel("a", height=180))
+        tall = strip.size
+        assert not strip.collapsed
+
+        strip.toggle_collapsed()
+        assert strip.collapsed
+        assert strip.size == strip.shut_size < tall
+
+        strip.toggle_collapsed()
+        assert not strip.collapsed
+        assert strip.size == tall
+
+    def test_a_drag_pins_the_height_over_the_panel_request(self, figure):
+        from mbo_utilities.gui._top_strip import TopStrip
+
+        strip = TopStrip(figure)
+        roi = panel("a", height=180)
+        strip.register(roi)
+        strip.resize_to(320)
+        assert strip.size == 320
+
+        # a panel asking for more no longer moves it
+        roi.height = 600
+        strip._resize()
+        assert strip.size == 320
+
+        strip.reset_size()
+        assert strip.size != 320
+
+    def test_resize_never_goes_under_the_shut_height(self, figure):
+        from mbo_utilities.gui._top_strip import TopStrip
+
+        strip = TopStrip(figure)
+        strip.register(panel("a", height=180))
+        strip.resize_to(10)
+        assert strip.size == strip.shut_size
+
+    def test_collapse_remembers_a_pinned_height(self, figure):
+        from mbo_utilities.gui._top_strip import TopStrip
+
+        strip = TopStrip(figure)
+        strip.register(panel("a", height=180))
+        strip.resize_to(300)
+        strip.toggle_collapsed()
+        assert strip.size == strip.shut_size
+        strip.toggle_collapsed()
+        assert strip.size == 300
+
+    def test_reset_size_clears_a_collapse_too(self, figure):
+        from mbo_utilities.gui._top_strip import TopStrip
+
+        strip = TopStrip(figure)
+        strip.register(panel("a", height=180))
+        auto = strip.size
+        strip.toggle_collapsed()
+        strip.reset_size()
+        assert not strip.collapsed
+        assert strip.size == auto
+
+    def test_the_bare_strip_has_no_handle(self, figure):
+        from mbo_utilities.gui._top_strip import MENU_HEIGHT, TopStrip
+
+        # nothing registered: there is no panel to shut, so no bar is drawn
+        strip = TopStrip(figure)
+        assert strip.size == MENU_HEIGHT
+
+
+class TestMenuRowCluster:
+    """The status / metadata / help / keybinds buttons sit at the right end
+    of the menu row, and the status button says what is idle."""
+
+    @staticmethod
+    def _gui(shape=(4, 1, 5, 32, 32)):
+        from mbo_utilities.arrays.numpy import NumpyArray
+        from mbo_utilities.gui.run_gui import _create_image_widget
+        from mbo_utilities.gui.widgets.preview_data import PreviewDataWidget
+
+        data = np.random.default_rng(0).random(shape).astype(np.float32)
+        iw = _create_image_widget(
+            NumpyArray(data, dims="TCZYX"),
+            widget="preview",
+            figure_kwargs_override={"size": FIGURE_SIZE},
+        )
+        gui = next(
+            w for w in iw.figure.imgui_windows.values()
+            if isinstance(w, PreviewDataWidget)
+        )
+        return iw, gui
+
+    def _buttons(self):
+        """``[(label, cursor_x, window_width)]`` for one drawn frame."""
+        from imgui_bundle import imgui
+
+        from mbo_utilities.gui.widgets.process_manager import get_process_manager
+
+        iw, _gui = self._gui()
+        # the status button reports whatever the shared process manager is
+        # holding, and other tests leave finished work in it; empty it just
+        # before the frame that is measured
+        pm = get_process_manager()
+        for job in pm.get_jobs():
+            pm.clear_job(job.job_id)
+        pm._processes.clear()
+        seen = []
+        real = imgui.button
+
+        def spy(label, *args, **kwargs):
+            seen.append((label, imgui.get_cursor_pos_x(), imgui.get_window_width()))
+            return real(label, *args, **kwargs)
+
+        imgui.button = spy
+        try:
+            iw.figure.canvas.draw()
+        finally:
+            imgui.button = real
+            iw.close()
+        return seen
+
+    def test_the_cluster_is_named_and_right_aligned(self):
+        seen = self._buttons()
+        labels = [label for label, _x, _w in seen]
+        status = [row for row in seen if "Console: Idle" in row[0]]
+        assert status, f"the status button names the console: {labels}"
+        # one Help and one Keybinds button, not a second ROI pair
+        assert any(label == "Help" for label, _x, _w in seen), labels
+        assert any(label == "Keybinds" for label, _x, _w in seen), labels
+        assert not [label for label in labels if label.startswith("ROI ")], labels
+        # the whole cluster starts past the middle of the row
+        _label, x, width = status[0]
+        assert x > width * 0.5, f"status button at {x} of {width}"
+
+    def test_the_panel_has_no_title_bar(self):
+        """fastplotlib draws a custom full-width title box for an edge window
+        with a title; a static "Data Preview" label only cost the panel a row
+        of height."""
+        iw, gui = self._gui()
+        try:
+            assert gui._title is None
         finally:
             iw.close()

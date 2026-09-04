@@ -13,7 +13,7 @@ from typing import Any
 
 from imgui_bundle import imgui, imgui_ctx, ImVec2
 
-from mbo_utilities.gui._imgui_helpers import PopupAutoSize, begin_popup_size
+from mbo_utilities.gui._imgui_helpers import begin_popup_size
 from mbo_utilities.gui._metadata import draw_metadata_inspector
 from mbo_utilities.gui._options_popup import (
     _ensure_gpu_list,
@@ -26,6 +26,8 @@ from mbo_utilities.gui.widgets.process_manager import get_process_manager
 from mbo_utilities.preferences import (
     get_gpu_index,
     set_gpu_index,
+    get_mem_monitor_interval,
+    get_mem_warn_pct,
 )
 
 
@@ -144,22 +146,31 @@ def _cpu_temp() -> float | None:
 
 
 def _draw_cpu_meter(cpu_pct: float) -> None:
-    """Total CPU as a usage meter, formatted like the GPU meters (RAM
-    used/total and temperature in the caption)."""
-    caption = []
-    try:
-        import psutil
-        vm = psutil.virtual_memory()
-        used = (vm.total - vm.available) / 1024**3
-        total = vm.total / 1024**3
-        caption.append(f"{used:.1f}/{total:.1f} GB")
-    except Exception:
-        pass
+    """Total CPU as a usage meter, formatted like the GPU meters (temperature
+    in the caption). RAM has its own meter below."""
     temp = _cpu_temp()
-    if temp is not None:
-        caption.append(f"{temp:.0f}C")
-    caption_s = ("  " + " · ".join(caption)) if caption else ""
+    caption_s = f"  {temp:.0f}C" if temp is not None else ""
     _draw_meter("CPU", cpu_pct / 100.0, f"{cpu_pct:.0f}%", caption_s)
+
+
+def _draw_ram_meter(snap: dict, warn_pct: float) -> None:
+    """System RAM as a usage meter, with this process tree's share.
+
+    The bar is the Task-Manager headline (all processes); the caption adds
+    used/total GB and what the gui plus its running jobs account for, which
+    is the number that matters when a pipeline is the thing eating the box.
+    """
+    pct = snap.get("sys_pct", 0.0)
+    caption = [f"{snap['used_gb']:.1f}/{snap['total_gb']:.1f} GB"]
+    proc_gb = snap.get("proc_gb")
+    if proc_gb is not None:
+        caption.append(f"mbo {proc_gb:.1f} GB/{snap.get('nproc', 0)} proc")
+    _draw_meter("RAM", pct / 100.0, f"{pct:.0f}%", "  " + " · ".join(caption))
+    if warn_pct and pct >= warn_pct:
+        imgui.same_line()
+        imgui.text_colored(
+            imgui.ImVec4(0.95, 0.45, 0.45, 1.0), f"! over {warn_pct:.0f}%"
+        )
 
 
 def _draw_gpu_selectors(parent: Any, devices: list, show_render: bool) -> None:
@@ -206,10 +217,11 @@ def _draw_gpu_selectors(parent: Any, devices: list, show_render: bool) -> None:
 def _draw_system_info_header(parent: Any) -> None:
     """Compact system-capacity header for the Process Console.
 
-    Shows: CPU cores, a CPU usage meter (with live RAM and temperature),
-    one live-usage meter per physical GPU, and — on multi-GPU systems —
-    render/compute GPU pickers. Per-GPU usage and CPU% come from a ~1.5s
-    throttle (nvidia-smi is a subprocess); RAM is read with the meter.
+    Shows: CPU cores, a CPU usage meter, a RAM meter (system use plus this
+    process tree's share), one live-usage meter per physical GPU, and — on
+    multi-GPU systems — render/compute GPU pickers. Per-GPU usage and CPU%
+    come from a ~1.5s throttle (nvidia-smi is a subprocess); RAM follows the
+    memory-monitor tick rate.
     """
     if not imgui.collapsing_header("System", imgui.TreeNodeFlags_.default_open):
         return
@@ -235,6 +247,20 @@ def _draw_system_info_header(parent: Any) -> None:
         parent._sys_gpu_last_refresh = now
     gpu_devices_live = parent._sys_gpu_devices
     cpu_pct = getattr(parent, "_sys_cpu_pct", None)
+
+    # RAM on its own throttle: a snapshot costs a children walk (~8 ms), so it
+    # follows the user's tick rate rather than the frame rate or the slower
+    # nvidia-smi window.
+    tick = max(0.25, min(get_mem_monitor_interval(), 2.0))
+    if (not hasattr(parent, "_sys_mem")
+            or now - getattr(parent, "_sys_mem_last_refresh", 0.0) >= tick):
+        from mbo_utilities._sysmem import mem_snapshot
+        try:
+            parent._sys_mem = mem_snapshot()
+        except Exception:
+            parent._sys_mem = None
+        parent._sys_mem_last_refresh = now
+    mem_snap = parent._sys_mem
 
     # CPU core counts via psutil (static). Live RAM moves to the CPU meter.
     try:
@@ -310,10 +336,12 @@ def _draw_system_info_header(parent: Any) -> None:
 
         imgui.end_table()
 
-    if cpu_pct is not None or gpu_devices_live:
+    if cpu_pct is not None or mem_snap or gpu_devices_live:
         imgui.spacing()
         if cpu_pct is not None:
             _draw_cpu_meter(cpu_pct)
+        if mem_snap:
+            _draw_ram_meter(mem_snap, get_mem_warn_pct())
         for d in gpu_devices_live:
             _draw_gpu_meter(d)
 
@@ -373,9 +401,17 @@ def draw_tools_popups(parent: Any):
 
 
 def draw_process_console_popup(parent: Any):
-    """Draw popup showing active tasks and background processes."""
+    """Draw the Process Console: active tasks, background processes, System.
+
+    A plain window rather than a modal, so it can be left open (or collapsed
+    to just its title bar) beside the viewer without dimming it — the System
+    meters are worth watching while a job runs. Position, size and collapsed
+    state persist through imgui's ini.
+    """
     if not hasattr(parent, "_show_process_console"):
         parent._show_process_console = False
+    if not hasattr(parent, "_process_console_open"):
+        parent._process_console_open = False
     if not hasattr(parent, "_process_console_size"):
         parent._process_console_size = ImVec2(500, 350)
     if not hasattr(parent, "_process_console_content_h"):
@@ -386,22 +422,38 @@ def draw_process_console_popup(parent: Any):
         parent._proc_log_fixed_h = 0.0
     if not hasattr(parent, "_proc_log_count"):
         parent._proc_log_count = 0
-    if not hasattr(parent, "_process_console_sizer"):
-        parent._process_console_sizer = PopupAutoSize(
-            "Process Console", auto_resize=False
-        )
 
+    # open request from the menu-bar status button
     if parent._show_process_console:
-        parent._process_console_sizer.before_open()
-        imgui.open_popup("Process Console")
+        parent._process_console_open = True
+        parent._process_console_focus = True
         parent._show_process_console = False
+    if not parent._process_console_open:
+        return
 
-    work = imgui.get_main_viewport().work_size
+    viewport = imgui.get_main_viewport()
+    work = viewport.work_size
     max_w = max(400.0, work.x - 40.0)
     max_h = max(300.0, work.y - 40.0)
 
+    if getattr(parent, "_process_console_focus", False):
+        # a second click on the status button raises it instead of doing
+        # nothing when it's already open behind the viewer
+        imgui.set_next_window_focus()
+        parent._process_console_focus = False
+
+    imgui.set_next_window_pos(
+        ImVec2(
+            viewport.work_pos.x
+            + max(0.0, (work.x - parent._process_console_size.x) * 0.5),
+            viewport.work_pos.y + 40.0,
+        ),
+        imgui.Cond_.first_use_ever,
+    )
     imgui.set_next_window_size(parent._process_console_size, imgui.Cond_.appearing)
-    imgui.set_next_window_size_constraints(imgui.ImVec2(350, 200), imgui.ImVec2(max_w, max_h))
+    # low minimum height on purpose: the window can be shrunk down to just
+    # the System meters and parked next to the viewer.
+    imgui.set_next_window_size_constraints(imgui.ImVec2(340, 120), imgui.ImVec2(max_w, max_h))
 
     # grow to fit content (requested last frame); width preserved, height bounded
     if parent._process_console_grow_to is not None:
@@ -411,17 +463,18 @@ def draw_process_console_popup(parent: Any):
         )
         parent._process_console_grow_to = None
 
-    # use resizable modal (no auto_resize flag)
-    opened, visible = imgui.begin_popup_modal(
+    # a normal window: no dimmed background, collapsible, and the viewer
+    # stays clickable underneath.
+    expanded, still_open = imgui.begin(
         "Process Console",
         p_open=True,
         flags=imgui.WindowFlags_.none,
     )
+    parent._process_console_open = still_open
 
-    if opened:
-        if not visible:
-            imgui.close_current_popup()
-        else:
+    try:
+        # collapsed -> title bar only; skip the body (and its process polling)
+        if expanded and still_open:
             # save current size for next time
             parent._process_console_size = imgui.get_window_size()
 
@@ -564,15 +617,15 @@ def draw_process_console_popup(parent: Any):
             total_w = close_w + (dismiss_w + spacing if finished else 0.0)
             imgui.set_cursor_pos_x((imgui.get_window_width() - total_w) * 0.5)
             if imgui.button("Close", ImVec2(close_w, 0)):
-                imgui.close_current_popup()
+                parent._process_console_open = False
             if finished:
                 imgui.same_line()
                 if imgui.button(f"Dismiss finished ({len(finished)})", ImVec2(dismiss_w, 0)):
                     for p in finished:
                         pm._processes.pop(p.pid, None)
                     pm._save()
-
-        imgui.end_popup()
+    finally:
+        imgui.end()
 
 
 def _draw_process_entry(pm: Any, proc: Any, log_fill_h: float = 0.0) -> float:

@@ -30,6 +30,8 @@ from mbo_utilities.roi_workflow import OUT_PREFIX, RunResult, labels_path
 
 __all__ = [
     "DerivedSet",
+    "MASK_MODES",
+    "RING_SCALE",
     "RoiRun",
     "RoiRunManager",
     "SELECTED_ALPHA",
@@ -37,13 +39,21 @@ __all__ = [
     "TraceSet",
     "build_pick_map",
     "component_color",
+    "derived_comps",
+    "derived_outline",
     "derived_rgba",
     "display_fneu",
     "display_trace",
     "feathered_rgba",
+    "footprint_center",
+    "footprint_edges",
+    "footprint_radius",
     "full_plane_args",
     "load_run_registry",
+    "outline_data",
+    "outline_paths",
     "registry_path",
+    "ring",
     "save_run_registry",
     "scan_run_dirs",
     "set_color",
@@ -249,7 +259,9 @@ class DerivedSet:
 
     ``accepted`` starts from the run's ``iscell`` and is the mutable
     curation state; the widget mirrors changes back into ``iscell.npy``.
-    ``classes`` maps a row to a class index in the shared label set.
+    ``classes`` maps a row to a class index in the shared label set;
+    ``colors`` maps a row to an explicit group color (float rgb in 0-1)
+    that wins over the class / hue color.
     """
 
     result: RunResult
@@ -258,6 +270,7 @@ class DerivedSet:
     visible: bool = True
     discarded: set[int] = field(default_factory=set)
     classes: dict[int, int] = field(default_factory=dict)
+    colors: dict[int, tuple[float, float, float]] = field(default_factory=dict)
     accepted: np.ndarray | None = None
     pick_map: np.ndarray | None = None
 
@@ -299,21 +312,183 @@ def _rim(mask: np.ndarray) -> np.ndarray:
     return mask & ~core
 
 
-def derived_rgba(
-    shape: tuple[int, int],
+# ---------------------------------------------------------------------------
+# vector overlays: thin paths instead of a filled raster
+# ---------------------------------------------------------------------------
+
+# A filled mask hides the pixels it covers, and at a handful of pixels per
+# cell even the 1-px rim above eats the whole footprint. suite2p and cellpose
+# get around that by drawing the mask boundary rather than its body, which is
+# what "outline" mode does here. The stand-in "circle" mode goes further: it
+# drops the footprint shape and just rings the cell, so nothing under the ROI
+# is covered at all. Both come out as line geometry, whose stroke stays one
+# screen pixel wide at any zoom instead of growing with the data pixels the
+# way a raster overlay does.
+
+MASK_MODES = ("circle", "outline", "fill")
+RING_SEGMENTS = 36  # reads as round at any sane zoom
+RING_SCALE = 1.15  # over the equal-area radius, so the ring clears the mask
+MIN_RING_RADIUS = 2.0  # px: a few-pixel cell still gets a ring worth seeing
+HALO_SCALE = 1.7  # the selection ring sits outside the ROI's own
+
+
+def footprint_center(ypix, xpix) -> tuple[float, float]:
+    """``(x, y)`` centre of a footprint in world coordinates.
+
+    Image pixel ``(row, col)`` covers world ``[col, col + 1) x [row, row + 1)``,
+    so a pixel centre sits half a pixel past its index.
+    """
+    return float(np.mean(xpix)) + 0.5, float(np.mean(ypix)) + 0.5
+
+
+def footprint_radius(ypix, xpix, scale: float = RING_SCALE) -> float:
+    """Radius of the circle standing in for a footprint: its equal-area
+    circle (``sqrt(npix / pi)``, which for a compact mask lands just outside
+    the edge), scaled, and floored at ``MIN_RING_RADIUS`` so the few-pixel
+    masks this was written for still get something to look at."""
+    n = max(len(ypix), 1)
+    return max(float(np.sqrt(n / np.pi)) * float(scale), MIN_RING_RADIUS)
+
+
+def ring(cx: float, cy: float, r: float, segments: int = RING_SEGMENTS) -> np.ndarray:
+    """Closed circle as ``(segments + 1, 2)`` ``(x, y)`` points."""
+    t = np.linspace(0.0, 2.0 * np.pi, segments + 1, dtype=np.float32)
+    return np.column_stack([cx + r * np.cos(t), cy + r * np.sin(t)])
+
+
+# The corners bounding each edge, as (dx, dy) off the top-left corner of
+# pixel (row, col) - which in world coordinates is (col, row). One row per
+# side, in the order the sides are stacked below.
+_EDGE_FROM = np.array([(0, 0), (0, 1), (0, 0), (1, 0)], np.float32)
+_EDGE_TO = np.array([(1, 0), (1, 1), (0, 1), (1, 1)], np.float32)
+
+
+def footprint_edges(ypix, xpix) -> np.ndarray:
+    """A footprint's mask/background border as ``(m, 2)`` line points: the
+    unit edges of its boundary pixels, separated by NaN rows.
+
+    cellpose traces its outlines into a polygon (``cv2.findContours``) and
+    suite2p paints a rim of boundary pixels; walking the pixel edges instead
+    needs no ordering pass and puts the stroke on the true border rather than
+    half a pixel inside it, which matters when a cell is four pixels across.
+    The mask is worked in its own bounding box, padded so an edge pixel still
+    has a neighbour to be missing.
+    """
+    if not len(ypix):
+        return np.zeros((0, 2), np.float32)
+    ypix = np.asarray(ypix, np.int64)
+    xpix = np.asarray(xpix, np.int64)
+    y0, x0 = int(ypix.min()), int(xpix.min())
+    h = int(ypix.max()) - y0 + 1
+    w = int(xpix.max()) - x0 + 1
+    mask = np.zeros((h + 2, w + 2), bool)
+    mask[ypix - y0 + 1, xpix - x0 + 1] = True
+    inner = mask[1:-1, 1:-1]
+    sides = np.stack([
+        inner & ~mask[:-2, 1:-1],  # nothing above: its top edge shows
+        inner & ~mask[2:, 1:-1],  # nothing below
+        inner & ~mask[1:-1, :-2],  # nothing to the left
+        inner & ~mask[1:-1, 2:],  # nothing to the right
+    ])
+    side, rows, cols = np.nonzero(sides)
+    if not len(side):
+        return np.zeros((0, 2), np.float32)
+    corner = np.column_stack([cols + x0, rows + y0]).astype(np.float32)
+    out = np.full((3 * len(side) - 1, 2), np.nan, np.float32)
+    out[0::3] = corner + _EDGE_FROM[side]
+    out[1::3] = corner + _EDGE_TO[side]
+    return out
+
+
+def outline_paths(
+    ypix,
+    xpix,
+    mode: str = "circle",
+    scale: float = RING_SCALE,
+    segments: int = RING_SEGMENTS,
+) -> list[np.ndarray]:
+    """One footprint's paths in ``mode``: its traced border, or the circle
+    standing in for it. An empty footprint gives nothing to draw."""
+    if mode == "outline":
+        edges = footprint_edges(ypix, xpix)
+        if len(edges):
+            return [edges]
+    if not len(ypix):
+        return []
+    cx, cy = footprint_center(ypix, xpix)
+    return [ring(cx, cy, footprint_radius(ypix, xpix, scale), segments)]
+
+
+def outline_data(
+    comps,
+    mode: str = "circle",
+    halo=(),
+    scale: float = RING_SCALE,
+    segments: int = RING_SEGMENTS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(positions (m, 3), colors (m, 4))`` for a line graphic drawing every
+    component as a thin closed path.
+
+    ``comps`` are the same ``(ypix, xpix, lam, rgb, fill)`` tuples
+    ``feathered_rgba`` takes, so one list feeds either overlay - ``lam`` goes
+    unused here and ``fill`` becomes the stroke alpha. The paths are stitched
+    into one buffer separated by NaN rows, which pygfx breaks the line on.
+    ``halo`` footprints (``(ypix, xpix)`` pairs) get a white circle outside
+    them as well: the vector answer to the filled overlay's white rim.
+    """
+    paths: list[np.ndarray] = []
+    colors: list[tuple] = []
+    for ypix, xpix, _lam, rgb, fill in comps:
+        rgba = (*np.asarray(rgb, np.float32).tolist(), float(fill))
+        for path in outline_paths(ypix, xpix, mode, scale, segments):
+            paths.append(path)
+            colors.append(rgba)
+    for ypix, xpix in halo:
+        if not len(ypix):
+            continue
+        cx, cy = footprint_center(ypix, xpix)
+        paths.append(
+            ring(cx, cy, footprint_radius(ypix, xpix, scale) * HALO_SCALE, segments)
+        )
+        colors.append((1.0, 1.0, 1.0, 1.0))
+    return stitch_paths(paths, colors)
+
+
+def stitch_paths(paths, colors) -> tuple[np.ndarray, np.ndarray]:
+    """Join ``(n, 2)`` paths into one ``(m, 3)`` position array with a NaN
+    row between pieces, plus the matching ``(m, 4)`` per-vertex colors."""
+    if not paths:
+        return np.zeros((0, 3), np.float32), np.zeros((0, 4), np.float32)
+    total = sum(len(p) for p in paths) + len(paths) - 1
+    pos = np.full((total, 3), np.nan, np.float32)
+    col = np.zeros((total, 4), np.float32)
+    at = 0
+    for path, rgba in zip(paths, colors):
+        n = len(path)
+        pos[at : at + n, :2] = path
+        pos[at : at + n, 2] = 0.0
+        col[at : at + n] = rgba
+        at += n + 1
+    return pos, col
+
+
+def derived_comps(
     sets_on_z: list[DerivedSet],
     alpha: float,
     selected: tuple[DerivedSet, int] | None = None,
-) -> np.ndarray:
-    """``(ny, nx, 4)`` uint8 overlay for the derived sets of one plane.
+    grouped: frozenset | set = frozenset(),
+) -> tuple[list, tuple | None, list]:
+    """What one plane's derived sets draw: ``(comps, selected, halo)``.
 
-    Each component's pixels get its own color (``component_color``) at
-    ``lam / lam.max() * alpha``; where components overlap the higher alpha
-    wins color and coverage. ``selected`` (a ``(set, row)`` pair) is filled
-    at ``SELECTED_ALPHA`` with a white rim. Discarded rows and invisible
-    sets are skipped; rejected rows draw dimmed.
+    ``comps`` are the ``(ypix, xpix, lam, rgb, fill)`` tuples both renderers
+    take, one per visible, undiscarded row - rejected rows dimmed, group
+    members at ``SELECTED_ALPHA``. ``selected`` is the ``(ypix, xpix, rgb)``
+    of the shown component, None when it is not on this plane. ``halo`` are
+    the footprints of the selection and the group, which the vector overlay
+    rings in white.
     """
-    comps = []
+    comps: list = []
+    halo: list = []
     sel = None
     for s in sets_on_z:
         if not s.visible:
@@ -322,13 +497,56 @@ def derived_rgba(
             if k in s.discarded:
                 continue
             fill = alpha if s.accepted[k] else alpha * 0.35
+            if (id(s), k) in grouped:
+                fill = SELECTED_ALPHA
+                halo.append((row["ypix"], row["xpix"]))
             comps.append((row["ypix"], row["xpix"], row["lam"], component_color(s, k), fill))
     if selected is not None:
         s, k = selected
         if s in sets_on_z and s.visible and k not in s.discarded:
             row = s.result.stat[k]
             sel = (row["ypix"], row["xpix"], component_color(s, k))
+            halo.append((row["ypix"], row["xpix"]))
+    return comps, sel, halo
+
+
+def derived_rgba(
+    shape: tuple[int, int],
+    sets_on_z: list[DerivedSet],
+    alpha: float,
+    selected: tuple[DerivedSet, int] | None = None,
+    grouped: frozenset | set = frozenset(),
+) -> np.ndarray:
+    """``(ny, nx, 4)`` uint8 overlay for the derived sets of one plane.
+
+    Each component's pixels get its own color (``component_color``) at
+    ``lam / lam.max() * alpha``; where components overlap the higher alpha
+    wins color and coverage. ``selected`` (a ``(set, row)`` pair) is filled
+    at ``SELECTED_ALPHA`` with a white rim; ``grouped`` (``(id(set), row)``
+    pairs of a multi-selection) fills at ``SELECTED_ALPHA`` too. Discarded
+    rows and invisible sets are skipped; rejected rows draw dimmed.
+    """
+    comps, sel, _halo = derived_comps(sets_on_z, alpha, selected, grouped)
     return feathered_rgba(shape, comps, sel)
+
+
+def derived_outline(
+    sets_on_z: list[DerivedSet],
+    mode: str = "circle",
+    selected: tuple[DerivedSet, int] | None = None,
+    grouped: frozenset | set = frozenset(),
+    scale: float = RING_SCALE,
+    segments: int = RING_SEGMENTS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(positions, colors)`` drawing one plane's derived sets as thin
+    paths - the same rows ``derived_rgba`` fills, outlined instead.
+
+    Strokes are opaque: a hairline at the fill overlay's opacity is
+    invisible. Only rejected rows draw dimmed, and the selection and the
+    group keep their white ring.
+    """
+    comps, _sel, halo = derived_comps(sets_on_z, 1.0, selected, grouped)
+    return outline_data(comps, mode, halo, scale, segments)
 
 
 def display_trace(entry: dict, correct_neuropil: bool = True) -> np.ndarray:
@@ -358,8 +576,12 @@ def display_fneu(entry: dict) -> np.ndarray | None:
 
 
 def component_color(s: DerivedSet, k: int) -> tuple[float, float, float]:
-    """One component's rgb in 0-1: its class color when labeled, else a hue
-    of its own - the same treatment drawn ROIs get."""
+    """One component's rgb in 0-1: its explicit group color when set, its
+    class color when labeled, else a hue of its own - the same treatment
+    drawn ROIs get."""
+    rgb = s.colors.get(k)
+    if rgb is not None:
+        return tuple(rgb)
     ci = s.classes.get(k)
     if ci is not None:
         return class_color(ci)
@@ -496,9 +718,30 @@ def scan_run_dirs(fpath) -> list[dict]:
     return rows
 
 
-def full_plane_args(kind: str, fpath, plane_1based: int, iw) -> dict:
-    """Minimal ``task_suite2p`` / ``task_masknmf`` worker args for one
-    plane, writing beside the data; the worker fills in every default."""
+def full_plane_args(kind: str, fpath, plane_1based: int, iw, host=None) -> dict:
+    """``task_suite2p`` / ``task_masknmf`` worker args for one plane.
+
+    Parameters
+    ----------
+    kind : {"suite2p", "masknmf"}
+        Which pipeline to run.
+    fpath : path-like
+        The data to run on; outputs are written beside it.
+    plane_1based : int
+        The z-plane to run, 1-based.
+    iw : MboNDViewer
+        The viewer, for its reader settings.
+    host : PreviewDataWidget, optional
+        The widget holding the Run tab's live settings. Given one, the run
+        uses exactly the parameters configured there - including the
+        Registration / Detection skip / run / force toggles - instead of the
+        pipeline's defaults.
+
+    Returns
+    -------
+    dict
+        Worker args for the task named by ``kind``.
+    """
     if fpath is None:
         raise ValueError("no data path to run a full plane on")
     if kind not in ("suite2p", "masknmf"):
@@ -512,10 +755,53 @@ def full_plane_args(kind: str, fpath, plane_1based: int, iw) -> dict:
         "reader_kwargs": widget_reader_kwargs(iw),
     }
     if kind == "masknmf":
-        from mbo_utilities.masknmf.params import MasknmfSettings
-
-        args["settings"] = MasknmfSettings().to_dict()
+        args["settings"] = masknmf_settings(host) or _default_masknmf_settings()
+        return args
+    s2p = getattr(host, "s2p", None)
+    # This button exists to find ROIs on this plane, so say so outright.
+    # lsp merges the source plane dir's ops.npy under the caller's ops, and
+    # a dir written by a registration pass carries roidetect=0 - which wins
+    # over anything the caller leaves unspelled and silently turns the run
+    # into "regenerate figures only".
+    detect = 1 if s2p is None else int(bool(getattr(s2p, "do_detection", 1)))
+    args["ops"] = {"roidetect": detect}
+    # This button means "detect now", so the run has to say that twice.
+    # roidetect alone is not enough: lsp skips detection whenever the plane
+    # dir already holds a stat.npy, and the staging step copies one in from
+    # the source dir - which for a re-analysed plane is another pipeline's
+    # run ("Registration and detection already complete, skipping suite2p").
+    # force_detect is the only way past that; force_reg stays the tri-state,
+    # because re-registering is expensive and rarely what this button means.
+    args["s2p_settings"] = {
+        "force_reg": s2p is not None and int(getattr(s2p, "do_registration", 1)) == 2,
+        "force_detect": bool(detect),
+    }
+    if s2p is None:
+        return args
+    args["settings"] = s2p.to_dict()
+    db = getattr(host, "s2p_db", None)
+    if db is not None:
+        args["db"] = db.to_dict()
     return args
+
+
+def _default_masknmf_settings() -> dict:
+    from mbo_utilities.masknmf.params import MasknmfSettings
+
+    return MasknmfSettings().to_dict()
+
+
+def masknmf_settings(host) -> dict | None:
+    """The masknmf settings the Run tab is holding, or None when it has not
+    built that pipeline yet."""
+    instances = getattr(host, "_pipeline_instances", None) or {}
+    settings = getattr(instances.get("MaskNMF"), "settings", None)
+    if settings is None:
+        return None
+    try:
+        return settings.to_dict()
+    except Exception:
+        return None
 
 
 def registry_path(fpath) -> Path:
@@ -548,13 +834,18 @@ def load_run_registry(path) -> list[dict]:
                         int(k): int(v)
                         for k, v in (row.get("classes") or {}).items()
                     },
+                    "colors": {
+                        int(k): tuple(float(x) for x in v)
+                        for k, v in (row.get("colors") or {}).items()
+                    },
                 }
             )
     return out
 
 
 def save_run_registry(path, entries: list[dict]) -> None:
-    """Write the sidecar: ``{"runs": [{"path", "kind", "discarded", "classes"}]}``."""
+    """Write the sidecar: ``{"runs": [{"path", "kind", "discarded", "classes",
+    "colors"}]}``."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     runs = [
@@ -564,6 +855,10 @@ def save_run_registry(path, entries: list[dict]) -> None:
             "discarded": sorted(int(i) for i in e.get("discarded", [])),
             "classes": {
                 str(k): int(v) for k, v in (e.get("classes") or {}).items()
+            },
+            "colors": {
+                str(k): [float(x) for x in v]
+                for k, v in (e.get("colors") or {}).items()
             },
         }
         for e in entries

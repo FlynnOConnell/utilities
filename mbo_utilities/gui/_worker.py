@@ -193,89 +193,72 @@ def _start_watchdog(uuid: str | None, logger: logging.Logger, log_file: str | No
     t.start()
 
 
-def _resolve_mem_interval() -> float:
-    """Memory-monitor sample interval in seconds, or 0 when off.
+def _resolve_mem_settings() -> tuple[float, float, float]:
+    """(tick_s, log_s, warn_pct) for this worker's memory monitor.
 
-    Off by default. The MBO_MEM_LOG_INTERVAL env var overrides when set;
-    otherwise the persisted preference (File -> Options) decides.
+    Tick 0 means off. Env vars win so an HPC submission can dial the rates
+    without touching the gui preferences:
+
+      MBO_MEM_LOG_INTERVAL  sample (tick) interval, seconds
+      MBO_MEM_LOG_EVERY     seconds between log lines (0 = every tick)
+      MBO_MEM_WARN_PCT      warn at/above this system-memory percent (0 = off)
     """
-    raw = os.environ.get("MBO_MEM_LOG_INTERVAL")
-    if raw is not None:
+    def _env(name: str) -> float | None:
+        raw = os.environ.get(name)
+        if raw is None:
+            return None
         try:
             return float(raw)
         except ValueError:
-            return 0.0
-    try:
-        from mbo_utilities.preferences import get_mem_monitor, get_mem_monitor_interval
-        if get_mem_monitor():
-            return float(get_mem_monitor_interval())
-    except Exception:
-        pass
-    return 0.0
+            return None
+
+    tick = _env("MBO_MEM_LOG_INTERVAL")
+    log_s = _env("MBO_MEM_LOG_EVERY")
+    warn = _env("MBO_MEM_WARN_PCT")
+
+    if tick is None or log_s is None or warn is None:
+        try:
+            from mbo_utilities.preferences import (
+                get_mem_monitor,
+                get_mem_monitor_interval,
+                get_mem_log_interval,
+                get_mem_warn_pct,
+            )
+            if tick is None:
+                tick = float(get_mem_monitor_interval()) if get_mem_monitor() else 0.0
+            if log_s is None:
+                log_s = float(get_mem_log_interval())
+            if warn is None:
+                warn = float(get_mem_warn_pct())
+        except Exception:
+            pass
+
+    return (tick or 0.0), (log_s if log_s is not None else 0.0), (warn or 0.0)
 
 
 def _start_mem_monitor(uuid: str | None, logger: logging.Logger):
-    """daemon thread that samples system + process-tree memory to a csv.
+    """Sample system + process-tree memory to logs/mem_<uuid>.csv.
 
-    Samples every interval seconds into logs/mem_<uuid>.csv, flushing each
-    row so the last sample survives a hard OOM kill. An INFO line goes to
-    the task log on the first sample and on each new pipeline-memory peak;
-    the rest are DEBUG.
+    Every tick is a csv row (flushed, so the last sample survives a hard OOM
+    kill); log lines are throttled to their own rate, with new pipeline-memory
+    peaks and high-memory warnings still getting through immediately.
     """
-    interval = _resolve_mem_interval()
-    if interval <= 0:
-        return
+    tick, log_s, warn_pct = _resolve_mem_settings()
+    if tick <= 0:
+        return None
 
-    from mbo_utilities._sysmem import mem_snapshot, format_mem_line
+    from mbo_utilities._sysmem import MemoryMonitor
+    from mbo_utilities.preferences import get_mbo_dirs
 
-    def _monitor():
-        from mbo_utilities.preferences import get_mbo_dirs
-        log_dir = get_mbo_dirs()["logs"]
-        log_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = log_dir / f"mem_{uuid or os.getpid()}.csv"
-        start = time.time()
-        peak = 0.0
-        first = True
-        f = None
-        try:
-            f = open(csv_path, "a", encoding="utf-8")
-            if f.tell() == 0:
-                f.write(
-                    "t_iso,elapsed_s,sys_pct,used_gb,total_gb,"
-                    "proc_gb,nproc,top_pid,top_name,top_gb\n"
-                )
-            while True:
-                time.sleep(interval)
-                try:
-                    s = mem_snapshot()
-                except Exception:
-                    continue
-                top = s.get("top")
-                tp, tn, tgb = (top[0], str(top[1]).replace(",", " "), top[2]) if top else ("", "", 0.0)
-                try:
-                    f.write(
-                        f"{time.strftime('%Y-%m-%dT%H:%M:%S')},{time.time() - start:.1f},"
-                        f"{s['sys_pct']:.1f},{s['used_gb']:.3f},{s['total_gb']:.3f},"
-                        f"{s.get('proc_gb', 0.0):.3f},{s.get('nproc', 0)},{tp},{tn},{tgb:.3f}\n"
-                    )
-                    f.flush()
-                except Exception:
-                    pass
-                pg = s.get("proc_gb", 0.0)
-                if first or pg > peak + 0.1:
-                    peak = max(peak, pg)
-                    first = False
-                    logger.info(format_mem_line(s))
-                else:
-                    logger.debug(format_mem_line(s))
-        finally:
-            if f is not None:
-                try:
-                    f.close()
-                except Exception:
-                    pass
-
-    threading.Thread(target=_monitor, daemon=True).start()
+    log_dir = get_mbo_dirs()["logs"]
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return MemoryMonitor(
+        tick_s=tick,
+        log_s=log_s,
+        warn_pct=warn_pct,
+        csv_path=log_dir / f"mem_{uuid or os.getpid()}.csv",
+        logger=logger,
+    ).start()
 
 
 def _contain_in_job():

@@ -1,4 +1,4 @@
-> **Experimental demo fork of [mbo_utilities](https://github.com/MillerBrainObservatory/mbo_utilities)**
+> **A fork of [mbo_utilities](https://github.com/MillerBrainObservatory/mbo_utilities) for Program in Memory Longevity (PML)**
 
 <p align="center">
 <img src="mbo_utilities/assets/static/logo_utilities.png" height="220" alt="MBO Utilities logo">

@@ -65,6 +65,7 @@ __all__ = [
     "RoiSelection",
     "RunResult",
     "as_movie",
+    "detection_algo",
     "load_rois",
     "load_run_dir",
     "select_rois",
@@ -79,7 +80,10 @@ __all__ = [
     "extract_rois",
     "demix_rois",
     "discover_rois",
+    "extract_linescan_traces",
+    "extract_linescan_units",
     "feather_mask",
+    "pmd_crop",
     "run",
 ]
 
@@ -367,15 +371,43 @@ def feather_mask(mask: np.ndarray, edge_width: int = 3) -> np.ndarray:
     return np.clip(inside / max(int(edge_width), 1), 0.0, 1.0).astype(np.float32)
 
 
+def _factorized(arr) -> bool:
+    """True for masknmf factorized arrays, whose ``__getitem__`` reconstructs
+    only the requested crop; frame batching then just adds overhead."""
+    return callable(getattr(arr, "getitem_tensor", None))
+
+
 def roi_trace(source, mask: np.ndarray, t=slice(None), *, z: int = 0, c: int = 0, batch: int = 500, weights: np.ndarray | None = None) -> np.ndarray:
     """Mean over ``mask`` per frame, reading only the mask's bounding box.
 
-    ``source`` is anything :func:`as_movie` takes. Frames are read in
-    ``batch``-sized blocks so a long movie never lands in RAM at once.
-    ``weights`` (a full-frame image, e.g. :func:`feather_mask`) makes it a
-    weighted mean over the mask's pixels.
+    Parameters
+    ----------
+    source
+        Anything :func:`as_movie` accepts - a lazy array, a numpy array, a
+        ``PlaneMovie`` or an ``imread``-able path.
+    mask : np.ndarray
+        ``(Y, X)`` boolean mask.
+    t : slice or int, optional
+        Frames to read; all by default.
+    z, c : int, optional
+        Plane and channel passed to :func:`as_movie`.
+    batch : int, optional
+        Frames per read on a raw movie, so a long recording never lands in
+        RAM at once. A masknmf factorized array (``PMDArray``, ``ACArray``,
+        ``ResidualArray``, ...) reconstructs only the bounding box, so it is
+        read in a single call regardless of ``batch``.
+    weights : np.ndarray, optional
+        Full-frame weight image (e.g. :func:`feather_mask`); makes the trace
+        a weighted mean over the mask's pixels.
+
+    Returns
+    -------
+    np.ndarray
+        ``(num_frames,)`` float32 trace.
     """
     movie = as_movie(source, z=z, c=c)
+    if _factorized(movie.arr):
+        batch = movie.shape[0]
     y0, y1, x0, x1 = _bbox(mask)
     m = np.asarray(mask, bool)[y0:y1, x0:x1]
     w = None
@@ -396,8 +428,30 @@ def roi_trace(source, mask: np.ndarray, t=slice(None), *, z: int = 0, c: int = 0
 
 
 def pixel_trace(source, row: int, col: int, t=slice(None), *, z: int = 0, c: int = 0, batch: int = 2000) -> np.ndarray:
-    """One pixel's value per frame - ``movie[t, row, col]``."""
+    """One pixel's value per frame - ``movie[t, row, col]``.
+
+    Parameters
+    ----------
+    source
+        Anything :func:`as_movie` accepts.
+    row, col : int
+        Pixel coordinates in the frame.
+    t : slice or int, optional
+        Frames to read; all by default.
+    z, c : int, optional
+        Plane and channel passed to :func:`as_movie`.
+    batch : int, optional
+        Frames per read on a raw movie; a masknmf factorized array is read
+        in a single call.
+
+    Returns
+    -------
+    np.ndarray
+        ``(num_frames,)`` float32 trace.
+    """
     movie = as_movie(source, z=z, c=c)
+    if _factorized(movie.arr):
+        batch = movie.shape[0]
     nt, ny, nx = movie.shape
     if not (0 <= row < ny and 0 <= col < nx):
         raise IndexError(f"pixel ({row}, {col}) outside {ny}x{nx}")
@@ -523,6 +577,32 @@ class RunResult:
     iscell: np.ndarray | None
     uids: np.ndarray | None
     store_indices: np.ndarray | None
+    #: which detector produced these rows ("s2p-sparsery", "masknmf", ...);
+    #: "" for a result built without ops (tests, hand-made results)
+    algo: str = ""
+
+
+def detection_algo(ops: dict) -> str:
+    """Which detector produced a run dir's ROIs.
+
+    suite2p picks its detector from ops rather than from a name, so report
+    the algorithm the run actually used - sourcery, sparsery or cellpose -
+    instead of the bare "suite2p" that says nothing about the components.
+    """
+    wf = ops.get("roi_workflow") or {}
+    engine = str(
+        wf.get("engine")
+        or ("masknmf" if ops.get("pipeline") == "masknmf" else "suite2p")
+    )
+    if engine != "suite2p":
+        return engine
+    # same derivation lbm_suite2p_python uses (db_settings), so a run dir
+    # reports the detector it was actually configured with
+    if ops.get("algorithm"):
+        return f"s2p-{ops['algorithm']}"
+    if ops.get("anatomical_only"):
+        return "s2p-cellpose"
+    return "s2p-sparsery" if ops.get("sparse_mode", True) else "s2p-sourcery"
 
 
 def load_run_dir(path: str | Path, *, iscell_only: bool = True, logger=None) -> RunResult:
@@ -607,7 +687,7 @@ def load_run_dir(path: str | Path, *, iscell_only: bool = True, logger=None) -> 
     return RunResult(
         path=path, kind=str(kind), z=z, shape=(int(ops["Ly"]), int(ops["Lx"])),
         stat=stat, F=F, Fneu=Fneu, norm=norm, iscell=iscell,
-        uids=uids, store_indices=store_indices,
+        uids=uids, store_indices=store_indices, algo=detection_algo(ops),
     )
 
 
@@ -715,8 +795,32 @@ def register(
                 raise FileNotFoundError(f"registration produced no plane dir for plane {p}")
             d = cands[0]
         dirs.append(d)
+        _drop_run_gates(d / "ops.npy", logger)
     logger.info(f"roi_workflow: registration done in {time.time() - t0:.1f}s")
     return dirs
+
+
+def _drop_run_gates(ops_path: Path, logger) -> None:
+    """Strip ``roidetect`` from a plane dir's ops.npy after registration.
+
+    ``roidetect=0`` is how this function asks suite2p for registration
+    only; it is an instruction for one run, not a property of the data.
+    Left in ops.npy it is inherited by every later stage (masknmf's
+    merge_ops keeps it, lsp lets it win over settings that do not spell
+    it) and the GUI hydrates it as "Detection: Skip" - which is how a
+    suite2p run ends up regenerating figures and finding no ROIs.
+    """
+    try:
+        if not ops_path.exists():
+            return
+        ops = np.load(ops_path, allow_pickle=True).item()
+        if not isinstance(ops, dict) or "roidetect" not in ops:
+            return
+        ops.pop("roidetect")
+        np.save(ops_path, ops)
+        logger.debug(f"roi_workflow: dropped roidetect from {ops_path}")
+    except Exception as error:  # noqa: BLE001 - never fail a run over this
+        logger.warning(f"roi_workflow: could not clean {ops_path}: {error}")
 
 
 # ---------------------------------------------------------------------------
@@ -770,7 +874,14 @@ def _ops_for(source, movie: PlaneMovie) -> dict:
     if p is not None:
         d = p if p.is_dir() else p.parent
         if (d / "ops.npy").exists():
-            return np.load(d / "ops.npy", allow_pickle=True).item()
+            from mbo_utilities.metadata.base import normalize_ops_arrays
+
+            # an ops.npy written before the images were normalized carries
+            # them as JSON lists; repair on the way through rather than
+            # copying the breakage into this run's outputs
+            return normalize_ops_arrays(
+                np.load(d / "ops.npy", allow_pickle=True).item()
+            )
     nt, ly, lx = movie.shape
     ops = {"Ly": ly, "Lx": lx, "nframes": nt, "processing_history": []}
     meta = getattr(movie.arr, "metadata", None) or {}
@@ -1117,6 +1228,111 @@ def extract_rois(
 
 
 # ---------------------------------------------------------------------------
+# cropping an existing PMD decomposition
+# ---------------------------------------------------------------------------
+
+
+def pmd_crop(pmd, y0: int, y1: int, x0: int, x1: int):
+    """Spatially crop a ``masknmf.PMDArray`` without recompressing.
+
+    Row-selects the sparse spatial basis (and the local projector / trend
+    basis when present) and crops the mean / variance images, so the result
+    is the parent decomposition restricted to the window - exact, and
+    effectively free next to a new PMD run on the crop.
+
+    Parameters
+    ----------
+    pmd : masknmf.PMDArray
+        Parent decomposition of shape ``(T, H, W)``.
+    y0, y1, x0, x1 : int
+        Crop bounds, ``0 <= y0 < y1 <= H`` and ``0 <= x0 < x1 <= W``.
+
+    Returns
+    -------
+    masknmf.PMDArray
+        Decomposition of shape ``(T, y1 - y0, x1 - x0)`` sharing the
+        parent's temporal basis, device, and rescale / trend settings.
+    """
+    import torch
+    from masknmf import PMDArray
+
+    nt, h, w = pmd.shape
+    y0, y1, x0, x1 = int(y0), int(y1), int(x0), int(x1)
+    if not (0 <= y0 < y1 <= h and 0 <= x0 < x1 <= w):
+        raise IndexError(f"crop ({y0}:{y1}, {x0}:{x1}) outside {h}x{w}")
+    idx = torch.arange(h * w, device=pmd.device).reshape(h, w)[y0:y1, x0:x1].reshape(-1)
+    proj = pmd.u_local_projector
+    trend = pmd.spatial_trend_basis
+    return PMDArray.from_tensors(
+        (nt, y1 - y0, x1 - x0),
+        torch.index_select(pmd.u, 0, idx),
+        pmd.v,
+        pmd.mean_img[y0:y1, x0:x1],
+        pmd.var_img[y0:y1, x0:x1],
+        u_local_projector=torch.index_select(proj, 0, idx) if proj is not None else None,
+        spatial_trend_basis=trend[idx] if trend is not None else None,
+        temporal_trend_basis=pmd.temporal_trend_basis if trend is not None else None,
+        device=pmd.device,
+        rescale=pmd.rescale,
+        include_trend=pmd.include_trend,
+    )
+
+
+def _cached_pmd_crop(source, movie: PlaneMovie, cfg, logger) -> tuple[object, str] | None:
+    """Cropped ``PMDArray`` built from the source plane's cached compression.
+
+    Parameters
+    ----------
+    source
+        The plane source ``movie`` was opened from; its plane dir is where
+        the cached ``compression.hdf5`` is looked up.
+    movie : PlaneMovie
+        The crop to serve; its ``box`` gives the window.
+    cfg : MasknmfCompressionSettings
+        Current compression settings; the cache is only reused when its
+        stored settings hash matches and compression is not forced.
+    logger
+        Workflow logger.
+
+    Returns
+    -------
+    tuple of (masknmf.PMDArray, str) or None
+        The cropped decomposition and its provenance key, or None when there
+        is no usable cache (no plane dir, no file, stale settings, a shape
+        mismatch, or ``movie`` is not a crop).
+    """
+    from mbo_utilities.masknmf import runner as _runner
+    from mbo_utilities.masknmf.params import PMD_FILE, STAGE_FORCE
+
+    box = movie.box
+    if box is None or cfg.do_compression == STAGE_FORCE:
+        return None
+    src = _source_path(source)
+    if src is None:
+        return None
+    pmd_path = (src if src.is_dir() else src.parent) / PMD_FILE
+    if not pmd_path.exists():
+        return None
+    stored = _runner._read_provenance(pmd_path)
+    if stored is None or stored.get("settings") != _runner._stage_hash(cfg, "do_compression"):
+        return None
+
+    import masknmf
+
+    try:
+        pmd = masknmf.PMDArray.from_hdf5(str(pmd_path))
+    except Exception as e:
+        logger.warning(f"roi_workflow: cached {pmd_path.name} unusable ({e}); recompressing crop")
+        return None
+    size = dict(zip(movie.dims, (int(s) for s in movie.arr.shape)))
+    if tuple(pmd.shape) != (movie.shape[0], size["Y"], size["X"]):
+        return None
+    y0, y1, x0, x1 = box
+    logger.info(f"roi_workflow: cropping cached {pmd_path.name} to ({y0}:{y1}, {x0}:{x1})")
+    return pmd_crop(pmd, y0, y1, x0, x1), f"pmd_crop:{pmd_path}:{box}"
+
+
+# ---------------------------------------------------------------------------
 # demixing (masknmf, seeded with the drawn masks)
 # ---------------------------------------------------------------------------
 
@@ -1140,7 +1356,9 @@ def demix_rois(
     PMD compression runs through the same ``PlaneMovie`` view, so any
     spatially sliceable array works; its result is cached as
     ``compression.hdf5`` next to the outputs (a plane dir's earlier masknmf
-    cache is reused). Outputs are masknmf's usual suite2p-shaped sidecars
+    cache is reused). A cropped view of an already-compressed plane skips
+    compression entirely: the plane's cached decomposition is cropped from
+    its factors (:func:`pmd_crop`). Outputs are masknmf's usual suite2p-shaped sidecars
     plus ``demixing_results.hdf5``.
 
     NMF may merge or delete seeds, so the number of output components can be
@@ -1186,15 +1404,20 @@ def demix_rois(
         )
         s.compression.detrend = False
 
-    # PMD through the movie view: reuse the cache, else compute
+    # PMD through the movie view: crop a cached plane decomposition, else
+    # reuse this view's cache, else compute
     src = _source_path(source)
     fingerprint = _movie_fingerprint(movie, src)
-    pmd, comp_seconds, pmd_key = _runner._stage_compression(
-        movie, s.compression, s.runtime, cache_dir, dev, np.ones((ly, lx), float), fs, logger,
-        f"registered:{fingerprint}", False,
-    )
-    if pmd is None:
-        raise ValueError("compression skipped and no cached compression.hdf5 to demix from")
+    cached = _cached_pmd_crop(source, movie, s.compression, logger)
+    if cached is not None:
+        pmd, comp_seconds, pmd_key = cached[0], 0.0, cached[1]
+    else:
+        pmd, comp_seconds, pmd_key = _runner._stage_compression(
+            movie, s.compression, s.runtime, cache_dir, dev, np.ones((ly, lx), float), fs, logger,
+            f"registered:{fingerprint}", False,
+        )
+        if pmd is None:
+            raise ValueError("compression skipped and no cached compression.hdf5 to demix from")
 
     # seed footprints: one binary column per selected ROI
     a0 = np.zeros((ly, lx, K), np.float32)
@@ -1315,7 +1538,10 @@ def discover_rois(
     Everything runs on the crop - masknmf's superpixel initialisation
     (``engine="masknmf"``) or suite2p's detector plus its extractor
     (``engine="suite2p"``) - and ``stat.npy`` is written back in full-frame
-    coordinates, so the outputs read like any other run dir.
+    coordinates, so the outputs read like any other run dir. When the plane
+    already has a ``compression.hdf5`` computed with the same settings, the
+    crop's PMD is built from those factors (:func:`pmd_crop`) instead of
+    recompressing.
 
     Returns the output dir (``out_dir`` or ``rois_<tag>/`` beside the
     source), or ``None`` when nothing is found in the region - an ordinary
@@ -1373,12 +1599,16 @@ def discover_rois(
         detrend_ok = bool(fs) and nframes >= 2 * int(40 * fs)
         if fs and not detrend_ok:
             s.compression.detrend = False
-        pmd, comp_seconds, pmd_key = _runner._stage_compression(
-            crop, s.compression, s.runtime, out_dir, dev, np.ones((h, w), float), fs, logger,
-            f"registered:{_movie_fingerprint(crop, _source_path(source))}", False,
-        )
-        if pmd is None:
-            raise ValueError("compression skipped and no cached compression.hdf5 to demix from")
+        cached = _cached_pmd_crop(source, crop, s.compression, logger)
+        if cached is not None:
+            pmd, comp_seconds, pmd_key = cached[0], 0.0, cached[1]
+        else:
+            pmd, comp_seconds, pmd_key = _runner._stage_compression(
+                crop, s.compression, s.runtime, out_dir, dev, np.ones((h, w), float), fs, logger,
+                f"registered:{_movie_fingerprint(crop, _source_path(source))}", False,
+            )
+            if pmd is None:
+                raise ValueError("compression skipped and no cached compression.hdf5 to demix from")
         detrender = None
         if detrend_ok:
             from masknmf.compression.preprocessing import MaximinSplineDetrend
@@ -1455,6 +1685,164 @@ def discover_rois(
     )
     logger.info(f"roi_workflow: discovered {len(stat)} ROIs -> {out} ({info['seconds']}s)")
     return out
+
+
+# ---------------------------------------------------------------------------
+# line-scan trace extraction (AOD/.mesc units where Z is already the ROI axis)
+# ---------------------------------------------------------------------------
+
+
+def _dfof_maxmin(
+    F: np.ndarray, fs: float, window_s: float = 5.0, sigma_s: float = 0.05
+) -> np.ndarray:
+    """Rolling max-min baseline dF/F, no neuropil term.
+
+    Same two-pass smooth -> rolling-max -> rolling-min baseline as a
+    suite2p-style dF/F, but sized in seconds via ``fs`` rather than a fixed
+    frame count: a line-scan's frame rate (~1-2.5 kHz) is one to two orders
+    of magnitude higher than a raster-scanned movie's (~10-30 Hz), so a
+    fixed frame-count window would be the wrong number of seconds here.
+    Uses ``scipy.ndimage``'s O(T) sliding max/min filters rather than a
+    per-frame python loop, since a line-scan run has far more timepoints.
+    """
+    from scipy.ndimage import gaussian_filter1d, maximum_filter1d, minimum_filter1d
+
+    fs = float(fs)
+    window = max(3, int(round(window_s * fs)))
+    sigma = max(0.5, sigma_s * fs)
+    smoothed = gaussian_filter1d(F, sigma=sigma, axis=1)
+    rolled_max = maximum_filter1d(smoothed, size=window, axis=1, mode="nearest")
+    baseline = minimum_filter1d(rolled_max, size=window, axis=1, mode="nearest")
+    return ((F - baseline) / baseline).astype(np.float32)
+
+
+def extract_linescan_traces(
+    source,
+    *,
+    channel: int = 0,
+    out_dir: str | Path | None = None,
+    compute_dfof: bool = True,
+    dfof_window_s: float = 5.0,
+    batch_size: int = 5000,
+    tag: str = "linescan",
+    logger=None,
+) -> Path:
+    """Per-ROI kymograph traces from a linescan ``.mesc`` unit.
+
+    A linescan MESc unit already has each dendrite/spine ROI on its own
+    Z-index - the file's own MultiROI protocol did the spatial separation -
+    so there is no mask to draw and no 2D field of view to register, and
+    this does not go through :func:`extract_rois` / :func:`demix_rois`.
+    Each ROI's true (unpadded) extent is read from
+    ``arr.metadata["mesc_roi_extents"]`` and reduced to one trace per
+    timepoint (mean over the ROI's real height x width, in
+    ``batch_size``-frame chunks); ``Fneu`` is all zero - there is no
+    neuropil concept for a line-scan ROI.
+
+    Only linescan units (``mesc_layout == "packed"``) are supported.
+    Ribbon-scan (``"boxes"``) and chessboard (``"tiled"``, real 2D tiles
+    that belong in masknmf/suite2p instead) raise ``ValueError``.
+
+    Returns the output dir (``out_dir`` or ``rois_<tag>/`` beside the
+    source), with the usual store-less sidecars (:func:`_write_discovery_outputs`)
+    plus ``dfof.npy`` when ``compute_dfof`` is set.
+    """
+    logger = logger or log.get("roi_workflow")
+    arr = source
+    if isinstance(arr, (str, Path)):
+        from mbo_utilities.reader import imread
+
+        arr = imread(arr)
+    md = arr.metadata
+    if md.get("mesc_z_axis_meaning") != "roi_index" or md.get("mesc_layout") != "packed":
+        raise ValueError(
+            "extract_linescan_traces only handles linescan units "
+            f"(mesc_layout='packed'); got mesc_layout={md.get('mesc_layout')!r}, "
+            f"modality={md.get('mesc_modality_name')!r}"
+        )
+    extents = md["mesc_roi_extents"]
+    K = len(extents)
+    fs = float(md["fs"])
+    t0 = time.time()
+    logger.info(f"roi_workflow: extracting {K} linescan ROIs, channel={channel}")
+
+    movies = [as_movie(arr, z=i, c=channel) for i in range(K)]
+    T = movies[0].shape[0]
+    F = np.zeros((K, T), np.float32)
+    for i, (movie, ext) in enumerate(zip(movies, extents)):
+        h, w = int(ext["height"]), int(ext["width"])
+        for tt0 in range(0, T, batch_size):
+            tt1 = min(T, tt0 + batch_size)
+            blk = movie.frames(tt0, tt1, slice(0, h), slice(0, w)).astype(np.float32, copy=False)
+            F[i, tt0:tt1] = blk.reshape(blk.shape[0], -1).mean(axis=1)
+
+    Fneu = np.zeros_like(F)
+    stat = np.array(
+        [
+            {
+                "roi_index": int(ext["index"]),
+                "y_start": int(ext["y_start"]),
+                "height": int(ext["height"]),
+                "width": int(ext["width"]),
+                "npix": int(ext["height"]) * int(ext["width"]),
+                "comment": md.get("comment", ""),
+            }
+            for ext in extents
+        ],
+        dtype=object,
+    )
+    ops = _ops_for(source, movies[0])
+    info = {
+        "process": "extract_linescan",
+        "engine": "linescan",
+        "channel": int(channel),
+        "n_rois": K,
+        "dfof": bool(compute_dfof),
+        # each ROI is its own Z-index (see mesc_roi_extents), not a single
+        # shared plane - _write_discovery_outputs's rois.json wants a value
+        # here regardless, so 0 is a placeholder, not a meaningful plane.
+        "plane": 0,
+        "seconds": round(time.time() - t0, 3),
+    }
+    out_dir = Path(out_dir) if out_dir is not None else _default_out_dir(source, tag)
+    out = _write_discovery_outputs(
+        out_dir, source=source, ops=ops, stat=stat, F=F, Fneu=Fneu, info=info,
+    )
+    if compute_dfof:
+        dfof = _dfof_maxmin(F, fs=fs, window_s=dfof_window_s)
+        np.save(out / "dfof.npy", dfof)
+    logger.info(
+        f"roi_workflow: wrote {K} linescan traces -> {out} ({info['seconds']}s)"
+    )
+    return out
+
+
+def extract_linescan_units(
+    mesc_path: str | Path,
+    *,
+    channel: int = 0,
+    out_root: str | Path | None = None,
+    **kwargs,
+) -> dict[str, Path]:
+    """Run :func:`extract_linescan_traces` on every linescan unit in a ``.mesc`` file.
+
+    Returns ``{unit_key: out_dir}`` for each unit with
+    ``kind == "packed"`` (skips ribbon/chessboard/zstack/multicube/timeseries
+    units in the same file).
+    """
+    from mbo_utilities.arrays.mesc import MescArray, list_mesc_units
+
+    out_root = Path(out_root) if out_root is not None else None
+    outputs: dict[str, Path] = {}
+    for u in list_mesc_units(mesc_path):
+        if u["kind"] != "packed":
+            continue
+        arr = MescArray(mesc_path, unit=u["key"])
+        out_dir = (out_root / u["munit"]) if out_root is not None else None
+        outputs[u["key"]] = extract_linescan_traces(
+            arr, channel=channel, out_dir=out_dir, **kwargs
+        )
+    return outputs
 
 
 # ---------------------------------------------------------------------------

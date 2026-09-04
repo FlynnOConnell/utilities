@@ -588,6 +588,23 @@ def task_suite2p(args: dict, logger: logging.Logger) -> None:
         "use_fft": args.get("use_fft", True),
     }
 
+    # a detection-only re-run copies the source ops.npy rather than writing
+    # a new one, so images left there as JSON lists by an older export would
+    # reach suite2p's plotting as lists and every figure that indexes .shape
+    # would fail. repair both ends before handing them over.
+    from mbo_utilities.metadata import repair_ops_tree
+
+    for target in (input_path, output_dir):
+        try:
+            fixed = repair_ops_tree(target)
+            if fixed:
+                logger.info(
+                    f"task_suite2p: repaired {fixed} ops.npy file(s) under {target} "
+                    "(summary images were stored as lists)"
+                )
+        except Exception as _e:  # noqa: BLE001 - never block the run on this
+            logger.warning(f"task_suite2p: ops.npy repair pass failed for {target}: {_e}")
+
     # Rastermap Force → drop cached model.npy in every plane subdir under
     # output_dir before pipeline runs. lsp's plot_zplane_figures already
     # deletes the rastermap PNG every run, but reuses model.npy when its
@@ -762,6 +779,22 @@ def task_masknmf(args: dict, logger: logging.Logger) -> None:
     logger.info(f"Input: {input_path}")
     logger.info(f"Output: {output_dir}")
     logger.info(f"Planes: {planes}")
+
+    # same repair the suite2p task does: a stage that resumes from an
+    # existing plane dir reads its ops.npy, and an older export may have
+    # left the summary images there as JSON lists
+    from mbo_utilities.metadata import repair_ops_tree
+
+    for target in (input_path, output_dir):
+        try:
+            fixed = repair_ops_tree(target)
+            if fixed:
+                logger.info(
+                    f"task_masknmf: repaired {fixed} ops.npy file(s) under {target} "
+                    "(summary images were stored as lists)"
+                )
+        except Exception as _e:  # noqa: BLE001 - never block the run on this
+            logger.warning(f"task_masknmf: ops.npy repair pass failed for {target}: {_e}")
 
     # periodic log line keeps the worker's stall watchdog fed through long
     # silent GPU stages (PMD / HALS)

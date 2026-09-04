@@ -3,17 +3,13 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "utilities"
+name = "pml_utilities"
 version = "3.3.4"
-description = "Various utilities for the Miller Brain Observatory"
+description = "A fork of mbo_utilities for Program in Memory Longevity (PML)"
 readme = "README.md"
 license = "BSD-3-Clause"
-requires-python = ">=3.12.7,<3.14"  # masknmf caps at <3.14
+requires-python = ">=3.12.7,<3.14"
 keywords = ["Microscopy", "ScanImage", "multiROI", "Tiff"]
-# Slim base: viewer (fastplotlib/imgui/wgpu) + IO + scan-phase only. Heavy
-# stacks (suite2p/torch, napari, jupyter, qt) are opt-in extras below so
-# `uvx --from mbo_utilities mbo <path>` installs fast. `[all]` restores the
-# full set.
 dependencies = [
 	"setuptools<81",
 	"click",
@@ -31,25 +27,15 @@ dependencies = [
 	"h5py",
 	"tqdm",
 	"icecream>=2.1.4",
-	# windowing backend for the fastplotlib canvas: glfw on win/mac, Qt on
-	# linux (glfw needs system X11/wayland libs there, so Qt is the default).
 	"glfw ; sys_platform != 'linux'",
 	"pyqt6>=6.7 ; sys_platform == 'linux'",
 	"pyqt6-sip ; sys_platform == 'linux'",
 	"pygfx>=0.15.2",
 	"llvmlite>=0.43.0",
 	"numba>=0.60.0",
-	# Unreleased branches, so PEP 508 direct references live here (not in a
-	# uv-only source/group) to keep `pip install git+...#egg=utilities[all]`
-	# working. fastplotlib is a commit on the ndwidget branch (NDWidget /
-	# add_imgui_window). It MUST stay byte-identical to masknmf's own
-	# fastplotlib pin below -- two different URLs for one package is a hard
-	# resolver error ("conflicting URLs for package fastplotlib") in both pip
-	# and uv, so when masknmf moves its pin, copy the new URL here verbatim.
 	"fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib@b2132e3d11b9e2bd641e0bbfc0bbee3d413d1d88",
-	# xarray-compatability: xarray-backed masknmf arrays; also the only place
-	# the multisession/classification extras exist (PyPI masknmf has neither).
-	"masknmf[multisession,classification] @ git+https://github.com/apasarkar/masknmf-toolbox.git@xarray-compatability",
+	"masknmf",
+	#"masknmf[multisession,classification] @ git+https://github.com/apasarkar/masknmf-toolbox.git@xarray-compatability",
 	"rendercanvas>=2.4.2",
 	"imgui-bundle>=1.92.801,<1.92.900",
 	"wgpu>=0.28.1",
@@ -60,15 +46,7 @@ dependencies = [
 [project.scripts]
 mbo = "mbo_utilities.cli:main"
 pollen = "pollen.pollen_calibration_mbo:main"
-# no `docs` entry point: scripts/ is deliberately not packaged (too generic a
-# top-level name to claim in site-packages) and build_docs builds the docs/
-# tree, which is not shipped either -- so it can only ever work from a repo
-# checkout. Its own docstring documents the supported invocation:
-#   uv run python scripts/build_docs.py
 
-# imread() dispatch loads every class in this group.
-# Third-party packages declare the same group to add formats without editing
-# mbo_utilities (see docs/forking.md). Built-ins also self-register on import.
 [project.entry-points."mbo_utilities.lazy_arrays"]
 lbm = "mbo_utilities.arrays.tiff:LBMArray"
 lbm_piezo = "mbo_utilities.arrays.tiff:LBMPiezoArray"
@@ -97,7 +75,6 @@ napari = [
     "pyqt6>=6.7",
     "qtpy",
 ]
-# notebook authoring / inline rendering.
 notebooks = [
     "jupyterlab>=4.2.6",
     "ipykernel",
@@ -125,24 +102,13 @@ docs = [
     "myst_nb",
     "pygfx>=0.14.0",
 ]
-all = ["utilities[napari,notebooks]"]
+all = ["pml_utilities[napari,notebooks]"]
 
 [tool.uv]
-# repo dev env keeps the full stack so `uv run mbo` is unchanged.
 default-groups = ["dev", "suite2p", "napari", "notebooks", "docs"]
-# uv-only (pip never sees these): drop the packages that make the suite2p
-# stack unresolvable alongside the ndwidget graphics stack. An override whose
-# marker never matches removes the dependency from the whole graph.
 override-dependencies = [
-	# lbm-suite2p-python requires PyPI mbo-utilities, which owns this same
-	# mbo_utilities import package and pins the pre-ndwidget stack
-	# (mbo-fastplotlib, imgui-bundle==1.92.5). This repo provides the package.
 	"mbo-utilities ; python_version < '0'",
-	# suite2p hard dep with no wheels past cp310; suite2p guards the import
-	# and mbo's own tiff readers feed it, so it is safe to drop.
 	"scanimage-tiff-reader ; python_version < '0'",
-	# cellpose pulls opencv-python-headless; opencv-contrib-python-headless
-	# (base dep, masknmf's pin) is the single cv2 provider here.
 	"opencv-python-headless ; python_version < '0'",
 ]
 
@@ -251,11 +217,8 @@ dev = [
     "pygetwindow>=0.0.9",
     "pytest>=8.4.2",
 ]
-# resolvable only under uv thanks to tool.uv.override-dependencies (see the
-# optional-dependencies comment); in default-groups so `uv sync` gets it.
 suite2p = [
     "lbm-suite2p-python[rastermap]>=3.3.2",
     "suite2p>=1.1.0",
     "rastermap>=0.9",
 ]
-# Local-only; auto-synced via default-groups so `uv run mbo` uses ../isoview.

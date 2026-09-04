@@ -27,6 +27,10 @@ from mbo_utilities.preferences import (
     set_mem_monitor,
     get_mem_monitor_interval,
     set_mem_monitor_interval,
+    get_mem_log_interval,
+    set_mem_log_interval,
+    get_mem_warn_pct,
+    set_mem_warn_pct,
 )
 from mbo_utilities.gui._imgui_helpers import PopupAutoSize
 
@@ -167,6 +171,87 @@ def _ensure_gpu_list(parent: Any) -> None:
     parent._options_gpu_labels = labels
 
 
+def sync_memory_options(obj: Any) -> None:
+    """Re-read the memory-monitor prefs into ``obj``'s widget state.
+
+    Called when a dialog opens so a change made from the CLI, a notebook or
+    the other options window isn't shadowed by a stale snapshot.
+    """
+    obj._mem_on = get_mem_monitor()
+    obj._mem_tick = get_mem_monitor_interval()
+    obj._mem_log_s = get_mem_log_interval()
+    obj._mem_warn_pct = get_mem_warn_pct()
+
+
+def draw_memory_options(obj: Any, tooltip: Any = None) -> None:
+    """Memory-monitor controls, shared by the launch dialog and File -> Options.
+
+    Preferences are the truth; ``obj`` only holds the in-flight widget state
+    (``_mem_*``) so a half-typed number survives a frame. ``tooltip`` is the
+    caller's tooltip function (the launch dialog wraps long text).
+
+    Tick and log rate are separate on purpose: the warn threshold wants a fast
+    tick to catch a spike, which is far more often than anyone wants a line in
+    the log.
+    """
+    if not hasattr(obj, "_mem_on"):
+        sync_memory_options(obj)
+    tip = tooltip if tooltip is not None else imgui.set_tooltip
+
+    changed, new_on = imgui.checkbox("Log memory usage", obj._mem_on)
+    if imgui.is_item_hovered():
+        tip(
+            "Sample RAM (system + this process tree) to logs/mem_<id>.csv "
+            "every tick, and to the task log at the log rate."
+        )
+    if changed:
+        obj._mem_on = new_on
+        set_mem_monitor(new_on)
+
+    imgui.begin_disabled(not obj._mem_on)
+    w = hello_imgui.em_size(4)
+
+    imgui.set_next_item_width(w)
+    changed, new_tick = imgui.input_float(
+        "tick (s)##mem_tick", obj._mem_tick, 0.0, 0.0, "%.2f"
+    )
+    if imgui.is_item_hovered():
+        tip("How often memory is sampled. Every sample is a csv row.")
+    if changed:
+        obj._mem_tick = max(0.25, new_tick)
+        set_mem_monitor_interval(obj._mem_tick)
+
+    imgui.same_line()
+    imgui.set_next_item_width(w)
+    changed, new_log = imgui.input_float(
+        "log (s)##mem_log", obj._mem_log_s, 0.0, 0.0, "%.1f"
+    )
+    if imgui.is_item_hovered():
+        tip(
+            "How often a sample is written to the task log. 0 logs every "
+            "tick. New memory peaks and warnings are logged regardless."
+        )
+    if changed:
+        obj._mem_log_s = max(0.0, new_log)
+        set_mem_log_interval(obj._mem_log_s)
+
+    imgui.same_line()
+    imgui.set_next_item_width(w)
+    changed, new_warn = imgui.input_float(
+        "warn (%)##mem_warn", obj._mem_warn_pct, 0.0, 0.0, "%.0f"
+    )
+    if imgui.is_item_hovered():
+        tip(
+            "Log a WARNING when system memory use reaches this percent. "
+            "0 disables the check. Pair it with a fast tick."
+        )
+    if changed:
+        obj._mem_warn_pct = min(100.0, max(0.0, new_warn))
+        set_mem_warn_pct(obj._mem_warn_pct)
+
+    imgui.end_disabled()
+
+
 def draw_options_popup(parent: Any) -> None:
     """Draw the Options popup. Open with ``parent._show_options_popup = True``.
 
@@ -182,10 +267,6 @@ def draw_options_popup(parent: Any) -> None:
         parent._options_gpu_idx = get_gpu_index()
     if not hasattr(parent, "_options_debug"):
         parent._options_debug = get_debug_logging()
-    if not hasattr(parent, "_options_mem"):
-        parent._options_mem = get_mem_monitor()
-    if not hasattr(parent, "_options_mem_interval"):
-        parent._options_mem_interval = get_mem_monitor_interval()
     if not hasattr(parent, "_options_compute_devices"):
         parent._options_compute_devices = []
 
@@ -194,8 +275,7 @@ def draw_options_popup(parent: Any) -> None:
         # window aren't shadowed by a stale snapshot.
         parent._options_gpu_idx = get_gpu_index()
         parent._options_debug = get_debug_logging()
-        parent._options_mem = get_mem_monitor()
-        parent._options_mem_interval = get_mem_monitor_interval()
+        sync_memory_options(parent)
         # nvidia-smi is a subprocess; refresh the compute-device list once per
         # open, not per frame.
         parent._options_compute_devices = compute_gpu_devices()
@@ -283,22 +363,7 @@ def draw_options_popup(parent: Any) -> None:
                 logging.DEBUG if new_debug else logging.INFO
             )
 
-        changed, new_mem = imgui.checkbox("Log memory usage", parent._options_mem)
-        if imgui.is_item_hovered():
-            imgui.set_tooltip("Sample RAM use to logs/mem_<id>.csv each tick.")
-        if changed:
-            parent._options_mem = new_mem
-            set_mem_monitor(new_mem)
-        imgui.same_line()
-        imgui.begin_disabled(not parent._options_mem)
-        imgui.set_next_item_width(hello_imgui.em_size(5))
-        changed, new_iv = imgui.input_float(
-            "tick (s)##mem_interval", parent._options_mem_interval, 0.0, 0.0, "%.1f"
-        )
-        imgui.end_disabled()
-        if changed:
-            parent._options_mem_interval = max(0.25, new_iv)
-            set_mem_monitor_interval(parent._options_mem_interval)
+        draw_memory_options(parent)
 
         imgui.dummy(imgui.ImVec2(0, 8))
         btn_w = hello_imgui.em_size(6)

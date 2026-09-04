@@ -1,11 +1,5 @@
 name: Install from git URL
 
-# Proves the package installs the way users actually install it -- straight
-# from a git URL, no checkout, no lockfile, no [tool.uv] config in scope --
-# on both supported platforms. Catches things a local `uv sync` cannot:
-# stray submodule gitlinks, linux-only dependency markers, and direct-URL
-# conflicts with masknmf's own pinned fastplotlib.
-
 on:
   workflow_dispatch:
   push:
@@ -24,20 +18,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     env:
-      # Ubuntu 24.04 ships CPython 3.12.3 at /usr/bin/python3.12, which does
-      # NOT satisfy requires-python = ">=3.12.7" -- uv would happily build a
-      # venv on it and only fail at install time. Force a uv-managed
-      # interpreter so both runners get a patch release that qualifies.
       UV_PYTHON_PREFERENCE: only-managed
     steps:
       - name: Setup uv
         uses: astral-sh/setup-uv@v5
         with:
-          # no python-version here: it makes setup-uv create its own .venv on
-          # linux, which then collides with the `uv venv` below.
           enable-cache: true
-          # nothing is checked out, so there is no lockfile to key the cache on
-          # and no workdir to inspect; both of these are warnings otherwise.
           cache-dependency-glob: ""
           ignore-empty-workdir: true
 
@@ -45,8 +31,6 @@ jobs:
         shell: bash
         run: df -h .
 
-      # deliberately NOT actions/checkout: the point is to install from the
-      # remote exactly as a user would, so nothing local can mask a problem.
       - name: Install from git URL
         shell: bash
         run: |
@@ -58,7 +42,7 @@ jobs:
             echo "--- uv version"; uv --version
             echo "--- uv venv"; uv venv --clear --python 3.12
             echo "--- uv pip install"
-            uv pip install "utilities[all] @ git+https://github.com/${{ github.repository }}@${{ github.sha }}"
+            uv pip install "pml_utilities[all] @ git+https://github.com/${{ github.repository }}@${{ github.sha }}"
           } > install.log 2>&1
           rc=$?
           tail -n 40 install.log
@@ -75,7 +59,7 @@ jobs:
           uv run --no-project python -c "
           import mbo_utilities, fastplotlib as fpl, masknmf, importlib.metadata as md
           assert 'site-packages' in mbo_utilities.__file__, mbo_utilities.__file__
-          print('utilities   ', md.version('utilities'))
+          print('pml_utilities', md.version('pml_utilities'))
           print('fastplotlib ', fpl.__version__, '| NDWidget:', hasattr(fpl, 'NDWidget'))
           print('masknmf     ', md.version('masknmf'))
           from mbo_utilities import imread

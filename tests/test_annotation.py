@@ -208,6 +208,21 @@ class TestLabelsZarr:
         assert np.array_equal(restored.labels, store.labels)
         assert restored.rois[2].note == "new one"
 
+    def test_color_and_plane_axes_round_trip(self, tmp_path):
+        store = self._populated()
+        store.set_color(0, (255, 64, 0))
+        store.plane_axes = (("c", 2), ("z", 3))
+        assert store.roi_rgb(0) == (255, 64, 0)  # wins over the class color
+        path = tmp_path / "manual_labels.zarr"
+        LabelsZarr(path).save(store)
+        restored = LabelsZarr.load(path)
+        assert restored.rois[0].color == (255, 64, 0)
+        assert restored.rois[1].color is None
+        assert restored.roi_rgb(0) == (255, 64, 0)
+        assert restored.plane_axes == (("c", 2), ("z", 3))
+        store.set_color(0, None)
+        assert store.roi_rgb(0) != (255, 64, 0)
+
     def test_uid_source_round_trip(self, tmp_path):
         store = self._populated()
         store.add_roi(1, disk(32, 32, 16, 16, 3), source="rois_a:4")

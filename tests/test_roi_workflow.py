@@ -646,6 +646,79 @@ def test_discover_masknmf(tmp_path, store):
     assert ops["roi_workflow"]["box"] == [4, 44, 2, 38]
 
 
+# ---- cropping an existing PMD ------------------------------------------------
+
+
+def _toy_pmd(t=24, h=14, w=12, rank=5, seed=0):
+    import torch
+    from masknmf import PMDArray
+
+    rng = np.random.default_rng(seed)
+    u = rng.random((h * w, rank)).astype(np.float32)
+    u[rng.random((h * w, rank)) > 0.4] = 0.0
+    return PMDArray.from_tensors(
+        (t, h, w),
+        torch.from_numpy(u).to_sparse_coo(),
+        torch.from_numpy(rng.standard_normal((rank, t)).astype(np.float32)),
+        torch.from_numpy(rng.random((h, w)).astype(np.float32)),
+        torch.from_numpy((rng.random((h, w)) + 0.5).astype(np.float32)),
+    )
+
+
+def test_pmd_crop_matches_full_reconstruction():
+    if not (_importable("masknmf") and _importable("torch")):
+        pytest.skip("masknmf/torch not importable")
+    pmd = _toy_pmd()
+    crop = rw.pmd_crop(pmd, 3, 11, 2, 9)
+    assert tuple(crop.shape) == (24, 8, 7)
+    np.testing.assert_allclose(crop[:], pmd[:, 3:11, 2:9], rtol=1e-5, atol=1e-5)
+    with pytest.raises(IndexError):
+        rw.pmd_crop(pmd, 3, 15, 0, 5)
+
+
+def test_roi_trace_factorized_single_read():
+    if not (_importable("masknmf") and _importable("torch")):
+        pytest.skip("masknmf/torch not importable")
+    pmd = _toy_pmd()
+    assert rw._factorized(pmd) and not rw._factorized(pmd[:])
+    mask = _disc(6, 5, 3, shape=pmd.shape[1:])
+    np.testing.assert_allclose(
+        rw.roi_trace(pmd, mask), rw.roi_trace(pmd[:], mask), rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        rw.pixel_trace(pmd, 6, 5), rw.pixel_trace(pmd[:], 6, 5), rtol=1e-5, atol=1e-5
+    )
+
+
+def test_cached_pmd_crop_reuses_plane_compression(tmp_path, store):
+    if not (_importable("masknmf") and _importable("torch")):
+        pytest.skip("masknmf/torch not importable")
+    import masknmf
+
+    from mbo_utilities import log
+    from mbo_utilities.masknmf import MasknmfSettings
+    from mbo_utilities.masknmf.params import PMD_FILE
+
+    n = 400
+    plane = _write_plane(tmp_path, "zplane01", 1, store, nframes=n)
+    rw.demix_rois(plane, store, [0, 1], settings=_MNMF, tag="d")
+    logger = log.get("roi_workflow")
+    s = MasknmfSettings.from_dict(_MNMF)
+    s.compression.detrend = False  # demix_rois disabled it for this short movie
+    crop = rw.as_movie(plane).crop(4, 40, 2, 36)
+    got = rw._cached_pmd_crop(plane, crop, s.compression, logger)
+    assert got is not None
+    pmd, key = got
+    assert tuple(pmd.shape) == (n, 36, 34)
+    assert key.startswith("pmd_crop:")
+    full = masknmf.PMDArray.from_hdf5(str(plane / PMD_FILE))
+    np.testing.assert_allclose(pmd[:5], full[:5, 4:40, 2:36], rtol=1e-4, atol=1e-4)
+    # a full-frame view or changed settings falls back to compression
+    assert rw._cached_pmd_crop(plane, rw.as_movie(plane), s.compression, logger) is None
+    s.compression.detrend = True
+    assert rw._cached_pmd_crop(plane, crop, s.compression, logger) is None
+
+
 def test_discover_suite2p(tmp_path):
     if not (_importable("suite2p") and _importable("torch")):
         pytest.skip("suite2p/torch not importable")

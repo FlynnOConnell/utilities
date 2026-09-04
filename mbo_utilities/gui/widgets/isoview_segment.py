@@ -571,7 +571,7 @@ def draw_window(parent: Any) -> None:
         if arr is None or iso is None or not hasattr(arr, "scan_root"):
             imgui.text_colored(
                 imgui.ImVec4(0.95, 0.7, 0.4, 1.0),
-                "Open an isoview dataset and the Run tab to tune segmentation.",
+                "Open an isoview dataset and the Process tab to tune segmentation.",
             )
             return
 

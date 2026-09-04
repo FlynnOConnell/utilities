@@ -10,6 +10,12 @@ selecting one selects the other (``report_right_tab`` / ``take_right_focus``).
 Work a feature needs every frame regardless of which tab is on top — polling
 jobs, keyboard handling, its own floating windows — goes in a frame hook, not
 in a panel body.
+
+A grab bar along the strip's bottom edge drags it taller or shorter and
+double-clicks shut, the way fastplotlib's right and bottom edge windows work
+(it does not draw one for the top edge, so the strip draws its own). Dragging
+pins the height until :meth:`TopStrip.reset_size`; until then the strip sizes
+itself to whatever panel is showing.
 """
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from fastplotlib.ui import ImguiWindow
-from imgui_bundle import imgui
+from imgui_bundle import imgui, imgui_ctx
 
 __all__ = ["MENU_HEIGHT", "TopPanel", "TopStrip"]
 
@@ -35,6 +41,9 @@ SYNC_HOLD = 3
 # the height it asked for and never more than twice it
 GROW_SHARE = 0.28
 GROW_MAX = 2.0
+
+# never drag the strip so far down that the canvas has less than this
+MIN_RENDER_AREA = 150
 
 
 @dataclass
@@ -81,6 +90,12 @@ class TopStrip(ImguiWindow):
         self._right_focus: str | None = None
         self._hold = 0
         self._closed = False
+        # our own resize state: ImguiWindow._collapsed drives its edge-window
+        # drawing, so shutting the strip must not touch it
+        self._shut = False
+        self._manual: int | None = None
+        self._before_collapse: int | None = None
+        self._cursor_set = False
         figure.add_imgui_window(self, location="top", size=self._want_size(), title=None)
 
     # ------------------------------------------------------------------
@@ -148,16 +163,58 @@ class TopStrip(ImguiWindow):
     def _panel(self, key: str | None) -> TopPanel | None:
         return next((p for p in self.panels if p.key == key), None)
 
+    @property
+    def handle_height(self) -> int:
+        """Thickness of the grab bar along the bottom edge."""
+        return int(self._separator_thickness)
+
+    @property
+    def shut_size(self) -> int:
+        """Height of the strip with the panels shut: the menu row and the bar."""
+        return MENU_HEIGHT + self.handle_height
+
+    @property
+    def collapsed(self) -> bool:
+        """True while the panels are shut and only the menu row shows."""
+        return self._shut
+
+    def toggle_collapsed(self) -> None:
+        """Shut the panels away, or bring them back at the previous height."""
+        if self._shut:
+            self._shut = False
+            self._manual, self._before_collapse = self._before_collapse, None
+        else:
+            self._before_collapse = self._manual
+            self._shut = True
+        self._resize()
+
+    def resize_to(self, size: int) -> None:
+        """Hold the strip at ``size`` px instead of sizing it to its panel."""
+        self._shut = False
+        self._manual = max(int(size), self.shut_size)
+        self._resize()
+
+    def reset_size(self) -> None:
+        """Size the strip to whatever panel is showing again."""
+        self._shut = False
+        self._manual = self._before_collapse = None
+        self._resize()
+
     def _want_size(self) -> int:
-        """Menu row plus the selected panel.
+        """Menu row plus the selected panel, unless the user set a height.
 
         The strip is as tall as what it is *showing*, not as tall as the
         tallest thing registered, and it grows with the window: on a tall
         canvas the panel takes a share of the height instead of leaving a
-        band of empty space under its cards.
+        band of empty space under its cards. A drag on the grab bar pins the
+        height until :meth:`reset_size`.
         """
         if not self.panels:
             return MENU_HEIGHT
+        if self._shut:
+            return self.shut_size
+        if self._manual is not None:
+            return self._manual
         panel = self._panel(self.active)
         height = panel.height if panel is not None else max(p.height for p in self.panels)
         try:
@@ -166,7 +223,7 @@ class TopStrip(ImguiWindow):
             canvas_height = 0.0
         if canvas_height > 0:
             height = max(height, min(canvas_height * GROW_SHARE, height * GROW_MAX))
-        return MENU_HEIGHT + int(height) + PANEL_PAD
+        return MENU_HEIGHT + int(height) + PANEL_PAD + self.handle_height
 
     def _resize(self) -> None:
         want = self._want_size()
@@ -187,7 +244,83 @@ class TopStrip(ImguiWindow):
             self.draw_menu()
         if not self.panels:
             return
+        if not self._shut:
+            # the tabs live above the grab bar, never under it
+            with imgui_ctx.begin_child(
+                "##strip_body", imgui.ImVec2(0, -float(self.handle_height))
+            ):
+                self._draw_tabs()
+        self._draw_handle()
 
+    def _draw_handle(self) -> None:
+        """The grab bar along the bottom edge: drag to resize, double click
+        to shut or reopen the panels."""
+        thickness = float(self.handle_height)
+        imgui.set_cursor_pos(
+            imgui.ImVec2(0.0, imgui.get_window_height() - thickness)
+        )
+        imgui.invisible_button(
+            "##top_resize", imgui.ImVec2(imgui.get_window_width(), thickness)
+        )
+        hovered, active = imgui.is_item_hovered(), imgui.is_item_active()
+        rect_min, rect_max = imgui.get_item_rect_min(), imgui.get_item_rect_max()
+
+        if hovered and imgui.is_mouse_double_clicked(0):
+            self.toggle_collapsed()
+
+        if hovered or active:
+            if not self._cursor_set:
+                self._set_cursor("ns_resize")
+                self._cursor_set = True
+            imgui.set_tooltip("Drag to resize, double click to expand/collapse")
+        elif self._cursor_set:
+            self._set_cursor("default")
+            self._cursor_set = False
+
+        if active and imgui.is_mouse_dragging(0):
+            # the bar is the strip's bottom edge, so dragging down grows it -
+            # but never past leaving the canvas too little to render into
+            delta = imgui.get_mouse_drag_delta(0).y
+            imgui.reset_mouse_drag_delta(0)
+            if delta > 0 and self._render_height() - delta < MIN_RENDER_AREA:
+                delta = 0.0
+            if delta:
+                self.resize_to(round(self.size + delta))
+
+        draw = imgui.get_window_draw_list()
+        strong = hovered or active
+        line = imgui.get_color_u32(
+            imgui.ImVec4(0.9, 0.9, 0.9, 1.0) if strong
+            else imgui.ImVec4(0.5, 0.5, 0.5, 0.8)
+        )
+        draw.add_rect_filled(
+            rect_min, rect_max,
+            imgui.get_color_u32(
+                imgui.ImVec4(0.2, 0.2, 0.2, 0.8) if strong
+                else imgui.ImVec4(0.15, 0.15, 0.15, 0.6)
+            ),
+        )
+        mid_y = (rect_min.y + rect_max.y) * 0.5
+        center_x = (rect_min.x + rect_max.x) * 0.5
+        for i in (-1, 0, 1):
+            draw.add_circle_filled(
+                imgui.ImVec2(center_x + i * 7.0, mid_y), 2, line
+            )
+
+    def _set_cursor(self, name: str) -> None:
+        try:
+            self.figure.canvas.set_cursor(name)
+        except Exception:
+            pass
+
+    def _render_height(self) -> float:
+        """Canvas height left for pygfx, or a big number when unknown."""
+        try:
+            return float(self.figure.get_pygfx_render_area()[3])
+        except Exception:
+            return float("inf")
+
+    def _draw_tabs(self) -> None:
         focus, self._focus = self._focus, None
         # a fresh report from the right bar means the user switched over there
         if self._right_now and self._right_now != self._right_last:

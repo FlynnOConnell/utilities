@@ -35,6 +35,12 @@ try:
                 out = {"ok": False, "use": "cpu", "name": name,
                        "reason": f"this torch build has no kernels for {name} "
                                  f"({cc}; build supports {archs})"}
+    elif sys.argv[1] == "auto":
+        # auto asked for a GPU and did not get one: say why, so the caller can
+        # flag it rather than reporting a healthy cpu
+        out = {"ok": True, "use": "cpu", "wanted_gpu": True,
+               "reason": "torch reports no CUDA device (cpu-only build, no "
+                         "driver, or no GPU visible)"}
     else:
         out = {"ok": True, "use": "cpu"}
 except Exception as e:
@@ -95,10 +101,18 @@ def draw_gpu_status(device: str = "auto") -> None:
     status = get_status(device)
     if status is None:
         color, label, tip = _YELLOW, f"{device} (validating...)", "validating"
+    elif status["ok"] and status.get("wanted_gpu") and status["use"] == "cpu":
+        # green here would read as "GPU is fine" while everything runs on cpu
+        color = _YELLOW
+        label = "cpu (no GPU)"
+        tip = (
+            f"{status.get('reason', 'no CUDA device')}. Device is Auto, so "
+            f"the run falls back to cpu (much slower). {_INSTALL_HINT}"
+        )
     elif status["ok"]:
         color = _GREEN
         label = status.get("name") or status["use"]
-        tip = "torch is properly configured"
+        tip = f"torch is properly configured ({status['use']})"
     else:
         color = _RED
         name = status.get("name") or device
