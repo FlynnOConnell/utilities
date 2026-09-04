@@ -80,6 +80,8 @@ __all__ = [
     "extract_rois",
     "demix_rois",
     "discover_rois",
+    "extract_linescan_traces",
+    "extract_linescan_units",
     "feather_mask",
     "pmd_crop",
     "run",
@@ -1683,6 +1685,164 @@ def discover_rois(
     )
     logger.info(f"roi_workflow: discovered {len(stat)} ROIs -> {out} ({info['seconds']}s)")
     return out
+
+
+# ---------------------------------------------------------------------------
+# line-scan trace extraction (AOD/.mesc units where Z is already the ROI axis)
+# ---------------------------------------------------------------------------
+
+
+def _dfof_maxmin(
+    F: np.ndarray, fs: float, window_s: float = 5.0, sigma_s: float = 0.05
+) -> np.ndarray:
+    """Rolling max-min baseline dF/F, no neuropil term.
+
+    Same two-pass smooth -> rolling-max -> rolling-min baseline as a
+    suite2p-style dF/F, but sized in seconds via ``fs`` rather than a fixed
+    frame count: a line-scan's frame rate (~1-2.5 kHz) is one to two orders
+    of magnitude higher than a raster-scanned movie's (~10-30 Hz), so a
+    fixed frame-count window would be the wrong number of seconds here.
+    Uses ``scipy.ndimage``'s O(T) sliding max/min filters rather than a
+    per-frame python loop, since a line-scan run has far more timepoints.
+    """
+    from scipy.ndimage import gaussian_filter1d, maximum_filter1d, minimum_filter1d
+
+    fs = float(fs)
+    window = max(3, int(round(window_s * fs)))
+    sigma = max(0.5, sigma_s * fs)
+    smoothed = gaussian_filter1d(F, sigma=sigma, axis=1)
+    rolled_max = maximum_filter1d(smoothed, size=window, axis=1, mode="nearest")
+    baseline = minimum_filter1d(rolled_max, size=window, axis=1, mode="nearest")
+    return ((F - baseline) / baseline).astype(np.float32)
+
+
+def extract_linescan_traces(
+    source,
+    *,
+    channel: int = 0,
+    out_dir: str | Path | None = None,
+    compute_dfof: bool = True,
+    dfof_window_s: float = 5.0,
+    batch_size: int = 5000,
+    tag: str = "linescan",
+    logger=None,
+) -> Path:
+    """Per-ROI kymograph traces from a linescan ``.mesc`` unit.
+
+    A linescan MESc unit already has each dendrite/spine ROI on its own
+    Z-index - the file's own MultiROI protocol did the spatial separation -
+    so there is no mask to draw and no 2D field of view to register, and
+    this does not go through :func:`extract_rois` / :func:`demix_rois`.
+    Each ROI's true (unpadded) extent is read from
+    ``arr.metadata["mesc_roi_extents"]`` and reduced to one trace per
+    timepoint (mean over the ROI's real height x width, in
+    ``batch_size``-frame chunks); ``Fneu`` is all zero - there is no
+    neuropil concept for a line-scan ROI.
+
+    Only linescan units (``mesc_layout == "packed"``) are supported.
+    Ribbon-scan (``"boxes"``) and chessboard (``"tiled"``, real 2D tiles
+    that belong in masknmf/suite2p instead) raise ``ValueError``.
+
+    Returns the output dir (``out_dir`` or ``rois_<tag>/`` beside the
+    source), with the usual store-less sidecars (:func:`_write_discovery_outputs`)
+    plus ``dfof.npy`` when ``compute_dfof`` is set.
+    """
+    logger = logger or log.get("roi_workflow")
+    arr = source
+    if isinstance(arr, (str, Path)):
+        from mbo_utilities.reader import imread
+
+        arr = imread(arr)
+    md = arr.metadata
+    if md.get("mesc_z_axis_meaning") != "roi_index" or md.get("mesc_layout") != "packed":
+        raise ValueError(
+            "extract_linescan_traces only handles linescan units "
+            f"(mesc_layout='packed'); got mesc_layout={md.get('mesc_layout')!r}, "
+            f"modality={md.get('mesc_modality_name')!r}"
+        )
+    extents = md["mesc_roi_extents"]
+    K = len(extents)
+    fs = float(md["fs"])
+    t0 = time.time()
+    logger.info(f"roi_workflow: extracting {K} linescan ROIs, channel={channel}")
+
+    movies = [as_movie(arr, z=i, c=channel) for i in range(K)]
+    T = movies[0].shape[0]
+    F = np.zeros((K, T), np.float32)
+    for i, (movie, ext) in enumerate(zip(movies, extents)):
+        h, w = int(ext["height"]), int(ext["width"])
+        for tt0 in range(0, T, batch_size):
+            tt1 = min(T, tt0 + batch_size)
+            blk = movie.frames(tt0, tt1, slice(0, h), slice(0, w)).astype(np.float32, copy=False)
+            F[i, tt0:tt1] = blk.reshape(blk.shape[0], -1).mean(axis=1)
+
+    Fneu = np.zeros_like(F)
+    stat = np.array(
+        [
+            {
+                "roi_index": int(ext["index"]),
+                "y_start": int(ext["y_start"]),
+                "height": int(ext["height"]),
+                "width": int(ext["width"]),
+                "npix": int(ext["height"]) * int(ext["width"]),
+                "comment": md.get("comment", ""),
+            }
+            for ext in extents
+        ],
+        dtype=object,
+    )
+    ops = _ops_for(source, movies[0])
+    info = {
+        "process": "extract_linescan",
+        "engine": "linescan",
+        "channel": int(channel),
+        "n_rois": K,
+        "dfof": bool(compute_dfof),
+        # each ROI is its own Z-index (see mesc_roi_extents), not a single
+        # shared plane - _write_discovery_outputs's rois.json wants a value
+        # here regardless, so 0 is a placeholder, not a meaningful plane.
+        "plane": 0,
+        "seconds": round(time.time() - t0, 3),
+    }
+    out_dir = Path(out_dir) if out_dir is not None else _default_out_dir(source, tag)
+    out = _write_discovery_outputs(
+        out_dir, source=source, ops=ops, stat=stat, F=F, Fneu=Fneu, info=info,
+    )
+    if compute_dfof:
+        dfof = _dfof_maxmin(F, fs=fs, window_s=dfof_window_s)
+        np.save(out / "dfof.npy", dfof)
+    logger.info(
+        f"roi_workflow: wrote {K} linescan traces -> {out} ({info['seconds']}s)"
+    )
+    return out
+
+
+def extract_linescan_units(
+    mesc_path: str | Path,
+    *,
+    channel: int = 0,
+    out_root: str | Path | None = None,
+    **kwargs,
+) -> dict[str, Path]:
+    """Run :func:`extract_linescan_traces` on every linescan unit in a ``.mesc`` file.
+
+    Returns ``{unit_key: out_dir}`` for each unit with
+    ``kind == "packed"`` (skips ribbon/chessboard/zstack/multicube/timeseries
+    units in the same file).
+    """
+    from mbo_utilities.arrays.mesc import MescArray, list_mesc_units
+
+    out_root = Path(out_root) if out_root is not None else None
+    outputs: dict[str, Path] = {}
+    for u in list_mesc_units(mesc_path):
+        if u["kind"] != "packed":
+            continue
+        arr = MescArray(mesc_path, unit=u["key"])
+        out_dir = (out_root / u["munit"]) if out_root is not None else None
+        outputs[u["key"]] = extract_linescan_traces(
+            arr, channel=channel, out_dir=out_dir, **kwargs
+        )
+    return outputs
 
 
 # ---------------------------------------------------------------------------
