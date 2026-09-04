@@ -60,7 +60,11 @@ dependencies = [
 [project.scripts]
 mbo = "mbo_utilities.cli:main"
 pollen = "pollen.pollen_calibration_mbo:main"
-docs = "scripts.build_docs:main"
+# no `docs` entry point: scripts/ is deliberately not packaged (too generic a
+# top-level name to claim in site-packages) and build_docs builds the docs/
+# tree, which is not shipped either -- so it can only ever work from a repo
+# checkout. Its own docstring documents the supported invocation:
+#   uv run python scripts/build_docs.py
 
 # imread() dispatch loads every class in this group.
 # Third-party packages declare the same group to add formats without editing
@@ -82,7 +86,7 @@ isoview = "mbo_utilities.arrays.isoview.array:IsoviewArray"
 [project.urls]
 Homepage = "https://github.com/millerbrainobservatory/mbo_utilities"
 Documentation = "https://millerbrainobservatory.github.io/mbo_utilities/index.html"
-Repository = "https://github.com/FlynnOConnell/utilities"
+Repository = "https://github.com/FlynnOConnell/pml_utilities"
 Issues = "https://github.com/MillerBrainObservatory/mbo_utilities/issues"
 
 [project.optional-dependencies]
