@@ -33,8 +33,8 @@ dependencies = [
 	"pygfx>=0.15.2",
 	"llvmlite>=0.43.0",
 	"numba>=0.60.0",
-	"fastplotlib[imgui]>=0.6.1",
-	"masknmf[multisession, classification]",
+	"fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib@b2132e3d11b9e2bd641e0bbfc0bbee3d413d1d88",
+	"masknmf[multisession,classification] @ git+https://github.com/apasarkar/masknmf-toolbox.git@xarray-compatability",
 	"rendercanvas>=2.4.2",
 	"imgui-bundle>=1.92.801,<1.92.900",
 	"wgpu>=0.28.1",
@@ -45,7 +45,6 @@ dependencies = [
 [project.scripts]
 mbo = "mbo_utilities.cli:main"
 pollen = "pollen.pollen_calibration_mbo:main"
-docs = "scripts.build_docs:main"
 
 [project.entry-points."mbo_utilities.lazy_arrays"]
 lbm = "mbo_utilities.arrays.tiff:LBMArray"
@@ -105,7 +104,7 @@ docs = [
 all = ["pml_utilities[napari,notebooks]"]
 
 [tool.uv]
-default-groups = ["pins", "dev", "suite2p", "napari", "notebooks", "docs"]
+default-groups = ["dev", "suite2p", "napari", "notebooks", "docs"]
 override-dependencies = [
 	"mbo-utilities ; python_version < '0'",
 	"scanimage-tiff-reader ; python_version < '0'",
@@ -177,19 +176,6 @@ exclude_lines = [
 ]
 
 [dependency-groups]
-# The branch pins for the two names left bare in [project.dependencies].
-# Kept in a group precisely so they do NOT reach consumers: a downstream dev
-# env declares its own [tool.uv.sources] for fastplotlib/masknmf (local path,
-# a different branch, whatever) and nothing here fights it. In default-groups,
-# so `uv sync` here still lands on these exact trees.
-# Consumers that just want what this repo uses can copy these two lines into
-# their own [tool.uv.sources]; pip users install them before this package.
-pins = [
-	"fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@ff32546722af09081833640c4e7957f7d3e648aa",
-	"masknmf[multisession] @ git+https://github.com/apasarkar/masknmf-toolbox.git@curation-viz",
-]
-# mirror the heavy optional-dependencies so the repo dev env (default-groups)
-# resolves the full stack for `uv run mbo`. pip users get these via extras.
 napari = [
     "napari",
     "napari-ome-zarr",
@@ -230,11 +216,8 @@ dev = [
     "pygetwindow>=0.0.9",
     "pytest>=8.4.2",
 ]
-# resolvable only under uv thanks to tool.uv.override-dependencies (see the
-# optional-dependencies comment); in default-groups so `uv sync` gets it.
 suite2p = [
     "lbm-suite2p-python[rastermap]>=3.3.2",
     "suite2p>=1.1.0",
     "rastermap>=0.9",
 ]
-# Local-only; auto-synced via default-groups so `uv run mbo` uses ../isoview.

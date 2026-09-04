@@ -1,0 +1,75 @@
+name: Install from git URL
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/install-check.yml
+
+jobs:
+  install:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: ""
+          ignore-empty-workdir: true
+
+      - name: Disk space before
+        shell: bash
+        run: df -h .
+
+      - name: Install from git URL
+        shell: bash
+        run: |
+          # every command is captured, including `uv venv` -- job logs need
+          # admin rights to read, so on failure the tail is re-emitted as
+          # ::error:: annotations, which are public.
+          set +e
+          {
+            echo "--- uv version"; uv --version
+            echo "--- uv venv"; uv venv --clear --python 3.12
+            echo "--- uv pip install"
+            uv pip install "pml_utilities[all] @ git+https://github.com/${{ github.repository }}@${{ github.sha }}"
+          } > install.log 2>&1
+          rc=$?
+          tail -n 40 install.log
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::install exited with $rc"
+            tail -n 30 install.log | tr -d '\r' | while IFS= read -r l; do echo "::error::| ${l}"; done
+            df -h . | tail -n 2 | while IFS= read -r l; do echo "::error::df ${l}"; done
+            exit 1
+          fi
+
+      - name: Import the installed package
+        # cwd is empty of any source tree, so these resolve to site-packages.
+        run: |
+          uv run --no-project python -c "
+          import mbo_utilities, fastplotlib as fpl, masknmf, importlib.metadata as md
+          assert 'site-packages' in mbo_utilities.__file__, mbo_utilities.__file__
+          print('pml_utilities', md.version('pml_utilities'))
+          print('fastplotlib ', fpl.__version__, '| NDWidget:', hasattr(fpl, 'NDWidget'))
+          print('masknmf     ', md.version('masknmf'))
+          from mbo_utilities import imread
+          import mbo_utilities.lazy_array as la
+          la._load_entry_point_arrays()
+          assert len(la._REGISTRY) >= 12, la._REGISTRY
+          print('lazy arrays ', len(la._REGISTRY))
+          "
+
+      - name: Run the console scripts
+        run: |
+          uv run --no-project mbo --help
+          uv run --no-project mbo formats
