@@ -1,0 +1,59 @@
+name: Install from git URL
+
+# Proves the package installs the way users actually install it -- straight
+# from a git URL, no checkout, no lockfile, no [tool.uv] config in scope --
+# on both supported platforms. Catches things a local `uv sync` cannot:
+# stray submodule gitlinks, linux-only dependency markers, and direct-URL
+# conflicts with masknmf's own pinned fastplotlib.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/install-check.yml
+
+jobs:
+  install:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      # deliberately NOT actions/checkout: the point is to install from the
+      # remote exactly as a user would, so nothing local can mask a problem.
+      - name: Install from git URL
+        run: |
+          uv venv --python 3.12
+          uv pip install "utilities[all] @ git+https://github.com/${{ github.repository }}@${{ github.sha }}"
+
+      - name: Import the installed package
+        # cwd is empty of any source tree, so these resolve to site-packages.
+        run: |
+          uv run --no-project python -c "
+          import mbo_utilities, fastplotlib as fpl, masknmf, importlib.metadata as md
+          assert 'site-packages' in mbo_utilities.__file__, mbo_utilities.__file__
+          print('utilities   ', md.version('utilities'))
+          print('fastplotlib ', fpl.__version__, '| NDWidget:', hasattr(fpl, 'NDWidget'))
+          print('masknmf     ', md.version('masknmf'))
+          from mbo_utilities import imread
+          import mbo_utilities.lazy_array as la
+          la._load_entry_point_arrays()
+          assert len(la._REGISTRY) >= 12, la._REGISTRY
+          print('lazy arrays ', len(la._REGISTRY))
+          "
+
+      - name: Run the console scripts
+        run: |
+          uv run --no-project mbo --help
+          uv run --no-project mbo formats
