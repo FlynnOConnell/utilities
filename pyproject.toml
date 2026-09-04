@@ -39,8 +39,17 @@ dependencies = [
 	"pygfx>=0.15.2",
 	"llvmlite>=0.43.0",
 	"numba>=0.60.0",
-	"fastplotlib[imgui]>=0.6.1",
-	"masknmf[multisession, classification]",
+	# Unreleased branches, so PEP 508 direct references live here (not in a
+	# uv-only source/group) to keep `pip install git+...#egg=utilities[all]`
+	# working. fastplotlib is a commit on the ndwidget branch (NDWidget /
+	# add_imgui_window). It MUST stay byte-identical to masknmf's own
+	# fastplotlib pin below -- two different URLs for one package is a hard
+	# resolver error ("conflicting URLs for package fastplotlib") in both pip
+	# and uv, so when masknmf moves its pin, copy the new URL here verbatim.
+	"fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib@b2132e3d11b9e2bd641e0bbfc0bbee3d413d1d88",
+	# xarray-compatability: xarray-backed masknmf arrays; also the only place
+	# the multisession/classification extras exist (PyPI masknmf has neither).
+	"masknmf[multisession,classification] @ git+https://github.com/apasarkar/masknmf-toolbox.git@xarray-compatability",
 	"rendercanvas>=2.4.2",
 	"imgui-bundle>=1.92.801,<1.92.900",
 	"wgpu>=0.28.1",
@@ -112,11 +121,11 @@ docs = [
     "myst_nb",
     "pygfx>=0.14.0",
 ]
-all = ["mbo_utilities[napari,notebooks]"]
+all = ["utilities[napari,notebooks]"]
 
 [tool.uv]
 # repo dev env keeps the full stack so `uv run mbo` is unchanged.
-default-groups = ["pins", "dev", "suite2p", "napari", "notebooks", "docs"]
+default-groups = ["dev", "suite2p", "napari", "notebooks", "docs"]
 # uv-only (pip never sees these): drop the packages that make the suite2p
 # stack unresolvable alongside the ndwidget graphics stack. An override whose
 # marker never matches removes the dependency from the whole graph.
@@ -198,19 +207,6 @@ exclude_lines = [
 ]
 
 [dependency-groups]
-# The branch pins for the two names left bare in [project.dependencies].
-# Kept in a group precisely so they do NOT reach consumers: a downstream dev
-# env declares its own [tool.uv.sources] for fastplotlib/masknmf (local path,
-# a different branch, whatever) and nothing here fights it. In default-groups,
-# so `uv sync` here still lands on these exact trees.
-# Consumers that just want what this repo uses can copy these two lines into
-# their own [tool.uv.sources]; pip users install them before this package.
-pins = [
-	"fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@ff32546722af09081833640c4e7957f7d3e648aa",
-	"masknmf[multisession] @ git+https://github.com/apasarkar/masknmf-toolbox.git@curation-viz",
-]
-# mirror the heavy optional-dependencies so the repo dev env (default-groups)
-# resolves the full stack for `uv run mbo`. pip users get these via extras.
 napari = [
     "napari",
     "napari-ome-zarr",
