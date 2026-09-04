@@ -43,14 +43,22 @@ jobs:
       - name: Install from git URL
         shell: bash
         run: |
-          set -o pipefail
-          uv venv --python 3.12
-          # job logs need admin rights to read, so on failure re-emit the tail
-          # of the output as ::error:: annotations, which are public.
-          if ! uv pip install "utilities[all] @ git+https://github.com/${{ github.repository }}@${{ github.sha }}" 2>&1 | tee install.log; then
-            echo "::error::install failed; tail follows"
-            tail -n 25 install.log | while IFS= read -r l; do echo "::error::| $l"; done
-            df -h . | while IFS= read -r l; do echo "::error::df $l"; done
+          # every command is captured, including `uv venv` -- job logs need
+          # admin rights to read, so on failure the tail is re-emitted as
+          # ::error:: annotations, which are public.
+          set +e
+          {
+            echo "--- uv version"; uv --version
+            echo "--- uv venv"; uv venv --python 3.12
+            echo "--- uv pip install"
+            uv pip install "utilities[all] @ git+https://github.com/${{ github.repository }}@${{ github.sha }}"
+          } > install.log 2>&1
+          rc=$?
+          tail -n 40 install.log
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::install exited with $rc"
+            tail -n 30 install.log | tr -d '\r' | while IFS= read -r l; do echo "::error::| ${l}"; done
+            df -h . | tail -n 2 | while IFS= read -r l; do echo "::error::df ${l}"; done
             exit 1
           fi
 
