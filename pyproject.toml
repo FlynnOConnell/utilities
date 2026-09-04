@@ -3,9 +3,9 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "utilities"
+name = "pml_utilities"
 version = "3.3.4"
-description = "Various utilities for the Miller Brain Observatory"
+description = "A fork of mbo_utilities for Program in Memory Longevity (PML)"
 readme = "README.md"
 license = "BSD-3-Clause"
 requires-python = ">=3.12.7,<3.14"
@@ -64,7 +64,7 @@ isoview = "mbo_utilities.arrays.isoview.array:IsoviewArray"
 [project.urls]
 Homepage = "https://github.com/millerbrainobservatory/mbo_utilities"
 Documentation = "https://millerbrainobservatory.github.io/mbo_utilities/index.html"
-Repository = "https://github.com/FlynnOConnell/utilities"
+Repository = "https://github.com/FlynnOConnell/pml_utilities"
 Issues = "https://github.com/MillerBrainObservatory/mbo_utilities/issues"
 
 [project.optional-dependencies]
@@ -102,7 +102,7 @@ docs = [
     "myst_nb",
     "pygfx>=0.14.0",
 ]
-all = ["mbo_utilities[napari,notebooks]"]
+all = ["pml_utilities[napari,notebooks]"]
 
 [tool.uv]
 default-groups = ["pins", "dev", "suite2p", "napari", "notebooks", "docs"]

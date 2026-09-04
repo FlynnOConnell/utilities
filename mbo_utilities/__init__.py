@@ -71,11 +71,13 @@ def __getattr__(name):
     """Lazy import attributes to avoid loading heavy dependencies at startup."""
     # Version (importlib.metadata pulls email + zipfile; defer to keep CLI startup fast)
     if name == "__version__":
-        try:
-            from importlib.metadata import version
-            return version("mbo_utilities")
-        except Exception:
-            return "0.0.0"  # editable install / metadata unavailable
+        from importlib.metadata import PackageNotFoundError, version
+        for dist in ("pml_utilities", "mbo_utilities"):
+            try:
+                return version(dist)
+            except PackageNotFoundError:
+                continue
+        return "0.0.0"  # editable install / metadata unavailable
 
     # Core I/O
     if name == "imread":
