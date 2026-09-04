@@ -29,13 +29,30 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+          # nothing is checked out, so there is no lockfile to key the cache on
+          # and no workdir to inspect; both of these are warnings otherwise.
+          cache-dependency-glob: ""
+          ignore-empty-workdir: true
+
+      - name: Disk space before
+        shell: bash
+        run: df -h .
 
       # deliberately NOT actions/checkout: the point is to install from the
       # remote exactly as a user would, so nothing local can mask a problem.
       - name: Install from git URL
+        shell: bash
         run: |
+          set -o pipefail
           uv venv --python 3.12
-          uv pip install "utilities[all] @ git+https://github.com/${{ github.repository }}@${{ github.sha }}"
+          # job logs need admin rights to read, so on failure re-emit the tail
+          # of the output as ::error:: annotations, which are public.
+          if ! uv pip install "utilities[all] @ git+https://github.com/${{ github.repository }}@${{ github.sha }}" 2>&1 | tee install.log; then
+            echo "::error::install failed; tail follows"
+            tail -n 25 install.log | while IFS= read -r l; do echo "::error::| $l"; done
+            df -h . | while IFS= read -r l; do echo "::error::df $l"; done
+            exit 1
+          fi
 
       - name: Import the installed package
         # cwd is empty of any source tree, so these resolve to site-packages.
